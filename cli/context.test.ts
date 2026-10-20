@@ -414,8 +414,8 @@ describe("derived settings", () => {
       // herdr keeps its socket under %APPDATA% on Windows (bridge/config.ts), `~/.config` elsewhere.
       socket:
         process.platform === "win32"
-          ? join(HOME, "AppData", "Roaming", "herdr", "herdr.sock")
-          : join(HOME, ".config", "herdr", "herdr.sock"),
+          ? join(HOME, "AppData", "Roaming", "hangar", "herdr.sock")
+          : join(HOME, ".config", "hangar", "herdr.sock"),
     });
   });
 

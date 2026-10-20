@@ -517,9 +517,9 @@ export function defaultSocketPath(
 ): string {
   if (host.platform === "win32") {
     const appData = env.APPDATA ?? host.path.join(home, "AppData", "Roaming");
-    return host.path.join(appData, "herdr", "herdr.sock");
+    return host.path.join(appData, "hangar", "herdr.sock");
   }
-  return host.path.join(home, ".config", "herdr", "herdr.sock");
+  return host.path.join(home, ".config", "hangar", "herdr.sock");
 }
 
 /**
