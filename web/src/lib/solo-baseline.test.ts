@@ -1,0 +1,438 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { http, HttpResponse } from "msw";
+
+import { server } from "@/test/setup";
+import { fetchSnapshot } from "./api";
+import { healthFor, hostHealthMap, writeRefusal } from "./host-health";
+import { HOST_PARAM, normalizeSession, scopeSearch, SESSION_PARAM, sessionSearch } from "./session";
+import type {
+  AgentView,
+  DeviceAuth,
+  SessionSummary,
+  SnapshotResponse,
+  UpdateInfo,
+} from "./types";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOLO ZERO-TAX BASELINE — the client half.
+//
+// The bridge half lives in `bridge/solo-baseline.test.ts` and owns the contract (CREW_PROTOCOL.md
+// §11). This file pins the two things only the frontend can answer: that the hand-mirrored wire
+// types here gained no crew dimension either (they would otherwise drift into accepting a `servers`
+// the bridge must then emit), and that a solo client puts NO host param on the wire — §11's `?h=`
+// row: "never emitted by the client, never present in a URL".
+//
+// The golden snapshot is read from the BRIDGE's fixture on purpose, the same way
+// `bridge/prompt-binding.test.ts` reads a web fixture: one committed body, both sides pinned to it.
+// A failure here is not a stale golden — it is a solo user being taxed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const GOLDEN = join(__dirname, "..", "..", "..", "bridge", "fixtures", "solo-baseline", "snapshot.json");
+// SAFETY: the golden is the bridge's own committed solo body — `bridge/prompt-binding.test.ts`
+// reads the same file and pins it from the other side, so its shape IS `SnapshotResponse`. The
+// assertions below are what would fail if it ever stopped being.
+const goldenSnapshot = JSON.parse(readFileSync(GOLDEN, "utf8")) as SnapshotResponse;
+
+// Exhaustive by construction: `Record<keyof T, true>` makes every key of T — optional ones included —
+// required here, so adding `servers?:` or `host?:` to a mirror type fails `bun run typecheck`.
+//
+// ── THE TRIPWIRE FIRED, IN M5/02 — THE CLIENT HALF OF M4/04 ──────────────────
+// `servers?:` (SnapshotResponse) and `host?:` (SessionSummary, AgentView) are the frontend mirrors of
+// the fields the snapshot merge added bridge-side; `bridge/solo-baseline.test.ts` recorded the same
+// three, the same way, in M4/04. Read it as the type-level guard working: the mirror cannot grow a
+// crew dimension without an author acknowledging it HERE.
+//
+// **No golden was regenerated and no byte moved.** All three are optional-and-absent, so the bridge's
+// committed solo body still contains none of them — which the golden assertion below now states
+// positively, not just as "no unknown keys". Only the key-LIST assertions in this file changed; every
+// byte-level and wire-level assertion is untouched. (§11's "Why `servers` is optional-and-absent".)
+const SNAPSHOT_KEYS = {
+  bridge: true,
+  device: true,
+  agents: true,
+  shellPanes: true,
+  workspaces: true,
+  tabs: true,
+  notifications: true,
+  sessions: true,
+  update: true,
+  ts: true,
+  // Present on the type since M5/02, absent from every solo body — see the section header.
+  servers: true,
+  // Not a crew dimension: present only while the mux is down for a refused durable token (M50 spec
+  // 14), so a healthy solo body carries no such key and no golden byte moved.
+  muxFault: true,
+} satisfies Record<keyof SnapshotResponse, true>;
+
+const SESSION_SUMMARY_KEYS = {
+  name: true,
+  isPrimary: true,
+  reachable: true,
+  agents: true,
+  working: true,
+  blocked: true,
+  host: true,
+  // The session card (M55): optional on the type, absent from a solo body with no program session.
+  kind: true,
+  mux: true,
+  caps: true,
+  where: true,
+  state: true,
+  experimental: true,
+  // Rides only on a program card refused for its wire version (M55 spec 14), so no solo byte moved.
+  notice: true,
+} satisfies Record<keyof SessionSummary, true>;
+
+const AGENT_VIEW_KEYS = {
+  paneId: true,
+  workspaceId: true,
+  workspaceLabel: true,
+  workspaceNumber: true,
+  tabId: true,
+  agent: true,
+  status: true,
+  cwd: true,
+  focused: true,
+  kind: true,
+  paneLabel: true,
+  sessionName: true,
+  hasSession: true,
+  readableLines: true,
+  tabLabel: true,
+  lastActiveAt: true,
+  lastSeenAt: true,
+  host: true,
+  // NOT a crew dimension — an ordinary optional feature field (0.29.0, panes named by their OSC
+  // title). Recorded here because the tripwire is exhaustive over `keyof AgentView`, not because it
+  // carries a host.
+  terminalTitle: true,
+  // Also not a crew dimension: a presentation flag on the field above, set only when the title
+  // outlived the program that printed it.
+  terminalTitleStale: true,
+  // Also not a crew dimension: an optional sentence the bridge composes about one kind of pane
+  // (M11/05), rendered as text and absent everywhere else.
+  hint: true,
+  // The OTHER half of a pane's address. Like `host` it is written by the REQUEST, not by the pane:
+  // present exactly when the snapshot was widened (`?sessions=all`, the "All sessions" view), absent
+  // on every other read — which is every read the app made before that view existed.
+  session: true,
+  // Also not a crew dimension: the pane's prompt-cache reading (M28/02), computed on the machine the
+  // pane lives on and absent until its agent has taken one turn. A 1.8.x peer omits it.
+  cache: true,
+  // Not a crew dimension: the pane's active todo list (bridge/todos.ts), absent when there are no
+  // todos or on an older bridge.
+  todos: true,
+  // Not a crew dimension: the pane's running subagents (bridge/subagents.ts), absent when none is
+  // running or on an older bridge.
+  subagents: true,
+  // Not a crew dimension: the model the pane's agent is on, from the same probe as `cache`, and
+  // absent until that agent has taken one turn. An older bridge or peer omits it.
+  model: true,
+  // Not a crew dimension: the effort beside that model, from the same probe, and absent whenever the
+  // model is or the log names no level. An older bridge or peer omits it.
+  effort: true,
+  // Not crew dimensions: the operator's name for this pane's one-pane tab, and the pane's position in
+  // its tab. Computed on the machine the pane lives on; an older peer omits both.
+  soleTabName: true,
+  tabPosition: true,
+  // Not a crew dimension: what the checkout holding the pane's folder is on, read off the disk of
+  // the machine the pane lives on. An older bridge or peer omits it.
+  gitHead: true,
+  // Not crew dimensions: a durable program's open asks and newest turn (ADR 0100, ADR 0101), present
+  // only on a pane with no screen and absent from an older bridge or peer.
+  asks: true,
+  turnId: true,
+  // Not crew dimensions: a durable program's line under the title and its small mark (WIRE.md 7.11),
+  // present only on a pane with no screen and absent from an older bridge or peer.
+  subtitle: true,
+  badge: true,
+  progress: true,
+  // Not a crew dimension either: the belt buttons a durable program lists for a pane (M53 spec 07), present only on a pane that has some.
+  actions: true,
+  // Not a crew dimension: the pane's input surface (M56 spec 04), present only while the bridge runs Surface shadow mode.
+  surface: true,
+  // Not a crew dimension: the pane's hook-held permission (M56 spec 12), with `surface` only.
+  hold: true,
+  // Not a crew dimension: the pane's hook source, live or none (M56 spec 11), present only with `surface`.
+  hooks: true,
+  // Not a crew dimension: the Send Protocol's mark (M56 spec 05). Only ISSANCE_SEND_PROTOCOL=1 fills it,
+  // and it is off by default, so it is absent on every pane here and no golden byte moved.
+  sendProtocol: true,
+  // Not a crew dimension: the pane's held sends (M56 spec 15), present only while a send waits for the turn to end.
+  held: true,
+  // Not a crew dimension: the pane's session instance (walky talky), four characters naming the session that holds the pane id now. Absent on a machine that predates it.
+  instance: true,
+} satisfies Record<keyof AgentView, true>;
+
+const DEVICE_AUTH_KEYS = {
+  enforced: true,
+  device: true,
+  authorized: true,
+} satisfies Record<keyof DeviceAuth, true>;
+
+const UPDATE_INFO_KEYS = {
+  current: true,
+  latest: true,
+  latestUrl: true,
+  releaseAvailable: true,
+  majorAvailable: true,
+  majorUrl: true,
+  installKind: true,
+  bridgeStale: true,
+  checkedAt: true,
+  // The update card's two additions (M15/05): what one update folds in, and the run record the card
+  // renders. Both optional — an older bridge sends neither.
+  newerVersions: true,
+  run: true,
+  // The package manager's own upgrade command (M17/02). Optional: only a packaged install under a
+  // prefix issance recognises has one to name.
+  packageCommand: true,
+  // The files on disk stopped naming the version this process runs (M17/02), and the command that
+  // clears it. Both optional — a bridge older than the field sends neither.
+  restartNeeded: true,
+  restartCommand: true,
+  // The two bands the operator can close (M17/08) — the offer for this host and the quiet notice
+  // about a machine a package manager owns. The bridge's facts, so the decision holds wherever the
+  // band is read next. Optional here: a bridge older than the fields sends neither.
+  dismissedVersion: true,
+  dismissedCrewVersion: true,
+  // When the crew notice was closed (1.21.1). Optional, and absent until a crew close is made, so a
+  // solo payload carries no such key.
+  dismissedCrewAt: true,
+  // The peer legs of a run this machine has no record of, and that run's settle stamp (M20/09,
+  // M20/01). Both optional and both ABSENT on a solo install: a machine with no crew has no legs,
+  // so the solo payload is byte-identical to what it was.
+  peers: true,
+  settledAt: true,
+  // Where those legs' run levels the members to (M32). Optional, and absent on a solo install with
+  // the legs it travels beside.
+  peersTo: true,
+  // Whether the release ahead changes the crew wire (M27/06). Optional and ABSENT on a solo
+  // install, for the same reason: a machine with no crew has no link to change.
+  linkChange: true,
+  // The newest urgent release in the delta (ADR 0046). Optional, and absent on every ordinary
+  // release, so a solo payload is byte-identical to what it was.
+  urgent: true,
+  // The release line and the way back to Stable (M60 spec 01). Optional: an older bridge sends
+  // neither, and that reads as Stable with no way back to offer.
+  line: true,
+  back: true,
+} satisfies Record<keyof UpdateInfo, true>;
+
+describe("solo zero-tax — the client's mirror types carry no crew dimension", () => {
+  it("SnapshotResponse mirrors the bridge's field set exactly", () => {
+    expect(Object.keys(SNAPSHOT_KEYS).toSorted()).toEqual([
+      "agents",
+      "bridge",
+      "device",
+      "muxFault",
+      "notifications",
+      "servers",
+      "sessions",
+      "shellPanes",
+      "tabs",
+      "ts",
+      "update",
+      "workspaces",
+    ]);
+  });
+
+  it("the crew dimension is on the mirror types, and every field of it is optional", () => {
+    // Renegotiated in M5/02 (see the header above the key maps): `servers`/`host` EXIST here now,
+    // mirroring bridge/types.ts. What must never change is that they are optional — a solo bridge
+    // emits none of them, so a snapshot literal without them still satisfies the type.
+    const solo: SnapshotResponse = {
+      bridge: "connected",
+      agents: [],
+      shellPanes: [],
+      workspaces: [],
+      tabs: [],
+      ts: 0,
+    };
+    expect(Object.keys(solo)).not.toContain("servers");
+    expect(SNAPSHOT_KEYS.servers).toBe(true);
+    expect(SESSION_SUMMARY_KEYS.host).toBe(true);
+    expect(AGENT_VIEW_KEYS.host).toBe(true);
+    // The pane's two ADDRESS fields, and the only two here a request can turn on: `host` on a merged
+    // crew body, `session` on a widened one. Neither is on a solo, un-widened read — which is what
+    // the golden object above pins — and this list is the tripwire against a quiet third.
+    expect(AGENT_VIEW_KEYS.session).toBe(true);
+    expect(Object.keys(AGENT_VIEW_KEYS).toSorted()).toEqual([
+      "actions",
+      "agent",
+      "asks",
+      "badge",
+      "cache",
+      "cwd",
+      "effort",
+      "focused",
+      "gitHead",
+      "hasSession",
+      "held",
+      "hint",
+      "hold",
+      "hooks",
+      "host",
+      "instance",
+      "kind",
+      "lastActiveAt",
+      "lastSeenAt",
+      "model",
+      "paneId",
+      "paneLabel",
+      "progress",
+      "readableLines",
+      "sendProtocol",
+      "session",
+      "sessionName",
+      "soleTabName",
+      "status",
+      "subagents",
+      "subtitle",
+      "surface",
+      "tabId",
+      "tabLabel",
+      "tabPosition",
+      "terminalTitle",
+      "terminalTitleStale",
+      "todos",
+      "turnId",
+      "workspaceId",
+      "workspaceLabel",
+      "workspaceNumber",
+    ]);
+    expect(Object.keys(DEVICE_AUTH_KEYS).toSorted()).toEqual(["authorized", "device", "enforced"]);
+    expect(Object.keys(UPDATE_INFO_KEYS).toSorted()).toEqual([
+      // The way back to Stable (M60 spec 01) — optional, sent only in that one case.
+      "back",
+      "bridgeStale",
+      "checkedAt",
+      "current",
+      // The two bands the operator can close (M17/08) — optional here, because a bridge older than
+      // the fields sends neither.
+      "dismissedCrewAt",
+      "dismissedCrewVersion",
+      "dismissedVersion",
+      "installKind",
+      "latest",
+      "latestUrl",
+      // The release line (M60 spec 01) — optional; absent reads as Stable.
+      "line",
+      // Whether the release ahead changes the crew wire (M27/06) — optional, and absent on a solo
+      // install.
+      "linkChange",
+      "majorAvailable",
+      "majorUrl",
+      "newerVersions",
+      // The package manager's own upgrade command (M17/02) — optional, present only on a packaged
+      // install under a prefix issance recognises.
+      "packageCommand",
+      // The peers-only run's legs and its settle stamp (M20/09, M20/01). Optional, and a solo
+      // install never carries either.
+      "peers",
+      // Where those legs' run levels the members to (M32). Optional, absent with the legs.
+      "peersTo",
+      "releaseAvailable",
+      // The command that clears the restart, optional beside the flag that raises it (M17/02).
+      "restartCommand",
+      "restartNeeded",
+      "run",
+      "settledAt",
+      // The newest urgent release in the delta (ADR 0046) — optional, and absent unless a release
+      // asked for the daily cadence.
+      "urgent",
+    ]);
+  });
+
+  it("every key in the bridge's golden solo snapshot is one the client already knows", () => {
+    const known = new Set(Object.keys(SNAPSHOT_KEYS));
+    expect(Object.keys(goldenSnapshot).filter((k) => !known.has(k))).toEqual([]);
+    const paneKeys = new Set(Object.keys(AGENT_VIEW_KEYS));
+    for (const pane of [...goldenSnapshot.agents, ...goldenSnapshot.shellPanes]) {
+      expect(Object.keys(pane).filter((k) => !paneKeys.has(k))).toEqual([]);
+    }
+    const sessionKeys = new Set(Object.keys(SESSION_SUMMARY_KEYS));
+    for (const s of goldenSnapshot.sessions ?? []) {
+      expect(Object.keys(s).filter((k) => !sessionKeys.has(k))).toEqual([]);
+    }
+  });
+
+  it("the golden solo body carries NONE of the crew fields the types now allow", () => {
+    // The half the key maps can no longer state on their own, now that `servers`/`host` are known
+    // keys: a solo BODY still has none of them. This is the byte-level claim §11 actually makes, and
+    // it is why M5/02 renegotiated the key lists without regenerating a single golden.
+    expect(goldenSnapshot).not.toHaveProperty("servers");
+    for (const pane of [...goldenSnapshot.agents, ...goldenSnapshot.shellPanes]) {
+      expect(pane).not.toHaveProperty("host");
+    }
+    for (const s of goldenSnapshot.sessions ?? []) {
+      expect(s).not.toHaveProperty("host");
+    }
+  });
+});
+
+describe("solo zero-tax — a solo client puts no host on the wire", () => {
+  it("the session param is `s`, and a solo scope emits no host param at all", () => {
+    expect(SESSION_PARAM).toBe("s");
+    expect(sessionSearch(undefined)).toBe("");
+    expect(sessionSearch("issance-demo")).toBe("?s=issance-demo");
+    expect(normalizeSession("")).toBeUndefined();
+    // The host param EXISTS (the addressing dimension shipped), but a solo client never produces it:
+    // no host means no `?h=`, so every URL a solo install builds is byte-identical to before.
+    expect(HOST_PARAM).toBe("h");
+    expect(scopeSearch({})).toBe("");
+    expect(scopeSearch({ host: undefined, session: undefined })).toBe("");
+    expect(scopeSearch({ session: "issance-demo" })).toBe("?s=issance-demo");
+    expect(scopeSearch({ session: "issance-demo" })).toBe(sessionSearch("issance-demo"));
+  });
+
+  it("fetchSnapshot on a solo install requests a bare /api/snapshot — no query at all", async () => {
+    const urls: string[] = [];
+    server.use(
+      http.get("/api/snapshot", ({ request }) => {
+        urls.push(new URL(request.url).search);
+        return HttpResponse.json(goldenSnapshot);
+      }),
+    );
+    const snap = await fetchSnapshot();
+    expect(urls).toEqual([""]);
+    // Round-trips the bridge's golden body untouched.
+    expect(snap).toEqual(goldenSnapshot);
+  });
+
+  it("a named session still only ever adds `session=` — never `h=` or `host=`", async () => {
+    const urls: string[] = [];
+    server.use(
+      http.get("/api/snapshot", ({ request }) => {
+        urls.push(new URL(request.url).search);
+        return HttpResponse.json(goldenSnapshot);
+      }),
+    );
+    await fetchSnapshot({ session: "issance-demo" });
+    expect(urls).toEqual(["?session=issance-demo"]);
+    expect(urls[0]).not.toMatch(/\b(h|host)=/);
+  });
+});
+
+// TIER 2 (lead↔peer health) is the newest thing that could tax a solo install, because it is the
+// first crew feature that DERIVES rather than merely labels — and a derivation that produces an
+// entry for "here" would give a one-machine install a peer-health dimension it has no peers for.
+describe("solo runs no per-host health machinery at all", () => {
+  it("derives an empty health map from the golden solo snapshot", () => {
+    // `servers` is optional-and-absent in the committed solo body (§11), which is the whole input.
+    expect(goldenSnapshot.servers).toBeUndefined();
+    const map = hostHealthMap(goldenSnapshot.servers, { at: goldenSnapshot.ts, pollMs: 1500 });
+    expect(map.size).toBe(0);
+  });
+
+  it("answers 'nothing to say' for every lookup, so no surface can render host chrome or refuse a write", () => {
+    const map = hostHealthMap(goldenSnapshot.servers, { at: goldenSnapshot.ts, pollMs: 1500 });
+    // `undefined` (no host in hand) and a named host both answer the same on solo — there is no
+    // host dimension to be wrong about, which is what makes the hide rule data rather than a flag.
+    expect(healthFor(map, undefined)).toBeUndefined();
+    expect(healthFor(map, "anything")).toBeUndefined();
+    expect(writeRefusal(healthFor(map, "anything"))).toBeUndefined();
+  });
+});

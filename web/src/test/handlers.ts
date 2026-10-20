@@ -1,0 +1,1121 @@
+import { http, HttpResponse } from "msw";
+
+import type {
+  AgentView,
+  CacheRuleWire,
+  ChangeCommitDiffResponse,
+  ChangeCommitResponse,
+  ChatEntry,
+  CreateResponse,
+  FileEntry,
+  FileReadResponse,
+  FilesListResponse,
+  CrewStatusResponse,
+  MachineAlerts,
+  PaneChatResponse,
+  PaneChangeDiffResponse,
+  PaneChangesResponse,
+  ServerSummary,
+  SessionSummary,
+  SnapshotResponse,
+  TabView,
+  ToolQuestion,
+  TranscriptEntry,
+  TranscriptPart,
+  WorkspaceView,
+} from "@/lib/types";
+import { asJsonObject, asJsonString, parseJsonObject, type JsonObject } from "@/lib/json";
+import type { Surface } from "@/lib/surface/surface";
+
+import { censusFor, fixtureMachinesSolo, historyFor } from "./machine-fixtures";
+import type { WalkyReceipt, WalkyRow, WalkySendBody } from "@/lib/walky";
+
+// A couple of fixture agents covering the triage groups, reused across tests.
+export const fixtureAgents: AgentView[] = [
+  {
+    paneId: "w1:p1",
+    workspaceId: "w1",
+    workspaceLabel: "webapp",
+    workspaceNumber: 1,
+    tabId: "w1:t1",
+    agent: "claude",
+    status: "blocked",
+    cwd: "/home/you/webapp",
+    focused: false,
+    // The bridge runs the Send Protocol for every terminal pane (on by default since M56 spec 06).
+    sendProtocol: true,
+  },
+  {
+    paneId: "w2:p1",
+    workspaceId: "w2",
+    workspaceLabel: "issance",
+    workspaceNumber: 2,
+    tabId: "w2:t1",
+    agent: "codex",
+    status: "working",
+    cwd: "/home/you/issance",
+    focused: true,
+    sendProtocol: true,
+  },
+];
+
+export const fixtureShellPanes: AgentView[] = [
+  {
+    paneId: "w2:p2",
+    workspaceId: "w2",
+    workspaceLabel: "issance",
+    workspaceNumber: 2,
+    tabId: "w2:t2",
+    agent: "shell",
+    status: "unknown",
+    cwd: "/home/you/issance",
+    focused: false,
+    kind: "shell",
+    sendProtocol: true,
+  },
+];
+
+export const fixtureWorkspaces: WorkspaceView[] = [
+  {
+    workspaceId: "w1",
+    number: 1,
+    label: "webapp",
+    focused: false,
+    activeTabId: "w1:t1",
+    tabCount: 1,
+    paneCount: 1,
+  },
+  {
+    workspaceId: "w2",
+    number: 2,
+    label: "issance",
+    focused: true,
+    activeTabId: "w2:t1",
+    tabCount: 2,
+    paneCount: 2,
+  },
+];
+
+export const fixtureTabs: TabView[] = [
+  { tabId: "w1:t1", workspaceId: "w1", number: 1, label: "1", focused: false, paneCount: 1 },
+  { tabId: "w2:t1", workspaceId: "w2", number: 1, label: "code", focused: true, paneCount: 1 },
+  { tabId: "w2:t2", workspaceId: "w2", number: 2, label: "shell", focused: false, paneCount: 1 },
+];
+
+// A two-session registry: the primary "default" plus a named "issance-demo". Order is primary-first,
+// then alphabetical — matching the bridge contract.
+export const fixtureSessions: SessionSummary[] = [
+  { name: "default", isPrimary: true, reachable: true, agents: 2, working: 1, blocked: 1 },
+  { name: "issance-demo", isPrimary: false, reachable: true, agents: 1, working: 1, blocked: 0 },
+];
+
+export const fixtureSnapshot: SnapshotResponse = {
+  bridge: "connected",
+  agents: fixtureAgents,
+  shellPanes: fixtureShellPanes,
+  workspaces: fixtureWorkspaces,
+  tabs: fixtureTabs,
+  notifications: { snoozedUntil: null },
+  sessions: fixtureSessions,
+  ts: 0,
+};
+
+// ── The crew fixtures ────────────────────────────────────────────────────────
+// Everything above is the SOLO snapshot, and it stays that way: no `servers`, no `host` anywhere, so
+// every existing test keeps asserting the one-host world and any host chrome that leaks into it
+// fails loudly. The crew fixtures below are opt-in — a test that wants two machines asks for them.
+//
+// Shapes mirror what the lead's merge actually emits (bridge/crew/merge.ts): the lead's OWN panes and
+// sessions are host-tagged too (not left bare), workspace ids repeat across machines because Hangar
+// numbers them per machine, and the roster's first entry is the lead.
+
+/** Lead + one reachable peer + one that is up but speaking another protocol version. */
+export const fixtureServers: ServerSummary[] = [
+  { id: "bluefin", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 1_000 },
+  { id: "workshop", name: "workshop", isLead: false, reachable: true, protocol: "ok", lastSeenAt: 990 },
+  {
+    id: "attic",
+    name: "attic",
+    isLead: false,
+    reachable: false,
+    protocol: "incompatible",
+    protocolDetail: "crew protocol 2 (this issance speaks 1)",
+    lastSeenAt: 500,
+  },
+];
+
+/**
+ * Agents across two machines, with `w1` deliberately used on BOTH — the id collision that makes a
+ * host-blind space key merge two projects. One blocked agent per host, so "Needs you" is provably a
+ * single cross-host list.
+ */
+export const fixtureCrewAgents: AgentView[] = [
+  { ...fixtureAgents[0]!, host: "bluefin" },
+  { ...fixtureAgents[1]!, host: "bluefin" },
+  {
+    paneId: "w1:p1",
+    workspaceId: "w1",
+    workspaceLabel: "moonward",
+    workspaceNumber: 1,
+    tabId: "w1:t1",
+    agent: "codex",
+    status: "blocked",
+    cwd: "/home/you/moonward",
+    focused: false,
+    host: "workshop",
+    sendProtocol: true,
+  },
+];
+
+export const fixtureCrewShellPanes: AgentView[] = fixtureShellPanes.map((p) => {
+  // Built by mutating a copy rather than by spreading in the map body: one clone per row instead of
+  // a fresh object literal plus a spread, and it says plainly that `host` is the ONLY difference
+  // from the solo fixture.
+  const packed = structuredClone(p);
+  packed.host = "bluefin";
+  return packed;
+});
+
+/** Both machines run a session called "default" — which is why the switchers stay separate. */
+export const fixtureCrewSessions: SessionSummary[] = [
+  { ...fixtureSessions[0]!, host: "bluefin" },
+  { ...fixtureSessions[1]!, host: "bluefin" },
+  { name: "default", isPrimary: true, reachable: true, agents: 1, working: 0, blocked: 1, host: "workshop" },
+];
+
+/**
+ * Spaces and tabs across two machines, host-tagged the way the lead's merge emits them — and with
+ `w1` deliberately used on BOTH, because Hangar numbers spaces per machine and two default installs
+ * both call theirs `w1` / `w1:t1`. An untagged merge collapsed those into one row carrying one
+ * machine's counts; `(host, workspaceId)` is what keeps them apart.
+ */
+export const fixtureCrewWorkspaces: WorkspaceView[] = [
+  ...fixtureWorkspaces.map((w) => Object.assign({}, w, { host: "bluefin" })),
+  {
+    workspaceId: "w1",
+    number: 1,
+    label: "moonward",
+    focused: false,
+    activeTabId: "w1:t1",
+    tabCount: 1,
+    paneCount: 1,
+    host: "workshop",
+  },
+];
+
+export const fixtureCrewTabs: TabView[] = [
+  ...fixtureTabs.map((t) => Object.assign({}, t, { host: "bluefin" })),
+  { tabId: "w1:t1", workspaceId: "w1", number: 1, label: "1", focused: false, paneCount: 1, host: "workshop" },
+];
+
+/**
+ * The merged snapshot a lead serves. `workspaces`/`tabs` are unioned and host-tagged, exactly as
+ * `bridge/crew/merge.ts` emits them; `lib/hosts.ts`'s `ambientSpaces` is what narrows them back to
+ * the one machine the URL is on, which is where the navigator's tree belongs.
+ */
+export const fixtureCrewSnapshot: SnapshotResponse = {
+  ...fixtureSnapshot,
+  agents: fixtureCrewAgents,
+  shellPanes: fixtureCrewShellPanes,
+  workspaces: fixtureCrewWorkspaces,
+  tabs: fixtureCrewTabs,
+  sessions: fixtureCrewSessions,
+  servers: fixtureServers,
+};
+
+/**
+ * The `/api/crew` census the LEAD serves, matching `fixtureServers` machine for machine — the two
+ * describe the same crew, so a test can mount the roster and the page together without them
+ * disagreeing. `attic` carries the loud pair: an incompatible protocol AND a second lead claiming
+ * the crew, which is what the page has to shout about.
+ *
+ * `ts` is the LEAD's clock and every timestamp here is stamped on it. It is deliberately AHEAD of
+ * the roster's `lastSeenAt` values by a realistic margin so the ages render as ages rather than
+ * as "now" — the page must never date anything against `Date.now()`.
+ */
+export const fixtureCrewStatus: CrewStatusResponse = {
+  crew: { id: "pk1", name: "home", secretGeneration: 3, rotatedAt: 100_000 },
+  self: { id: "bluefin", name: "bluefin", version: "0.30.0" },
+  deputy: { id: "workshop", warrantGeneration: 2 },
+  members: [
+    {
+      id: "bluefin",
+      name: "bluefin",
+      isLead: true,
+      health: "reachable",
+      lastSeenAt: 1_000,
+      version: "0.30.0",
+      secretBehind: false,
+      provisional: false,
+    },
+    {
+      id: "workshop",
+      name: "workshop",
+      isLead: false,
+      address: "workshop.tail1234.ts.net:8787",
+      enrolledAt: 50_000,
+      health: "reachable",
+      lastSeenAt: 990,
+      version: "0.29.0",
+      secretBehind: false,
+      provisional: false,
+    },
+    {
+      id: "attic",
+      name: "attic",
+      isLead: false,
+      address: "attic.tail1234.ts.net:8787",
+      enrolledAt: 60_000,
+      health: "conflicted",
+      reason: "crew protocol 2 (this issance speaks 1)",
+      lastSeenAt: 500,
+      secretBehind: true,
+      provisional: true,
+      conflict: { leadMemberId: "cellar", warrantGeneration: 7 },
+    },
+  ],
+  ts: 400_000,
+};
+
+/**
+ * What `POST /api/tab` answers: the fresh shell pane of a new tab in `issance` (w2). Shared by the
+ * unit layer's handler below and the browser tier's stub (e2e/fixtures/api.ts), so the two never
+ * describe a created tab two ways.
+ */
+export const fixtureNewTab: Extract<CreateResponse, { ok: true }> = {
+  ok: true,
+  pane: {
+    paneId: "w2:p9",
+    workspaceId: "w2",
+    workspaceLabel: "issance",
+    tabId: "w2:t9",
+    cwd: "/home/you/issance",
+  },
+};
+
+/**
+ * What `POST /api/workspace` answers: the fresh shell pane of a new space, opened in the fixture
+ * operator's home. Shared by the unit layer's handler below and the browser tier's stub
+ * (e2e/fixtures/api.ts), which swaps in the folder a create named, the way a multiplexer reports it.
+ */
+export const fixtureNewSpace: Extract<CreateResponse, { ok: true }> = {
+  ok: true,
+  pane: {
+    paneId: "w9:p1",
+    workspaceId: "w9",
+    workspaceLabel: "new-space",
+    tabId: "w9:t1",
+    cwd: "/home/you",
+  },
+};
+
+/** A minimal two-turn transcript: a human ask and the agent's tool-call-plus-answer reply. */
+/** The window's numbering, and where its turns sit. Both mirror the bridge: a `gen` is clock-seeded
+ *  and `seq` starts at 1,000,000 so a `?before=` page can number DOWN without signs. */
+export const FIXTURE_CHAT_GEN = 1_759_000_000_000;
+export const FIXTURE_SEQ_BASE = 1_000_000;
+
+export const fixtureTranscript: TranscriptEntry[] = [
+  {
+    uuid: "t1",
+    ts: "2026-07-25T06:22:21.253Z",
+    role: "user",
+    parts: [{ kind: "text", text: "what changed today?" }],
+  },
+  {
+    uuid: "t2",
+    ts: "2026-07-25T06:22:24.093Z",
+    role: "assistant",
+    parts: [
+      { kind: "tool", name: "Bash", summary: "git log --oneline", result: { text: "abc1234 fix" } },
+      { kind: "text", text: "One commit: abc1234." },
+    ],
+  },
+];
+
+/** Ask histories used by the Chat browser cases alongside real terminal captures. */
+function ompAskChat(summary: string, questions: readonly ToolQuestion[]): PaneChatResponse {
+  const part: TranscriptPart = {
+    kind: "tool",
+    name: "ask",
+    summary,
+    id: "omp-ask-1",
+    call: { kind: "question", name: "ask", summary, questions },
+  };
+  const turn: ChatEntry = {
+    uuid: "omp-ask-turn",
+    ts: "2026-10-13T09:00:00.000Z",
+    role: "assistant",
+    seq: 1_000_000,
+    parts: [part],
+  };
+  return {
+    paneId: fixtureAgents[0]!.paneId,
+    available: true,
+    page: "live",
+    gen: 1,
+    rev: 1,
+    head: turn.seq,
+    oldest: turn.seq,
+    hasOlder: false,
+    upserts: [turn],
+  };
+}
+
+export const fixtureOmpAskSingleChat = ompAskChat("Pick a colour", [
+  {
+    question: "Pick a colour",
+    multiple: false,
+    options: [{ label: "Red" }, { label: "Blue" }, { label: "Other (type your own)" }],
+  },
+]);
+
+export const fixtureOmpAskBatchChat = ompAskChat("Where should the note go?", [
+  {
+    header: "Location",
+    question: "Where should the note go?",
+    multiple: false,
+    options: [{ label: "Above" }, { label: "Below" }, { label: "Separate" }, { label: "Other (type your own)" }],
+  },
+  {
+    header: "Alternative",
+    question: "Which alternative should we keep?",
+    multiple: false,
+    options: [{ label: "Above" }, { label: "Below" }, { label: "Separate" }, { label: "Other (type your own)" }],
+  },
+  {
+    header: "Confirm",
+    question: "Confirm this plan?",
+    multiple: false,
+    options: [{ label: "Above" }, { label: "Below" }, { label: "Separate" }, { label: "Other (type your own)" }],
+  },
+]);
+
+/**
+ * A journal image reference in the ONE shape `imageSrc` accepts: a blob path on the owning issance,
+ * `/api/blobs/<64 hex>` (`lib/api.ts` § BLOB_REF). Anything else is refused there and renders as no
+ * image, so a fixture that used a plausible-looking `https://` URL would be testing the refusal.
+ */
+export const fixtureImageRef = "/api/blobs/" + "3f".repeat(32);
+
+/**
+ * {@link fixtureTranscript} plus ONE turn that carries a picture.
+ *
+ * A separate export rather than an image part spliced into `fixtureTranscript`: that array is the
+ * newest-turn fixture `use-latest-reply.test.ts` reads, and a third turn — or a second part on the
+ * newest one — moves what "the newest spoken turn" is. So the two-turn body stays exactly what it
+ * was, and the image case takes this one, which is that body with a turn appended.
+ *
+ * ONE image, deliberately. The mirror aligns pictures to placeholder clusters FROM THE END
+ * (`lib/mirror-images.ts` § alignImagesFromEnd), so a screen showing two clusters and holding one
+ * image renders a badge above a picture — both states at once, in one fixture.
+ */
+export const fixtureTranscriptWithImage: TranscriptEntry[] = [
+  ...fixtureTranscript,
+  {
+    uuid: "t3",
+    ts: "2026-07-25T06:22:31.771Z",
+    role: "assistant",
+    parts: [
+      { kind: "text", text: "Here is the screen." },
+      { kind: "image", url: fixtureImageRef },
+    ],
+  },
+];
+
+// ── The fake pane's input box ────────────────────────────────────────────────────────────────────
+// A guarded reply (lib/reply-action.ts) types with submit:false and then polls pane reads until the
+// adapter can see that text on the "❯" line — only then does it send the submit key. So the fake
+// pane has to behave like a real TUI (text typed → it appears on the prompt line; submit → the line
+// clears) or no guarded send would ever verify and every send test would stall.
+let typedDraft = "";
+/** Reset between tests (setup.ts afterEach) so a draft can't leak into the next case. */
+export function resetTypedDraft(): void {
+  typedDraft = "";
+}
+/** Record what a reply POST did to the input line — exported so tests that override the reply
+ *  handler with their own can keep the fake pane honest. */
+export function recordReply(body: { text?: string; submit?: boolean }): void {
+  typedDraft = body.submit ? "" : body.text ?? "";
+}
+// 40 box glyphs is comfortably above isBoxBorder's BARE_BORDER_MIN floor (8, harness/claude/markers.ts).
+const BOX_RULE = "─".repeat(40);
+/**
+ * `base` output with the current draft rendered inside a Claude-shaped input box below it. The box is
+ * ALWAYS drawn, empty draft included — that is what a real idle Claude pane looks like, and the reply
+ * path's pre-flight (`composerReady`) now reads it: a fake pane that only grew a box once text had
+ * been typed would report "no input box" and refuse every send before it started.
+ */
+export function paneTextWithDraft(base = "hello from the pane"): string {
+  return `${base}\n${BOX_RULE}\n❯ ${typedDraft}\n${BOX_RULE}`;
+}
+
+// ── The fake bridge's Send Protocol (M56 spec 06) ────────────────────────────────────────────────
+// Every text the composer sends is one request to `POST /api/send` (a pane on this machine) or to the
+// pane's reply route with an `id` (a pane on a crew member, which answers under `send`). The fake
+// records each request and answers `sent` unless a test answers otherwise with `sendHandler`.
+
+/** One request the fake bridge took, with the machine it was for when the pane is on a member. */
+export interface SentRequest {
+  id: string;
+  pane: string;
+  text: string;
+  mode: string;
+  rowsHash?: string;
+  /** The person's extra confirm after the cap's notice (M56 spec 09). */
+  capAck?: boolean;
+  /** A resend of an ended held row (M56 spec 15): the old request id; the text is empty. */
+  resendOf?: string;
+  host?: string;
+}
+let sends: SentRequest[] = [];
+/** The Send Protocol requests the fake bridge took in this test, oldest first. */
+export function recordedSends(): readonly SentRequest[] {
+  return sends;
+}
+/** Reset between tests (msw.ts afterEach). */
+export function resetSends(): void {
+  sends = [];
+}
+
+/** The parts of an answer a test names; everything else is a plain receipt. */
+export interface SendAnswerParts {
+  readonly offers?: readonly string[];
+  readonly rowsHash?: string;
+  readonly surface?: Surface;
+  readonly detail?: string;
+  /** The cap's answer (M56 spec 09): the count, the limit, the harness and its version. */
+  readonly cap?: { readonly count: number; readonly limit: number; readonly harness: string; readonly version: string };
+  /** The receipt's `queued`: the send went in while the turn ran and waits for its end. */
+  readonly queued?: boolean;
+}
+
+/** An answer body the way the bridge writes one: a receipt with the outcome and reason, then the offers. */
+export function sendAnswer(id: string, outcome: string | null, reason?: string, parts: SendAnswerParts = {}): JsonObject {
+  const body: JsonObject = { offers: [...(parts.offers ?? [])] };
+  if (outcome !== null) {
+    const receipt: JsonObject = reason === undefined ? { requestId: id, outcome, keys: [] } : { requestId: id, outcome, reason, keys: [] };
+    if (parts.queued === true) receipt.queued = true;
+    body.receipt = receipt;
+  }
+  if (parts.rowsHash !== undefined) body.rowsHash = parts.rowsHash;
+  if (parts.surface !== undefined) body.surface = parseJsonObject(JSON.stringify(parts.surface)) ?? {};
+  if (parts.detail !== undefined) body.detail = parts.detail;
+  if (parts.cap !== undefined) body.cap = { ...parts.cap };
+  return body;
+}
+
+function sentRequest(body: JsonObject | undefined, pane: string, host: string | null): SentRequest {
+  const rowsHash = asJsonString(body?.rowsHash);
+  const request: SentRequest = {
+    id: asJsonString(body?.id) ?? "",
+    pane,
+    text: asJsonString(body?.text) ?? "",
+    mode: asJsonString(body?.mode) ?? "send",
+  };
+  if (rowsHash !== undefined) request.rowsHash = rowsHash;
+  if (body?.capAck === true) request.capAck = true;
+  const resendOf = asJsonString(body?.resendOf);
+  if (resendOf !== undefined) request.resendOf = resendOf;
+  if (host !== null) request.host = host;
+  return request;
+}
+
+/**
+ * Answer every Send Protocol request with `answer` (this machine and crew members alike), recording
+ * each one. Use with `server.use(...)`.
+ */
+export function sendHandler(answer: (request: SentRequest) => JsonObject) {
+  return [
+    http.post("/api/send", async ({ request }) => {
+      const body = parseJsonObject(await request.text());
+      const sent = sentRequest(body, asJsonString(body?.pane) ?? "", null);
+      sends.push(sent);
+      return HttpResponse.json(answer(sent));
+    }),
+    http.post(/\/api\/pane\/[^/]+\/reply/, async ({ request }) => {
+      const url = new URL(request.url);
+      const body = parseJsonObject(await request.text());
+      // The old reply shape (no request id) is the dialog-note and prompt paths: keep the fake pane honest.
+      if (asJsonString(body?.id) === undefined) {
+        recordReply({ text: asJsonString(body?.text) ?? "", submit: body?.submit === true });
+        return HttpResponse.json({ ok: true });
+      }
+      const pane = decodeURIComponent(url.pathname.split("/")[3] ?? "");
+      const sent = sentRequest(body, pane, url.searchParams.get("host"));
+      sends.push(sent);
+      const send = answer(sent);
+      const receipt = asJsonObject(send.receipt);
+      const ok = receipt === undefined || receipt.outcome === "sent" || receipt.outcome === "effective" || receipt.outcome === "discarded";
+      return HttpResponse.json({ ok, send });
+    }),
+  ];
+}
+
+// ── The fake bridge's walky talky (M62) ─────────────────────────────────────────────────────────
+// `GET /api/pane/:id/walky` answers the rows a test set with `setWalkyRows` (none by default), and
+// `POST /api/walky` records each body and answers an accepted receipt per target, one for `all`.
+
+/** An agent message to this pane, held and verified by its lead: the card's happy path. */
+export const fixtureWalkyAgent: WalkyRow = {
+  v: 1,
+  id: "wt_k3f9x2m8q1a0",
+  kind: "agent",
+  from: { memberId: "bluefin", address: "bluefin/w6:p3", harness: "claude", label: "issance-workspace#fix-465" },
+  to: "bluefin/w1:p1",
+  replyTo: null,
+  at: Date.parse("2026-10-17T09:30:00Z"),
+  body: "Tests are green on fix-465. You can merge.",
+  signer: "bluefin",
+  signature: "c2ln",
+  receipt: { id: "wt_k3f9x2m8q1a0", state: "delivered", verified: "origin", at: Date.parse("2026-10-17T09:30:02Z"), by: "bluefin", target: "bluefin/w1:p1" },
+};
+
+/** An operator message from a paired phone, a reply to the agent's, written locally. */
+export const fixtureWalkyOperator: WalkyRow = {
+  v: 1,
+  id: "wt_p0q9r8s7t6u5",
+  kind: "operator",
+  from: { memberId: "bluefin", address: null, harness: null, label: "phone-altan" },
+  to: "bluefin/w1:p1",
+  replyTo: "wt_k3f9x2m8q1a0",
+  at: Date.parse("2026-10-17T09:31:00Z"),
+  body: "Stop and report what you changed.",
+  signer: null,
+  signature: null,
+  receipt: { id: "wt_p0q9r8s7t6u5", state: "inbox-only", reason: "dialog open", verified: "local", at: Date.parse("2026-10-17T09:31:01Z"), by: "solo", target: "bluefin/w1:p1" },
+};
+
+/** The address of the pane the walky fixtures belong to: the target of the two rows above, the sender of the one below. */
+export const fixtureWalkySelf = "bluefin/w1:p1";
+
+/** A message THIS pane sent to another agent pane (the list holds sent rows too), with its receipt. */
+export const fixtureWalkySent: WalkyRow = {
+  v: 1,
+  id: "wt_s3ntaaaa0001",
+  kind: "agent",
+  from: { memberId: "bluefin", address: "bluefin/w1:p1", harness: "claude", label: "issance-workspace#this-pane" },
+  to: "bluefin/w6:p3#k3f9",
+  replyTo: null,
+  at: Date.parse("2026-10-17T09:32:00Z"),
+  body: "Merged. Thanks.",
+  signer: "bluefin",
+  signature: "c2ln",
+  receipt: { id: "wt_s3ntaaaa0001", state: "delivered", verified: "local", at: Date.parse("2026-10-17T09:32:02Z"), by: "bluefin", target: "bluefin/w6:p3" },
+};
+
+let walkyRows: WalkyRow[] = [];
+let walkyPosts: WalkySendBody[] = [];
+/** The rows `GET /api/pane/:id/walky` answers with, newest first. */
+export function setWalkyRows(rows: readonly WalkyRow[]): void {
+  walkyRows = [...rows];
+}
+/** The `POST /api/walky` bodies the fake bridge took in this test, oldest first. */
+export function recordedWalkyPosts(): readonly WalkySendBody[] {
+  return walkyPosts;
+}
+/** Reset between tests (msw.ts afterEach). */
+export function resetWalky(): void {
+  walkyRows = [];
+  walkyPosts = [];
+}
+function walkyReceipt(id: string, to: string): WalkyReceipt {
+  return { id, state: "accepted", verified: "local", at: Date.now(), by: to.split("/")[0] ?? "solo", target: to };
+}
+
+// Default happy-path handlers; individual tests can override via server.use(...).
+/** The rule catalog `GET /api/cache-rules` answers with. Shaped exactly as the bridge composes it. */
+export const fixtureCacheRules: CacheRuleWire[] = [
+  {
+    id: "claude.subscription",
+    label: "Claude Code on a Claude subscription (Pro/Max)",
+    ttlSeconds: 3600,
+    confidence: "documented",
+    sourceTitle: "How Claude Code uses prompt caching",
+    sourceUrl: "https://code.claude.com/docs/en/prompt-caching",
+    retrievedAt: "2026-08-24",
+    slidingWindow: true,
+    automatic: true,
+    note: "Subagents use the five-minute TTL even on a subscription.",
+  },
+  {
+    id: "claude.api",
+    label: "Claude Code on an API key or third-party provider",
+    ttlSeconds: 300,
+    confidence: "documented",
+    sourceTitle: "How Claude Code uses prompt caching",
+    sourceUrl: "https://code.claude.com/docs/en/prompt-caching",
+    retrievedAt: "2026-08-24",
+    slidingWindow: true,
+    automatic: true,
+    overridden: {
+      ttlSeconds: 3600,
+      sourceUrl: "https://our.gateway.invalid/notes",
+      retrieved: "2026-09-12",
+      note: "our gateway sends ttl 1h on every request",
+    },
+  },
+];
+
+// The Changes view (ADR 0065): a workspace repo with two member repos below it, the shape the
+// feature was asked for. Shared by the unit suite, the e2e stub and the playground.
+export const fixtureChanges: PaneChangesResponse = {
+  paneId: "w1:p1",
+  workspaceId: "w1",
+  workspaceLabel: "webapp",
+  available: true,
+  root: "/home/you/webapp",
+  truncated: false,
+  repos: [
+    {
+      relPath: ".",
+      name: "webapp",
+      files: [
+        { path: "src/routes/checkout.tsx", status: "M", added: 3, removed: 1, binary: false },
+        { path: "src/lib/cart.ts", status: "A", added: 4, removed: 0, binary: false },
+        { path: "public/logo.png", status: "M", added: 0, removed: 0, binary: true },
+      ],
+    },
+    {
+      relPath: "packages/api",
+      name: "api",
+      files: [
+        { path: "server/handlers/orders.ts", oldPath: "server/orders.ts", status: "R", added: 1, removed: 1, binary: false },
+        { path: "notes.md", status: "?", added: 2, removed: 0, binary: false },
+      ],
+    },
+  ],
+};
+
+const FIXTURE_DIFFS = {
+  ".\nsrc/routes/checkout.tsx": [
+    "diff --git a/src/routes/checkout.tsx b/src/routes/checkout.tsx",
+    "index 1a2b3c4..5d6e7f8 100644",
+    "--- a/src/routes/checkout.tsx",
+    "+++ b/src/routes/checkout.tsx",
+    "@@ -12,5 +12,7 @@ export function Checkout() {",
+    "   const cart = useCart();",
+    "-  const total = cart.items.reduce((sum, item) => sum + item.price, 0);",
+    "+  const total = cartTotal(cart.items);",
+    "+  const shipping = total > 50 ? 0 : 4.9;",
+    "+  const label = `${formatPrice(total + shipping)} including shipping to ${cart.address?.city ?? \"your door\"}`;",
+    "   return (",
+    "     <section>",
+    "       <h1>Checkout</h1>",
+    "",
+  ].join("\n"),
+  ".\nsrc/lib/cart.ts": [
+    "diff --git a/src/lib/cart.ts b/src/lib/cart.ts",
+    "new file mode 100644",
+    "--- /dev/null",
+    "+++ b/src/lib/cart.ts",
+    "@@ -0,0 +1,4 @@",
+    "+export function cartTotal(items: { price: number }[]): number {",
+    "+  return items.reduce((sum, item) => sum + item.price, 0);",
+    "+}",
+    "+",
+    "",
+  ].join("\n"),
+  "packages/api\nserver/handlers/orders.ts": [
+    "diff --git a/server/orders.ts b/server/handlers/orders.ts",
+    "similarity index 90%",
+    "rename from server/orders.ts",
+    "rename to server/handlers/orders.ts",
+    "@@ -1,3 +1,3 @@",
+    "-import { db } from \"./db\";",
+    "+import { db } from \"../db\";",
+    " ",
+    " export async function listOrders() {",
+    "",
+  ].join("\n"),
+  "packages/api\nnotes.md": "diff --git a/notes.md b/notes.md\nnew file\n--- /dev/null\n+++ b/notes.md\n@@ -0,0 +1,2 @@\n+# Notes\n+Orders moved under handlers/.\n",
+};
+
+function diffFor(key: string): string | undefined {
+  return Object.entries(FIXTURE_DIFFS).find(([k]) => k === key)?.[1];
+}
+
+/** The fixture diff for one listed file, answered the way the bridge answers it. */
+export function fixtureChangeDiff(repo: string, path: string): PaneChangeDiffResponse {
+  const file = fixtureChanges.available
+    ? fixtureChanges.repos.find((r) => r.relPath === repo)?.files.find((f) => f.path === path)
+    : undefined;
+  if (!file) return { paneId: "w1:p1", workspaceId: "w1", workspaceLabel: "webapp", available: false, reason: "unknown-path" };
+  const answer: PaneChangeDiffResponse = {
+    paneId: "w1:p1",
+    workspaceId: "w1",
+    workspaceLabel: "webapp",
+    available: true,
+    repo,
+    path,
+    status: file.status,
+    binary: file.binary,
+    directory: false,
+    truncated: false,
+    diff: file.binary ? "" : (diffFor(`${repo}\n${path}`) ?? ""),
+  };
+  if (file.oldPath !== undefined) answer.oldPath = file.oldPath;
+  return answer;
+}
+
+// The commit view (ADR 0065): the same workspace after the agent committed its work. The list is
+// empty and offers the repo's last commit; that commit holds two of the files above.
+export const fixtureCleanChanges: PaneChangesResponse = {
+  paneId: "w1:p1",
+  workspaceId: "w1",
+  workspaceLabel: "webapp",
+  available: true,
+  root: "/home/you/webapp",
+  truncated: false,
+  repos: [],
+  clean: [{ relPath: ".", name: "webapp" }],
+};
+
+export const fixtureCommit: ChangeCommitResponse & { paneId: string } = {
+  paneId: "w1:p1",
+  workspaceId: "w1",
+  workspaceLabel: "webapp",
+  available: true,
+  repo: ".",
+  name: "webapp",
+  commit: {
+    hash: "3f2a9c1e5b7d4f60a8e2c4b6d8f0a1c3e5b7d9f1",
+    shortHash: "3f2a9c1",
+    subject: "Move the cart total into its own helper and charge shipping under 50",
+    author: "Claude",
+    time: 1_790_000_000,
+  },
+  truncated: false,
+  files: [
+    { path: "src/routes/checkout.tsx", status: "M", added: 3, removed: 1, binary: false },
+    { path: "src/lib/cart.ts", status: "A", added: 4, removed: 0, binary: false },
+  ],
+};
+
+/** One file of the fixture commit, answered the way the bridge answers it. */
+export function fixtureCommitDiff(repo: string, path: string): ChangeCommitDiffResponse & { paneId: string } {
+  const head = { paneId: "w1:p1", workspaceId: "w1", workspaceLabel: "webapp" };
+  const file = fixtureCommit.available && repo === fixtureCommit.repo ? fixtureCommit.files.find((f) => f.path === path) : undefined;
+  if (!file || !fixtureCommit.available) return { ...head, available: false, reason: "unknown-path" };
+  return {
+    ...head,
+    available: true,
+    repo,
+    path,
+    status: file.status,
+    binary: false,
+    directory: false,
+    truncated: false,
+    diff: diffFor(`${repo}\n${path}`) ?? "",
+    hash: fixtureCommit.commit.hash,
+  };
+}
+
+// The Changes tree (ADR 0083): a small tree under the same root the Changes fixture names, holding
+// every changed file the Changes fixture lists, so the marks join the two. Shared by the unit suite,
+// the e2e stub and the playground, so a folder or a file means the same everywhere.
+const FILES_ROOT = "/home/you/webapp";
+const FILES_HEAD = { paneId: "w1:p1", workspaceId: "w1", workspaceLabel: "webapp" };
+
+const FIXTURE_FOLDERS = new Map<string, FileEntry[]>([
+  [
+    "",
+    [
+      { name: "docs", kind: "dir" },
+      { name: "packages", kind: "dir" },
+      { name: "public", kind: "dir" },
+      { name: "src", kind: "dir" },
+      { name: "README.md", kind: "file", size: 1240 },
+      { name: "index.html", kind: "file", size: 468 },
+      { name: "logo.png", kind: "file", size: 20480 },
+      { name: "package.json", kind: "file", size: 312 },
+      { name: "current", kind: "link" },
+      // What git ignores in this folder. The Files view hides these until the operator asks, so the
+      // rows above are the visible ones; a member that predates the field sends no `ignored` at all.
+      { name: "node_modules", kind: "dir", ignored: true },
+      { name: "debug.log", kind: "file", size: 8200, ignored: true },
+    ],
+  ],
+  ["node_modules", [{ name: "react", kind: "dir", ignored: true }]],
+  ["docs", [{ name: "guide.md", kind: "file", size: 640 }]],
+  // The nested repo of the Changes fixture: a renamed handler and an untracked note.
+  ["packages", [{ name: "api", kind: "dir" }]],
+  [
+    "packages/api",
+    [
+      { name: "server", kind: "dir" },
+      { name: "notes.md", kind: "file", size: 38 },
+    ],
+  ],
+  ["packages/api/server", [{ name: "handlers", kind: "dir" }]],
+  ["packages/api/server/handlers", [{ name: "orders.ts", kind: "file", size: 96 }]],
+  ["public", [{ name: "logo.png", kind: "file", size: 20480 }]],
+  [
+    "src",
+    [
+      { name: "lib", kind: "dir" },
+      { name: "routes", kind: "dir" },
+      { name: "cart.ts", kind: "file", size: 214 },
+    ],
+  ],
+  ["src/lib", [{ name: "cart.ts", kind: "file", size: 120 }]],
+  ["src/routes", [{ name: "checkout.tsx", kind: "file", size: 388 }]],
+]);
+
+const FIXTURE_FILE_TEXT = new Map<string, string>([
+  [
+    "README.md",
+    [
+      "# Webapp",
+      "",
+      "A small shop. **Run it** with `bun dev`, then open the [docs](https://example.com/docs).",
+      "",
+      "- carts",
+      "- checkout",
+      "",
+      "<script>alert(1)</script>",
+      "",
+    ].join("\n"),
+  ],
+  ["docs/guide.md", "# Guide\n\nRead the cart code first.\n"],
+  [
+    "package.json",
+    JSON.stringify({ name: "webapp", version: "1.2.0", private: true, scripts: { dev: "vite", build: "vite build" }, files: ["dist", "src"] }, null, 2) + "\n",
+  ],
+  [
+    "index.html",
+    '<!doctype html><html><body style="font-family:sans-serif"><h1>Hello from a file</h1><p>Scripts, forms and remote files stay off.</p></body></html>\n',
+  ],
+  ["src/cart.ts", 'export function cartTotal(items: { price: number }[]): number {\n  return items.reduce((sum, item) => sum + item.price, 0);\n}\n'],
+  ["src/lib/cart.ts", 'export function cartTotal(items: { price: number }[]): number {\n  return items.reduce((sum, item) => sum + item.price, 0);\n}\n'],
+  ["packages/api/notes.md", "# Notes\nOrders moved under handlers/.\n"],
+  ["packages/api/server/handlers/orders.ts", "export function orders() {\n  return [];\n}\n"],
+  ["src/routes/checkout.tsx", 'export function Checkout() {\n  return <h1>Checkout</h1>;\n}\n'],
+]);
+
+const FIXTURE_BINARY = new Map<string, number>([
+  ["logo.png", 20480],
+  ["public/logo.png", 20480],
+]);
+
+/** The fixture folder `dir`, answered the way the bridge answers it, or null for a folder it has none of. */
+export function fixtureFilesDir(dir: string): FilesListResponse | null {
+  const entries = FIXTURE_FOLDERS.get(dir);
+  if (entries === undefined) return null;
+  return { ...FILES_HEAD, available: true, root: FILES_ROOT, dir, entries, truncated: false };
+}
+
+/** The modification time every fixture file answers with, epoch ms (the version's second half). */
+export const FIXTURE_MTIME_MS = 1_728_300_000_000;
+
+/** The fixture file `path`, answered the way the bridge answers it, or null for a path it has none of. */
+export function fixtureFileRead(path: string): FileReadResponse | null {
+  const bytes = FIXTURE_BINARY.get(path);
+  if (bytes !== undefined) {
+    return { ...FILES_HEAD, available: true, root: FILES_ROOT, path, size: bytes, mtimeMs: FIXTURE_MTIME_MS, binary: true, truncated: false, text: "" };
+  }
+  const text = FIXTURE_FILE_TEXT.get(path);
+  if (text === undefined) return null;
+  return { ...FILES_HEAD, available: true, root: FILES_ROOT, path, size: text.length, mtimeMs: FIXTURE_MTIME_MS, binary: false, truncated: false, text };
+}
+
+/** The route's one answer for a path that is not there, outside the root or denied. */
+export const FIXTURE_FILES_UNKNOWN = { error: "unknown-path" } as const;
+
+/** A 1 × 1 transparent PNG: the bytes every fixture picture answers the image read with (ADR 0090). */
+const FIXTURE_PNG = Uint8Array.from(
+  atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="),
+  (c) => c.charCodeAt(0),
+);
+
+/** The bytes the image read answers for `path`: a fixture binary named `.png`, or null (404). */
+export function fixtureFileImage(path: string): Uint8Array | null {
+  return FIXTURE_BINARY.has(path) && path.endsWith(".png") ? FIXTURE_PNG : null;
+}
+
+export const handlers = [
+  // The session page's recent sends (M56 spec 09): none, unless a test says otherwise.
+  http.get("/api/send/receipts", () => HttpResponse.json({ receipts: [] })),
+  http.get(/\/api\/pane\/[^/]+\/walky/, () => HttpResponse.json({ messages: walkyRows })),
+  http.post("/api/walky", async ({ request }) => {
+    const body = parseJsonObject(await request.text());
+    const posted: WalkySendBody = {
+      id: asJsonString(body?.id) ?? "",
+      to: asJsonString(body?.to) ?? "",
+      body: asJsonString(body?.body) ?? "",
+    };
+    const replyTo = asJsonString(body?.replyTo);
+    if (replyTo !== undefined) posted.replyTo = replyTo;
+    walkyPosts.push(posted);
+    if (posted.to === "all") {
+      return HttpResponse.json({ receipts: ["bluefin/w1:p1", "minibuch/w2:p1"].map((to) => walkyReceipt(posted.id, to)) });
+    }
+    if (posted.to.endsWith("/all")) {
+      return HttpResponse.json({ receipts: [walkyReceipt(posted.id, `${posted.to.slice(0, -4)}/w1:p1`)] });
+    }
+    return HttpResponse.json({ receipt: walkyReceipt(posted.id, posted.to) });
+  }),
+  // No agents, no shell panes, no refusals; a test that needs more overrides it with server.use(...).
+  http.get("/api/walky/who", () => HttpResponse.json({ targets: [], skipped: [], refusals: null })),
+  http.get("/api/snapshot", () => HttpResponse.json(fixtureSnapshot)),
+  http.get(/\/api\/pane\/[^/]+$/, () =>
+    HttpResponse.json({ paneId: "w1:p1", text: paneTextWithDraft(), truncated: false, revision: 1 }),
+  ),
+  http.get(/\/api\/pane\/[^/]+\/subagent\/[^/]+$/, () =>
+    HttpResponse.json({ paneId: "w1:p1", agentId: "a000000", available: false }),
+  ),
+  // The Changes view: the list, or with ?repo=&path= one file's diff. Asked by pane or by
+  // workspace, the answer is the same list (ADR 0065).
+  http.get(/\/api\/(?:pane|workspace)\/[^/]+\/changes/, ({ request }) => {
+    const q = new URL(request.url).searchParams;
+    const repo = q.get("repo");
+    const path = q.get("path");
+    if (q.get("view") === "commit") {
+      return HttpResponse.json(repo !== null && path !== null ? fixtureCommitDiff(repo, path) : fixtureCommit);
+    }
+    if (repo !== null && path !== null) return HttpResponse.json(fixtureChangeDiff(repo, path));
+    return HttpResponse.json(fixtureChanges);
+  }),
+  // The Files view: a folder (`?dir=`, none for the root) or one file (`?path=`).
+  http.get(/\/api\/(?:pane|workspace)\/[^/]+\/files$/, ({ request }) => {
+    const q = new URL(request.url).searchParams;
+    const path = q.get("path");
+    const answer = path !== null ? fixtureFileRead(path) : fixtureFilesDir(q.get("dir") ?? "");
+    return answer === null ? HttpResponse.json(FIXTURE_FILES_UNKNOWN, { status: 404 }) : HttpResponse.json(answer);
+  }),
+  // One picture under the Files root, as bytes (ADR 0090): a fixture binary named `.png`.
+  http.get(/\/api\/(?:pane|workspace)\/[^/]+\/files\/image$/, ({ request }) => {
+    const bytes = fixtureFileImage(new URL(request.url).searchParams.get("path") ?? "");
+    if (bytes === null) return HttpResponse.json(FIXTURE_FILES_UNKNOWN, { status: 404 });
+    const size = FIXTURE_BINARY.get(new URL(request.url).searchParams.get("path") ?? "") ?? bytes.length;
+    return new HttpResponse(bytes.slice(), {
+      headers: {
+        "content-type": "image/png",
+        "cache-control": "no-store",
+        "x-issance-file-size": String(size),
+        "x-issance-file-mtime": String(FIXTURE_MTIME_MS),
+      },
+    });
+  }),
+  // Which paths exist under the Files root (ADR 0088): the fixture tree's files and folders.
+  http.post(/\/api\/(?:pane|workspace)\/[^/]+\/files\/exist$/, async ({ request }) => {
+    const body = parseJsonObject(await request.text());
+    const paths = Array.isArray(body?.paths) ? body.paths.map(asJsonString).filter((p): p is string => p !== undefined) : [];
+    return HttpResponse.json({ exists: paths.filter((p) => fixtureFileRead(p) !== null || fixtureFilesDir(p) !== null) });
+  }),
+  // Pane transcript history. Two turns, newest-anchored, with nothing older behind them.
+  http.get(/\/api\/pane\/[^/]+\/history/, () =>
+    HttpResponse.json({
+      paneId: "w1:p1",
+      available: true,
+      entries: fixtureTranscript,
+      hasMore: false,
+      total: fixtureTranscript.length,
+      fileTruncated: false,
+    }),
+  ),
+  // The live session window (ADR 0073). The same two turns the transcript fixture has, numbered
+  // into one generation, with nothing older behind them — so a Chat body drawn over this fixture
+  // shows the same conversation the History page does, which is the point of one store under both.
+  http.get(/\/api\/pane\/[^/]+\/chat/, () =>
+    HttpResponse.json({
+      paneId: "w1:p1",
+      available: true,
+      page: "live",
+      gen: FIXTURE_CHAT_GEN,
+      rev: 1,
+      head: FIXTURE_SEQ_BASE + fixtureTranscript.length - 1,
+      oldest: FIXTURE_SEQ_BASE,
+      hasOlder: false,
+      // `Object.assign` onto a fresh object rather than a spread — `no-map-spread`.
+      upserts: fixtureTranscript.map((e, i) => Object.assign({}, e, { seq: FIXTURE_SEQ_BASE + i })),
+    }),
+  ),
+  // Every text from the composer: one Send Protocol request, answered `sent`. The reply route's old
+  // shape (dialog notes, prompt fields) keeps the fake pane's input line honest, as before.
+  ...sendHandler((request) => sendAnswer(request.id, "sent")),
+  http.post(/\/api\/pane\/[^/]+\/keys$/, () => HttpResponse.json({ ok: true })),
+  http.post(/\/api\/pane\/[^/]+\/close$/, () => HttpResponse.json({ ok: true })),
+  http.post(/\/api\/pane\/[^/]+\/rename$/, () => HttpResponse.json({ ok: true })),
+  http.post("/api/tab", () => HttpResponse.json(fixtureNewTab)),
+  http.post("/api/workspace", () => HttpResponse.json(fixtureNewSpace)),
+  // The DEFAULT world is solo, so the census refuses exactly as a non-lead bridge does: 404 with the
+  // app's ordinary JSON error shape. Every pre-existing test therefore keeps asserting the one-host
+  // world, and a test that wants a crew overrides this with `fixtureCrewStatus`.
+  http.get("/api/crew", () =>
+    HttpResponse.json(
+      { error: "this issance is not the lead of a crew", code: "crew.not_lead" },
+      { status: 404 },
+    ),
+  ),
+  // The machines census. The DEFAULT world is solo, which is a lead with one row, so the page has
+  // something to show; a test that wants a crew (or a peer's 404) overrides these. The POST echoes the
+  // body, which is what the bridge answers: the rules as stored.
+  http.get("/api/machines", ({ request }) => HttpResponse.json(censusFor(fixtureMachinesSolo, new URL(request.url)))),
+  http.get("/api/machines/:id/history", ({ request }) => HttpResponse.json(historyFor(new URL(request.url)))),
+  http.post<never, MachineAlerts>("/api/machines/:id/alerts", async ({ request }) =>
+    HttpResponse.json({ alerts: await request.json() }),
+  ),
+  http.get("/api/config", () => HttpResponse.json({ push: false, vapidPublicKey: "" })),
+  // The token-bearing subresources (lib/authed-url.ts, ADR 0086): a picture's bytes and the mark's.
+  // Any bytes do; the page draws them from an object URL the test setup stubs.
+  http.get("/api/blobs/:hash", () => new HttpResponse(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), { headers: { "content-type": "image/png" } })),
+  http.get("/api/mux/logo.svg", () => new HttpResponse("<svg/>", { headers: { "content-type": "image/svg+xml" } })),
+  // Default world: no `launchers.toml`. Session-scoped (server.ts), so a test that wants rows
+  // overrides this with its own `/api/launchers` handler rather than adding a field to `/api/config`.
+  http.get("/api/launchers", () => HttpResponse.json({ launchers: [], home: "" })),
+  // Default world: no folder recorded yet (#289), which is every bridge that never created a space
+  // in a folder. The New page then renders exactly as it did before the list existed; a test
+  // that wants a list overrides these two with its own.
+  http.get("/api/folders", () => HttpResponse.json({ recent: [], favourites: [], home: "" })),
+  http.post("/api/folders/star", () => HttpResponse.json({ recent: [], favourites: [], home: "" })),
+  // The prompt-cache rule catalog. Two rows are enough for every sheet case: one plain and one the
+  // operator moved. A test that wants a different catalog overrides this handler.
+  http.get("/api/cache-rules", () => HttpResponse.json({ rules: fixtureCacheRules })),
+  http.post<never, { snoozedUntil: number | null }>("/api/notifications/snooze", async ({ request }) => {
+    const { snoozedUntil } = await request.json();
+    return HttpResponse.json({ snoozedUntil });
+  }),
+  http.get("/api/notifications/prefs", () =>
+    HttpResponse.json({ blocked: true, done: false, updates: true, cache: false, machines: true }),
+  ),
+  http.post<never, Partial<{ blocked: boolean; done: boolean; updates: boolean; cache: boolean }>>("/api/notifications/prefs", async ({ request }) => {
+    const patch = await request.json();
+    return HttpResponse.json({ blocked: true, done: false, updates: true, cache: false, machines: true, ...patch });
+  }),
+  // The prompt-cache watch list (ADR 0042). The default world watches NOTHING and has the global switch
+  // off, which is a fresh install: a test that wants a watched pane overrides these three.
+  http.get("/api/notifications/cache-watch", () =>
+    HttpResponse.json({ on: false, global: false, watchable: true, warnSeconds: 300 }),
+  ),
+  http.post<never, { on: boolean }>("/api/notifications/cache-watch", async ({ request }) => {
+    const { on } = await request.json();
+    return HttpResponse.json({ on, global: false, watchable: true, warnSeconds: 300 });
+  }),
+  http.get("/api/notifications/cache-watch/list", () => HttpResponse.json({ entries: [] })),
+  http.post("/api/notifications/cache-watch/forget", () => HttpResponse.json({ entries: [] })),
+  // Device pairing. The default world has NOTHING paired, exactly like a fresh install, and pairing
+  // is always on (ADR 0086), so `enforced` is true. The other routes here answer without a token for
+  // the tests' convenience; a test that wants the refusal overrides the route with a 403.
+  http.get("/api/devices", () =>
+    HttpResponse.json({ enforced: true, current: null, devices: [] }),
+  ),
+  http.post("/api/devices/revoke", () =>
+    HttpResponse.json({ enforced: true, current: null, devices: [] }),
+  ),
+  http.post("/api/pair", () =>
+    HttpResponse.json({ error: "no-pending" }, { status: 400 }),
+  ),
+  http.post("/api/update/check", () =>
+    HttpResponse.json({
+      current: "0.11.0",
+      latest: "0.11.0",
+      latestUrl: null,
+      releaseAvailable: false,
+      majorAvailable: null,
+      majorUrl: null,
+      bridgeStale: false,
+      checkedAt: Date.now(),
+    }),
+  ),
+];

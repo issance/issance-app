@@ -1,0 +1,11 @@
+{
+  "source": "local",
+  "upstream": {
+    "github": "issance/issance-app",
+    "digests": true,
+    "assets": {
+      "x86_64": "issance-{pkgver}-linux-x64.tar.gz",
+      "aarch64": "issance-{pkgver}-linux-arm64.tar.gz"
+    }
+  }
+}

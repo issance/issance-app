@@ -1,0 +1,526 @@
+import type { JsonObject, JsonValue } from "./json.ts";
+import { mkdir, rename, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { join } from "node:path";
+import type { Config } from "./config.ts";
+import type { PushTitleCode, PushTitleDetail } from "./push-titles.ts";
+import { redactText } from "./redact.ts";
+
+// Optional Web Push (VAPID). Zero hard dependency: if `web-push` isn't installed or VAPID keys
+// aren't configured, push is silently disabled and the rest of the bridge works unchanged.
+// Subscriptions are persisted to the state dir so they survive restarts, and there are exactly three
+// ways a row leaves that file: the push service disowns it mid-send (404/410, or EVICT_AFTER
+// same-origin-witnessed failures — see broadcast()), the device that owns it registers a successor
+// (SubscriptionMeta.replaces), or an operator drops it by hand (`issance push forget`). The first
+// alone is not enough, which is issue #104: a subscription orphaned by a service-worker
+// re-registration was never `unsubscribe()`d, so the push service has no reason to reject it and it
+// accumulates forever, answering 201 to nobody. Hence the other two.
+
+type WebPushModule = typeof import("web-push");
+export type PushSubscription = { endpoint: string; keys: { p256dh: string; auth: string } };
+
+/**
+ * A persisted row: the subscription web-push needs, plus metadata that exists only so an OPERATOR
+ * can tell two rows apart. Both fields are optional in every direction — a file written before they
+ * existed loads unchanged, and a row that never learned a user agent simply hasn't got one.
+ *
+ * They are deliberately NOT part of {@link PushSubscription}: what reaches `sendNotification` is
+ * rebuilt as `{ endpoint, keys }`, because web-push signs and serialises what it is handed and an
+ * extra field there is a wire change nobody asked for.
+ */
+export interface StoredSubscription extends PushSubscription {
+  /** When this endpoint was FIRST seen. Preserved across a re-subscribe of the same endpoint —
+   *  "since when has this device been subscribed" is the question it answers, not "when last". */
+  createdAt?: string;
+  /** The `User-Agent` of the request that registered it, trimmed and capped. The only thing that
+   *  tells "my iPhone" from "the Mac I used once" in a list of opaque Apple endpoints. */
+  userAgent?: string;
+}
+
+/** What a registration knows about itself beyond the subscription — see {@link Push.addSubscription}. */
+export interface SubscriptionMeta {
+  /**
+   * An endpoint this registration SUPERSEDES: the one the same device last registered with. A
+   * service worker re-registration (a reinstall, a rejected push topic, a restart-triggered
+   * re-subscribe) mints a brand-new endpoint without `unsubscribe()`ing the old one, so the push
+   * service keeps answering 201 for a row nothing will ever read — invisible to the send-time
+   * 404/410 prune, and the whole of issue #104. The device is the only party that knows the two are
+   * the same device, so it is the device that says so.
+   */
+  replaces?: string;
+  userAgent?: string;
+}
+
+/**
+ * What a delivery answers with. Structurally `web-push`'s own `SendResult`, restated here so the
+ * seam does not drag the library's types into every fake — and optional throughout, because nothing
+ * on the send path reads it: a FAILED delivery throws, and that is the only outcome that matters.
+ */
+export type PushDeliveryResult = { statusCode?: number; body?: string; headers?: unknown } | void;
+
+/** One row of {@link PushStore.listSubscriptions} — metadata only, never the sending keys. */
+export type SubscriptionRow = { endpoint: string; createdAt?: string; userAgent?: string };
+
+/** The deep-link fields the service worker reads off a push payload (see web/src/sw.ts). */
+type PushPayloadData = {
+  paneId?: string;
+  session?: string;
+  host?: string;
+  machine?: string;
+  target?: "settings" | "machine";
+};
+
+/** The HTTP status a `web-push` rejection carries, or undefined when it carries none. */
+function sendErrorStatus<T>(err: T): number | undefined {
+  if (err === null || typeof err !== "object" || !("statusCode" in err)) return undefined;
+  return typeof err.statusCode === "number" ? err.statusCode : undefined;
+}
+
+/** Longer than this and a user agent is padding a terminal column, not identifying a device. */
+const USER_AGENT_MAX = 160;
+
+/** One row off disk. Anything that isn't a usable subscription is dropped; the two metadata fields
+ *  are carried only when they are strings, so a file written before they existed loads unchanged. */
+function coerceStored(v: JsonValue | undefined): StoredSubscription | null {
+  if (typeof v !== "object" || v === null || v === undefined || Array.isArray(v)) return null;
+  const o: JsonObject = v;
+  const keys = o.keys;
+  if (typeof o.endpoint !== "string" || typeof keys !== "object" || keys === null || keys === undefined || Array.isArray(keys)) {
+    return null;
+  }
+  if (typeof keys.p256dh !== "string" || typeof keys.auth !== "string") return null;
+  const row: StoredSubscription = {
+    endpoint: o.endpoint,
+    keys: { p256dh: keys.p256dh, auth: keys.auth },
+  };
+  if (typeof o.createdAt === "string") row.createdAt = o.createdAt;
+  if (typeof o.userAgent === "string") row.userAgent = o.userAgent.slice(0, USER_AGENT_MAX);
+  return row;
+}
+
+// Delivery options passed to web-push on every send. Without them a message gets web-push's 4-week
+// default TTL and NO collapse key, so an offline device replays every queued herd update on reconnect.
+//   • `topic` is a collapse key — the push service keeps only the LATEST message per device with this
+//     topic, so a reconnecting phone gets one current summary instead of a burst of stale ones. Must
+//     match [A-Za-z0-9_-] and be ≤32 chars ("issance-herd" is valid) — and, for Apple, must also be a
+//     LENGTH BASE64 CAN PRODUCE: never ≡ 1 (mod 4). RFC 8030 §5.4 only calls the topic URL-safe
+//     base64; Apple enforces that by decoding it, while FCM and Mozilla treat it as opaque. A
+//     13-character topic decodes nowhere (base64 turns 3 bytes into 4 chars, so a trailing group of
+//     one is impossible) and APNs answers 400 `{"reason":"BadWebPushTopic"}` for every endpoint.
+//     Measured, not inferred: "issance-update" (13) and "issance-herdab" (13) both fail, while
+//     "issance-updat" (12), "issance-herd" (11) and "issance-updates" (14) all succeed — so it is the
+//     arithmetic, not a length cap and not the wording. `topicIsSendable` pins this below.
+//   • `TTL` (seconds) bounds how long the service holds an undelivered message: 6h is long enough to
+//     reach a briefly-offline phone but short enough that a day-old "needs you" doesn't resurface.
+//   • `urgency: "high"` is load-bearing on Android, and its absence was a silent alert-eater:
+//     web-push defaults to `normal` (RFC 8030), FCM maps that to normal priority, and Android is then
+//     free to hold the message until the next Doze maintenance window — or to defer it by the PWA's
+//     App Standby bucket, which DEEPENS the less you open the app. That degrades into a vicious
+//     circle rather than a clean break: fewer alerts → fewer opens → deeper bucket → fewer alerts.
+//     Live-diagnosed by sending one endpoint the same payload at both urgencies minutes apart: normal
+//     never arrived, high arrived at once. Retractions ride this too, deliberately — a deferred
+//     `clear` leaves a handled alert on your lock screen, the exact thing the coordinator exists to
+//     prevent. It costs battery (high urgency punches through power-saving), which is the right trade
+//     for "an agent is waiting on you" and NOT for the update notice below.
+const SEND_OPTIONS = { TTL: 21_600, topic: "issance-herd", urgency: "high" } as const;
+// Update-available pushes ride their OWN collapse topic (and a longer TTL). The `topic` — NOT the
+// client-side `tag` — is the push service's collapse key: sharing "issance-herd" would make an offline
+// device's queued herd summary and an update push silently overwrite each other. 3-day TTL, since an
+// update stays relevant far longer than a transient "needs you". The trailing "s" is not a typo:
+// "issance-update" is 13 characters, which Apple refuses outright — see the base64 note above.
+const UPDATE_SEND_OPTIONS = { TTL: 259_200, topic: "issance-updates" } as const;
+// A machine's sustained load (ADR 0084) rides its own topics, for the update push's reason: sharing
+// "issance-herd" would let a queued load alert and a queued herd summary overwrite each other. One hour
+// of TTL, because a load alert older than that describes a minute the Machines page shows better, and
+// `high` urgency for the herd's reason: it is one push per episode, and a deferred one is late for the
+// only thing it is for. The topic is one per machine and metric ({@link machineTopic}), carried on the
+// message's `topic`; "issance-machines" (15 characters, which base64 can produce) is only the fallback
+// for a machine message that names none.
+const MACHINE_SEND_OPTIONS = { TTL: 3_600, topic: "issance-machines", urgency: "high" } as const;
+
+/** The fixed start of every per-machine topic. 16 characters, plus {@link MACHINE_TOPIC_HASH} = 28. */
+const MACHINE_TOPIC_PREFIX = "issance-machines-";
+/** Base64url characters of the hash kept: 72 bits, so two machines' topics do not meet by chance. */
+const MACHINE_TOPIC_HASH = 12;
+
+/**
+ * The collapse topic of one machine's alert on one metric: `issance-machines-` and the first 12
+ * base64url characters of the SHA-256 of `<id>:<metric>`. One topic per machine and metric, so a
+ * phone that is offline while two machines (or CPU and memory on one) alert gets both, where one
+ * shared topic kept only the last. A machine id is free text and can be longer than a topic may be,
+ * which is why it is hashed and not spelled. 28 characters, inside RFC 8030's alphabet and 32-char
+ * ceiling and a length base64 can produce ({@link topicIsSendable}).
+ */
+export function machineTopic(id: string, metric: string): string {
+  const hash = createHash("sha256").update(`${id}:${metric}`).digest("base64url");
+  return `${MACHINE_TOPIC_PREFIX}${hash.slice(0, MACHINE_TOPIC_HASH)}`;
+}
+
+/** Whether a collapse topic is one every push service will accept: RFC 8030's alphabet and 32-char
+ *  ceiling, plus the length base64 can actually produce (Apple decodes it; ≡ 1 mod 4 is impossible).
+ *  Exported for the test that guards the constants above — a topic edited for tidiness would
+ *  otherwise break Apple delivery silently, since nothing surfaces it but the push service's log. */
+export function topicIsSendable(topic: string): boolean {
+  return /^[A-Za-z0-9_-]+$/.test(topic) && topic.length <= 32 && topic.length % 4 !== 1;
+}
+
+// How many consecutive same-origin-witnessed failures retire a subscription (see broadcast()).
+// Broadcasts are event-driven — several in an active hour — so five clears a stale device within a
+// day of normal use while still absorbing a run of transients that slipped past the origin guard.
+const EVICT_AFTER = 5;
+
+/** The push service an endpoint belongs to, used to tell "this device is dead" from "this service
+ *  is rejecting us". Falls back to the raw endpoint if it won't parse — an unparseable endpoint is
+ *  then its own origin, which can never witness a sibling's success, so it is never evicted. */
+function pushServiceOrigin(endpoint: string): string {
+  try {
+    return new URL(endpoint).origin;
+  } catch {
+    return endpoint;
+  }
+}
+
+/** What actually went wrong, for the log. `web-push` throws a WebPushError whose `message` is the
+ *  constant "Received unexpected response code" — useless on its own — while the status and the
+ *  service's own reason (Apple's `{"reason":"BadDeviceToken"}`, FCM's text) sit unread on the error.
+ *  Surfacing them is what makes a transient 5xx distinguishable from a permanent rejection. */
+function describeSendError<T>(err: T): string {
+  const message = err instanceof Error ? err.message : String(err);
+  const code = sendErrorStatus(err);
+  const status = code === undefined ? "" : ` status=${code}`;
+  const bodyField = err !== null && typeof err === "object" && "body" in err ? err.body : undefined;
+  const raw = typeof bodyField === "string" ? bodyField.replace(/\s+/g, " ").trim() : "";
+  const body = raw ? ` body=${raw.length > 200 ? `${raw.slice(0, 200)}…` : raw}` : "";
+  return `${message}${status}${body}`;
+}
+
+/** web-push delivery options (collapse topic + TTL + urgency), derived per message from its `type`. */
+export type SendOptions = { TTL: number; topic: string; urgency?: "very-low" | "low" | "normal" | "high" };
+
+/** Delivers one payload to one subscription with the given options. Injectable so the prune/log
+ *  logic is testable. */
+export type PushSender = (
+  sub: PushSubscription,
+  payload: string,
+  options: SendOptions,
+) => Promise<PushDeliveryResult>;
+
+/**
+ * A notification instruction for the service worker (see web/src/sw.ts). `type:"clear"` closes the
+ * notification on `tag` instead of showing one; `type:"update"` is an update-available alert (its own
+ * collapse topic; taps open Settings); `type:"machine"` is a sustained-load alert (its own topic; taps
+ * open that machine's page); otherwise the SW renders `{ title, body }` into the `tag` slot,
+ * deep-links to `paneId` on tap, and re-alerts when `renotify` is set.
+ */
+export interface PushMessage {
+  type?: "clear" | "update" | "machine";
+  title?: string;
+  /**
+   * The stable code `title` was rendered from, and the values it was filled with (`push-titles.ts`).
+   * The service worker shows its own translation of the code when it has one and `title` otherwise,
+   * so an older cached SW — which ignores both — keeps showing exactly what it did. A title the
+   * operator typed (`issance push-test "…"`) is not issance's to translate and carries no code.
+   */
+  titleCode?: PushTitleCode;
+  titleDetail?: PushTitleDetail;
+  body?: string;
+  /** Notification slot. Same tag replaces (rather than stacks) the previous notification. */
+  tag?: string;
+  paneId?: string;
+  /**
+   * The herdr session this alert belongs to (registry name). Threaded into the payload `data` so the
+   * service worker deep-links to the right session. Absent for the primary session, whose payload
+   * then stays byte-identical to the single-session case (an older cached SW keeps working).
+   */
+  session?: string;
+  /**
+   * The crew member the alerting session lives on (`?h=`, CREW_PROTOCOL.md §4). Threaded into the
+   * payload `data` alongside `session` so a tap deep-links to the right machine. Absent for the
+   * issance that is sending — i.e. always absent on a solo instance, and always absent for the lead's
+   * own sessions — which is the same omitted-not-null discipline `session` follows and what keeps
+   * the solo payload byte-identical (§11).
+   */
+  host?: string;
+  /** Where a tap should land instead of the default pane deep-link. `"settings"` for update alerts;
+   *  absent = today's pane deep-link (so the agent-alert payload is unchanged).
+   *
+   *  The client resolves this name to `/settings/updates` (web/src/lib/push-decision.ts). The name
+   *  itself is frozen: an old cached service worker resolves it to `/settings` and lands one row
+   *  away from the page it wanted, which renaming the field would have turned into `/`.
+   *
+   *  `"machine"` opens `/machines/<machine>` (ADR 0084). An old service worker does not know it and
+   *  reads only `host`, which a machine push never carries, so it takes the pane path with no pane
+   *  and no `?h=`: the dashboard. */
+  target?: "settings" | "machine";
+  /**
+   * The machine a load alert is about (ADR 0084), threaded into the payload `data` as `machine`. It
+   * is deliberately NOT `host`: an old cached service worker reads `host` as a crew member and opens
+   * `/?h=<id>`, which on a solo issance (id `local`) names no member at all.
+   */
+  machine?: string;
+  /**
+   * The push service's collapse topic for this one message ({@link machineTopic}), in place of the
+   * type's own. Never sent to the device. A topic {@link topicIsSendable} refuses is ignored.
+   */
+  topic?: string;
+  renotify?: boolean;
+}
+
+/**
+ * A push message with its words masked (`bridge/redact.ts`): the body, and the title. A push crosses
+ * a third-party push service and shows on a lock screen, so it is the last place a secret should be.
+ *
+ * A title is a catalogue sentence filled from `titleDetail` (`push-titles.ts`), and the phone renders
+ * its own translation from the code and the detail when it has one. So a title the mask CHANGED drops
+ * its code and detail and travels as the masked English: a translated title rebuilt from the raw
+ * detail would put back exactly what was masked. A title the mask left alone keeps both.
+ *
+ * Pure and exported for the test; {@link Push.send} calls it when `ISSANCE_REDACT` is on.
+ */
+export function redactPushMessage(message: PushMessage): PushMessage {
+  const out: PushMessage = { ...message };
+  if (message.body !== undefined) out.body = redactText(message.body);
+  if (message.title === undefined) return out;
+  const title = redactText(message.title);
+  if (title === message.title) return out;
+  const { titleCode: _titleCode, titleDetail: _titleDetail, ...plain } = out;
+  return { ...plain, title };
+}
+
+export class Push {
+  private lib: WebPushModule | null = null;
+  private subs = new Map<string, StoredSubscription>();
+  private readonly file: string;
+  private readonly sender: PushSender;
+  private _enabled = false;
+  // Consecutive delivery failures per endpoint, for the eviction pass in broadcast(). Deliberately
+  // in-memory and NOT part of the persisted subscription shape: a restart forgives, which is the
+  // right bias for a counter whose whole job is spotting a *sustained* pattern — broadcasts vastly
+  // outnumber restarts, so a genuinely dead device re-earns its eviction within EVICT_AFTER rounds.
+  private failures = new Map<string, number>();
+  // Saves are funnelled through this chain so concurrent writes never interleave (last enqueued
+  // wins deterministically); a failed write is swallowed here so it can't poison later saves.
+  private saveChain: Promise<void> = Promise.resolve();
+
+  constructor(
+    private readonly cfg: Config,
+    sender?: PushSender,
+  ) {
+    this.file = join(cfg.stateDir, "push-subscriptions.json");
+    this.sender = sender ?? ((sub, payload, options) => this.lib!.sendNotification(sub, payload, options));
+  }
+
+  /** Whether push is live (VAPID keys configured and `web-push` installed). Set once in init(). */
+  get enabled(): boolean {
+    return this._enabled;
+  }
+
+  get publicKey(): string {
+    return this.enabled ? this.cfg.vapidPublic : "";
+  }
+
+  async init(): Promise<void> {
+    if (!this.cfg.vapidPublic || !this.cfg.vapidPrivate) {
+      console.log("[push] disabled (no VAPID keys configured)");
+      return;
+    }
+    try {
+      this.lib = await import("web-push");
+    } catch {
+      console.warn("[push] `web-push` not installed — run `bun add web-push` to enable push");
+      return;
+    }
+    this.lib.setVapidDetails(this.cfg.vapidSubject, this.cfg.vapidPublic, this.cfg.vapidPrivate);
+    this._enabled = true;
+    await this.loadStore();
+    console.log(`[push] enabled (${this.subs.size} saved subscription(s))`);
+  }
+
+  async addSubscription(sub: PushSubscription, meta: SubscriptionMeta = {}): Promise<void> {
+    if (!this.enabled) return;
+    // The row this one supersedes (SubscriptionMeta.replaces). Dropped BEFORE the new one is stored,
+    // and only when it is a different endpoint — a device re-registering the endpoint it already
+    // holds is naming itself, not a predecessor.
+    if (meta.replaces !== undefined && meta.replaces !== sub.endpoint) {
+      if (this.subs.delete(meta.replaces)) {
+        console.log(`[push] replaced superseded subscription: ${meta.replaces}`);
+      }
+      this.failures.delete(meta.replaces);
+    }
+    const previous = this.subs.get(sub.endpoint);
+    const userAgent = meta.userAgent?.trim().slice(0, USER_AGENT_MAX) ?? previous?.userAgent;
+    const row: StoredSubscription = { endpoint: sub.endpoint, keys: sub.keys };
+    // Re-subscribing does not restart the clock: `createdAt` is when this endpoint first appeared.
+    row.createdAt = previous?.createdAt ?? new Date().toISOString();
+    if (userAgent !== undefined && userAgent !== "") row.userAgent = userAgent;
+    this.subs.set(sub.endpoint, row);
+    // A re-subscribe is fresh evidence even when the endpoint string is unchanged — the device just
+    // told us it wants pushes, so it doesn't inherit the failure history of its predecessor.
+    this.failures.delete(sub.endpoint);
+    await this.save();
+  }
+
+  /**
+   * The persisted rows, for the operator-facing `issance push list`. Read-only and metadata-only:
+   * the keys are a sending credential and have no business on a terminal.
+   */
+  listSubscriptions(): readonly SubscriptionRow[] {
+    return [...this.subs.values()].map(({ endpoint, createdAt, userAgent }) => {
+      const row: SubscriptionRow = { endpoint };
+      if (createdAt !== undefined) row.createdAt = createdAt;
+      if (userAgent !== undefined) row.userAgent = userAgent;
+      return row;
+    });
+  }
+
+  /**
+   * Drop every row whose endpoint CONTAINS `match` (or all of them for `"*"`), and persist. Returns
+   * how many went. This is the hand-operated counterpart to the automatic prune in {@link broadcast}
+   * — which can only ever catch an endpoint the push service has disowned, and an orphan the device
+   * never `unsubscribe()`d is not one (issue #104).
+   *
+   * Nothing matched means nothing is written: asking the question must not create the file.
+   */
+  async forget(match: string): Promise<number> {
+    const doomed = [...this.subs.keys()].filter((e) => match === "*" || e.includes(match));
+    if (doomed.length === 0) return 0;
+    for (const endpoint of doomed) {
+      this.subs.delete(endpoint);
+      this.failures.delete(endpoint);
+    }
+    await this.save();
+    return doomed.length;
+  }
+
+  /** Send a notification instruction (render, clear, or update) to every subscribed device. */
+  async send(message: PushMessage): Promise<void> {
+    // The SW reads deep-link fields from `data`. `session` is omitted for the primary and `host` for
+    // this issance's own sessions (both absent on the message), keeping that payload identical to the
+    // pre-multi-session, pre-crew shape.
+    const { topic, ...raw } = message;
+    const msg = this.cfg.redact ? redactPushMessage(raw) : raw;
+    const data: PushPayloadData = { paneId: msg.paneId };
+    if (msg.session !== undefined) data.session = msg.session;
+    if (msg.host !== undefined) data.host = msg.host;
+    if (msg.machine !== undefined) data.machine = msg.machine;
+    if (msg.target !== undefined) data.target = msg.target;
+    // Per-message collapse topic — update and load alerts must not share the herd slot (see above).
+    const base =
+      msg.type === "update" ? UPDATE_SEND_OPTIONS : msg.type === "machine" ? MACHINE_SEND_OPTIONS : SEND_OPTIONS;
+    const options = topic !== undefined && topicIsSendable(topic) ? { ...base, topic } : base;
+    await this.broadcast(JSON.stringify({ ...msg, data }), options);
+  }
+
+  /** Convenience for a one-off render (used by the manual push-test script). */
+  async notify(title: string, body: string, data: { paneId?: string } = {}): Promise<void> {
+    await this.send({ title, body, paneId: data.paneId });
+  }
+
+  private async broadcast(payload: string, options: SendOptions): Promise<void> {
+    if (!this.enabled) return;
+    const dead: string[] = [];
+    // One entry per subscription attempted this round, so the eviction pass below can ask which
+    // push services proved themselves healthy before it holds a failure against any one device.
+    const results = await Promise.all(
+      [...this.subs.values()].map(async (sub) => {
+        try {
+          // `{ endpoint, keys }` and nothing else: the stored row also carries operator metadata,
+          // and web-push serialises what it is handed.
+          await this.sender({ endpoint: sub.endpoint, keys: sub.keys }, payload, options);
+          return { sub, err: null };
+        } catch (err) {
+          return { sub, err };
+        }
+      }),
+    );
+
+    // A push service that delivered to SOMEBODY this round has a working VAPID/JWT/network path,
+    // so a sibling's failure on that same origin is about that subscription and nothing else.
+    const healthy = new Set(
+      results.filter((r) => r.err === null).map((r) => pushServiceOrigin(r.sub.endpoint)),
+    );
+
+    for (const { sub, err } of results) {
+      if (err === null) {
+        // Consecutive means consecutive: one delivery wipes the slate.
+        this.failures.delete(sub.endpoint);
+        continue;
+      }
+      // 404/410 are the only statuses RFC 8030 blesses as "this subscription is gone". Everything
+      // else — 400, 401, 403, 429, 5xx — is either transient or about the SENDER (a VAPID key slip
+      // makes a whole push service reject perfectly live devices), so it must never prune on sight.
+      const code = sendErrorStatus(err);
+      if (code === 404 || code === 410) {
+        console.log(`[push] pruning gone subscription (${code}): ${sub.endpoint}`);
+        dead.push(sub.endpoint);
+        continue;
+      }
+      console.warn(`[push] send failed for ${sub.endpoint}: ${describeSendError(err)}`);
+
+      // Some failures are permanent without ever being 404/410 (Apple answers a dead token with
+      // 400 BadDeviceToken), and retried forever they accumulate into the log spam of issue #68.
+      // Counting only same-origin-witnessed failures is what keeps this from becoming a 403-storm
+      // foot-gun: during a global rejection nothing on that origin succeeds, so nothing is counted.
+      // The single-subscription operator therefore never evicts — deliberately. Eviction exists to
+      // garbage-collect stale duplicates, which needs a healthy sibling to prove the token is at
+      // fault; dropping someone's only subscription would trade a loud log for silent no-push.
+      if (!healthy.has(pushServiceOrigin(sub.endpoint))) continue;
+      // Overlapping broadcasts aren't serialised, so two in-flight rounds can each land a count on
+      // the same endpoint. EVICT_AFTER is slack enough to absorb that; a mutex isn't worth it.
+      const n = (this.failures.get(sub.endpoint) ?? 0) + 1;
+      this.failures.set(sub.endpoint, n);
+      if (n < EVICT_AFTER) continue;
+      console.warn(
+        `[push] evicting subscription after ${n} consecutive failures (last: ${describeSendError(err)}): ${sub.endpoint}`,
+      );
+      dead.push(sub.endpoint);
+    }
+
+    if (dead.length) {
+      for (const e of dead) {
+        this.subs.delete(e);
+        this.failures.delete(e);
+      }
+      await this.save();
+    }
+  }
+
+  /**
+   * Read the persisted file into memory. `init()` calls this once push is known to be live; the CLI
+   * calls it DIRECTLY, without VAPID, because `issance push list` / `push forget` are precisely what
+   * an operator runs when push is off or misconfigured — the store is a file, not a capability.
+   *
+   * This and {@link save} are the only reader and the only writer of `push-subscriptions.json`.
+   */
+  async loadStore(): Promise<void> {
+    try {
+      const raw: unknown = await Bun.file(this.file).json();
+      if (!Array.isArray(raw)) return;
+      for (const item of raw) {
+        const row = coerceStored(item);
+        if (row !== null) this.subs.set(row.endpoint, row);
+      }
+    } catch {
+      /* no saved subs yet */
+    }
+  }
+
+  private save(): Promise<void> {
+    // Snapshot now (subs mutate synchronously before each save call), then serialise the write
+    // behind any in-flight one. `then(write, write)` runs regardless of a prior failure; the
+    // chain itself is reset to a swallowed promise so one bad write doesn't wedge future saves.
+    const snapshot = JSON.stringify([...this.subs.values()], null, 2);
+    const write = () => this.writeState(snapshot);
+    const run = this.saveChain.then(write, write);
+    this.saveChain = run.catch(() => {});
+    return run;
+  }
+
+  /** Atomic, owner-only write: fresh temp file (mode 0600) then rename over the target. */
+  private async writeState(data: string): Promise<void> {
+    await mkdir(this.cfg.stateDir, { recursive: true, mode: 0o700 });
+    const tmp = `${this.file}.tmp`;
+    await writeFile(tmp, data, { mode: 0o600 });
+    await rename(tmp, this.file);
+  }
+}

@@ -1,0 +1,1890 @@
+import { afterAll, describe, expect, it } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, relative } from "node:path";
+
+import { loadConfig } from "./config.ts";
+
+import {
+  type ApiTag,
+  compareSemver,
+  followsTrain,
+  githubCredential,
+  githubHeaders,
+  GITHUB_TOKEN_ENVS,
+  githubReleaseUrl,
+  githubTagsUrl,
+  readAllTags,
+  TAG_PAGE_SIZE,
+  TAG_PAGES_MAX,
+  isGithubApiUrl,
+  isPrereleaseVersion,
+  latestUpdateInMajor,
+  latestReleaseAboveMajor,
+  latestReleaseInMajor,
+  latestReleaseTag,
+  LINK_CHANGE_SENTENCE,
+  majorOf,
+  parsePrereleaseTag,
+  newestUrgent,
+  parseReleaseManifest,
+  parseReleaseReading,
+  parseSemverTag,
+  parseTagsResponse,
+  releaseReadingUrl,
+  type ReleaseReadingResult,
+  restartCommandFor,
+  shouldNotify,
+  stampOf,
+  updateDigestBody,
+  releaseFetchers,
+  updateMirror,
+  updatesNewerThan,
+  UpdateMonitor,
+  type UpdateMonitorDeps,
+  UpdateStateStore,
+  type UpdateStore,
+} from "./update.ts";
+import { DEFAULT_UPDATE_LINE, lineReading, type UpdateLineRecord } from "./update-line.ts";
+
+describe("compareSemver", () => {
+  it("orders by major, then minor, then patch", () => {
+    expect(compareSemver("0.11.0", "0.12.0")).toBe(-1);
+    expect(compareSemver("0.12.0", "0.11.0")).toBe(1);
+    expect(compareSemver("1.0.0", "0.99.99")).toBe(1);
+    expect(compareSemver("0.11.0", "0.11.0")).toBe(0);
+    expect(compareSemver("0.11.2", "0.11.10")).toBe(-1); // numeric, not lexical
+  });
+
+  it("sorts a prerelease below the release it leads to", () => {
+    // The running version can be `1.0.0-beta.5` while every tag is strict, so the tail must be
+    // parsed rather than handed to `Number` (which yielded NaN and an arbitrary answer).
+    expect(compareSemver("1.0.0-beta.5", "1.0.0")).toBe(-1);
+    expect(compareSemver("1.0.0", "1.0.0-beta.5")).toBe(1);
+    expect(compareSemver("1.0.0-beta.5", "0.31.1")).toBe(1);
+    expect(compareSemver("1.0.0-beta.5+ab12cd3", "1.0.1")).toBe(-1);
+  });
+
+  it("orders prerelease tails by semver §11 — the whole beta train, in order", () => {
+    // The chain a beta install walks. `beta.9` vs `beta.10` used to compare EQUAL (the tail was
+    // reduced to a boolean), which would have frozen the train at its first two-digit beta.
+    const chain = ["1.0.0-beta.9", "1.0.0-beta.10", "1.0.0-rc.1", "1.0.0"];
+    for (let i = 0; i + 1 < chain.length; i++) {
+      expect(compareSemver(chain[i]!, chain[i + 1]!)).toBe(-1);
+      expect(compareSemver(chain[i + 1]!, chain[i]!)).toBe(1);
+    }
+    // Numeric identifiers sort BELOW alphanumeric ones, and a shorter tail that is a prefix of a
+    // longer one sorts first.
+    expect(compareSemver("1.0.0-1", "1.0.0-alpha")).toBe(-1);
+    expect(compareSemver("1.0.0-beta", "1.0.0-beta.1")).toBe(-1);
+    expect(compareSemver("1.0.0-beta.44", "1.0.0-beta.44")).toBe(0);
+    expect(compareSemver("1.0.0-alpha.1", "1.0.0-beta.1")).toBe(-1);
+  });
+});
+
+describe("parsePrereleaseTag / isPrereleaseVersion", () => {
+  it("accepts vX.Y.Z and vX.Y.Z-<tail>, and keeps the tail apart", () => {
+    expect(parsePrereleaseTag("v1.2.3")).toEqual({ triple: [1, 2, 3], prerelease: null });
+    expect(parsePrereleaseTag(" v1.0.0-beta.44 ")).toEqual({ triple: [1, 0, 0], prerelease: "beta.44" });
+    expect(parsePrereleaseTag("v1.0.0-rc.1")).toEqual({ triple: [1, 0, 0], prerelease: "rc.1" });
+  });
+
+  it("rejects garbage — remote ref names are untrusted input", () => {
+    expect(parsePrereleaseTag("v1.0.0-")).toBeNull(); // a bare trailing hyphen names no tail
+    expect(parsePrereleaseTag("v1.0.0-beta..1")).toBeNull(); // an empty identifier
+    expect(parsePrereleaseTag("refs/tags/v1.0.0-beta.1")).toBeNull(); // slashes never survive
+    expect(parsePrereleaseTag("v1.0.0-beta.1/x")).toBeNull();
+    expect(parsePrereleaseTag("v1.0.0-beta.1^{}")).toBeNull();
+    expect(parsePrereleaseTag("1.0.0-beta.1")).toBeNull(); // no leading v
+    expect(parsePrereleaseTag("v1.0-beta.1")).toBeNull();
+    expect(parsePrereleaseTag("nightly")).toBeNull();
+    // The STRICT parser is unchanged — it still means "strict releases only".
+    expect(parseSemverTag("v1.0.0-beta.44")).toBeNull();
+  });
+
+  it("reads prerelease-following off the installed version, never off a flag", () => {
+    expect(isPrereleaseVersion("1.0.0-beta.44")).toBe(true);
+    expect(isPrereleaseVersion("1.0.0")).toBe(false);
+    expect(isPrereleaseVersion("0.32.0")).toBe(false);
+    expect(isPrereleaseVersion("unknown")).toBe(false);
+  });
+});
+
+describe("followsTrain / latestUpdateInMajor", () => {
+  const tags = ["v0.32.0", "v1.0.0-beta.9", "v1.0.0-beta.10", "v1.0.0-rc.1", "v1.0.0", "nightly"];
+
+  it("the train is a FALLBACK, never a preference", () => {
+    expect(followsTrain("1.0.0", "1.0.0")).toBe(false); // stable install: never
+    expect(followsTrain("1.0.0", null)).toBe(false);
+    expect(followsTrain("1.0.0-beta.44", null)).toBe(true); // no strict release of the major at all
+    expect(followsTrain("1.0.0-beta.44", "1.0.0")).toBe(false); // a strict release is out → take it
+    expect(followsTrain("1.0.0-rc.1", "0.32.0")).toBe(true); // that strict one is not of this major
+    expect(followsTrain("1.0.0-beta.44", "1.0.0-beta.44")).toBe(true); // not newer than installed
+  });
+
+  it("a STABLE install never sees a prerelease — the regression this must not lose", () => {
+    // Only newer prereleases exist above it, and it is offered none of them.
+    const betasOnly = ["v1.0.0", "v1.1.0-beta.1", "v1.1.0-beta.2"];
+    expect(latestUpdateInMajor(betasOnly, 1, "1.0.0")).toBe("1.0.0");
+    expect(latestUpdateInMajor(tags, 0, "0.32.0")).toBe("0.32.0");
+    // Identical to the strict resolver, by construction.
+    expect(latestUpdateInMajor(tags, 1, "1.0.0")).toBe(latestReleaseInMajor(tags, 1));
+  });
+
+  it("a PRERELEASE install takes the train only while no strict release of its major is newer", () => {
+    // Fallback: nothing strict published in major 1 yet → the next beta.
+    expect(latestUpdateInMajor(["v1.0.0-beta.44", "v1.0.0-beta.45"], 1, "1.0.0-beta.44")).toBe("1.0.0-beta.45");
+    // Supersede: once v1.0.0 exists it wins, and beta.45 is skipped entirely.
+    expect(latestUpdateInMajor(["v1.0.0-beta.45", "v1.0.0"], 1, "1.0.0-beta.44")).toBe("1.0.0");
+    // The consent was to the road TO the release, not to the major's prereleases forever: a LATER
+    // minor's rc is as invisible to a beta install as it is to a stable one.
+    expect(latestUpdateInMajor(["v1.0.0", "v1.1.0-rc.1"], 1, "1.0.0-beta.5")).toBe("1.0.0");
+    expect(latestUpdateInMajor(tags, 1, "1.0.0-beta.10")).toBe("1.0.0");
+    // …and it never crosses out of its own major.
+    expect(latestUpdateInMajor(["v0.32.0", "v2.0.0"], 1, "1.0.0-beta.1")).toBeNull();
+  });
+});
+
+describe("majorOf / latestReleaseInMajor / latestReleaseAboveMajor", () => {
+  const tags = ["v0.31.1", "v0.32.0", "v1.0.0", "v1.1.0", "v1.1.0-rc.1", "v2.0.0", "nightly"];
+
+  it("reads the major off a version, prerelease and build metadata included", () => {
+    expect(majorOf("1.0.0-beta.5+ab12cd3")).toBe(1);
+    expect(majorOf("0.31.1")).toBe(0);
+    expect(majorOf("unknown")).toBeNull();
+  });
+
+  it("keeps the routine target inside the running major", () => {
+    expect(latestReleaseInMajor(tags, 0)).toBe("0.32.0");
+    expect(latestReleaseInMajor(tags, 1)).toBe("1.1.0"); // the rc is invisible, as everywhere
+    expect(latestReleaseInMajor(tags, 3)).toBeNull();
+  });
+
+  it("reports a higher major separately — announcing it is not taking it", () => {
+    expect(latestReleaseAboveMajor(tags, 0)).toBe("2.0.0");
+    expect(latestReleaseAboveMajor(tags, 1)).toBe("2.0.0");
+    expect(latestReleaseAboveMajor(tags, 2)).toBeNull();
+  });
+});
+
+describe("parseSemverTag / latestReleaseTag", () => {
+  it("accepts strict vX.Y.Z, rejects prereleases and junk", () => {
+    expect(parseSemverTag("v0.11.0")).toEqual([0, 11, 0]);
+    expect(parseSemverTag(" v1.2.3 ")).toEqual([1, 2, 3]);
+    expect(parseSemverTag("v1.0.0-rc.1")).toBeNull();
+    expect(parseSemverTag("0.11.0")).toBeNull(); // no leading v
+    expect(parseSemverTag("latest")).toBeNull();
+  });
+
+  it("picks the max release and strips the leading v", () => {
+    expect(latestReleaseTag(["v0.10.3", "v0.11.0", "v0.9.0"])).toBe("0.11.0");
+    // Non-release refs and prereleases are ignored, not chosen.
+    expect(latestReleaseTag(["v0.11.0", "v0.12.0-beta.1", "nightly"])).toBe("0.11.0");
+    expect(latestReleaseTag([])).toBeNull();
+    expect(latestReleaseTag(["main", "v1.0.0-rc"])).toBeNull();
+  });
+});
+
+// 10:00 on a fixed LOCAL day — past the digest's earliest hour, so a test that isn't about the clock
+// isn't accidentally about the clock. Built from local parts, so it holds in any TZ.
+const AT_10AM = new Date(2026, 0, 15, 10, 0, 0);
+const hoursAgo = (from: Date, h: number) => new Date(from.getTime() - h * 3600_000).toISOString();
+
+describe("updatesNewerThan", () => {
+  it("lists every version this install may take, oldest first — the digest names them all", () => {
+    expect(updatesNewerThan(["v0.11.0", "v0.12.0", "v0.12.1", "v1.0.0", "nightly"], "0.11.0")).toEqual([
+      "0.12.0",
+      "0.12.1",
+    ]);
+    // A stable install stays blind to prereleases; a beta install follows its own train.
+    expect(updatesNewerThan(["v1.0.0", "v1.1.0-beta.1"], "1.0.0")).toEqual([]);
+    expect(updatesNewerThan(["v1.0.0-beta.44", "v1.0.0-beta.45"], "1.0.0-beta.44")).toEqual([
+      "1.0.0-beta.45",
+    ]);
+  });
+});
+
+describe("updateDigestBody", () => {
+  it("names the one version, or the count AND every folded version", () => {
+    expect(updateDigestBody("1.3.0", ["1.3.1"])).toBe("issance 1.3.1 is available");
+    expect(updateDigestBody("1.3.0", ["1.3.1", "1.3.2"])).toBe("2 updates since 1.3.0: 1.3.1, 1.3.2");
+  });
+
+  it("an urgent release opens the body with its own sentence, ahead of the link change", () => {
+    const urgent = { version: "1.3.1", reason: "The reaper deletes live entries." };
+    expect(updateDigestBody("1.3.0", ["1.3.1"], null, urgent)).toBe(
+      "The reaper deletes live entries. issance 1.3.1 is available",
+    );
+    expect(updateDigestBody("1.3.0", ["1.3.1"], { from: 1, to: 2 }, urgent)).toBe(
+      `The reaper deletes live entries. issance 1.3.1 is available. ${LINK_CHANGE_SENTENCE}`,
+    );
+    // Without one, the body is byte-identical to what it always was.
+    expect(updateDigestBody("1.3.0", ["1.3.1"], null, null)).toBe("issance 1.3.1 is available");
+  });
+});
+
+describe("shouldNotify", () => {
+  const current = "0.11.0";
+  const gate = (over: Partial<Parameters<typeof shouldNotify>[0]> = {}) =>
+    shouldNotify({
+      current,
+      latest: "0.12.0",
+      newerVersions: ["0.12.0"],
+      lastNotified: null,
+      lastPushedAt: null,
+      now: AT_10AM,
+      ...over,
+    });
+
+  it("fires for a strictly-newer, not-yet-announced release", () => {
+    expect(gate()).toEqual({ send: true, versions: ["0.12.0"] });
+    // Already announced this exact version -> no re-nag, even with the window wide open.
+    expect(gate({ lastNotified: "0.12.0" })).toEqual({ send: false });
+    // Not newer than what we're running -> never.
+    expect(gate({ latest: "0.11.0", newerVersions: [] })).toEqual({ send: false });
+    expect(gate({ latest: "0.10.0", newerVersions: [] })).toEqual({ send: false });
+    expect(gate({ latest: null, newerVersions: [] })).toEqual({ send: false });
+  });
+
+  it("window closed suppresses the push — one a day, no matter how many releases land", () => {
+    expect(gate({ lastPushedAt: hoursAgo(AT_10AM, 3), lastNotified: "0.11.5" })).toEqual({ send: false });
+  });
+
+  it("window open sends, and the digest names every folded version since the last one announced", () => {
+    const verdict = gate({
+      latest: "0.13.0",
+      newerVersions: ["0.12.0", "0.12.1", "0.13.0"],
+      lastNotified: "0.12.0",
+      lastPushedAt: hoursAgo(AT_10AM, 30),
+    });
+    expect(verdict).toEqual({ send: true, versions: ["0.12.1", "0.13.0"] });
+  });
+
+  it("digest folds a whole release week into one push that names each version", () => {
+    expect(
+      gate({ latest: "0.14.0", newerVersions: ["0.12.0", "0.13.0", "0.14.0"] }),
+    ).toEqual({ send: true, versions: ["0.12.0", "0.13.0", "0.14.0"] });
+  });
+
+  it("a patch-only delta waits out the week, then sends — it is a wait, not a mute", () => {
+    const patches = { current: "1.3.0", latest: "1.3.2", newerVersions: ["1.3.1", "1.3.2"] };
+    // Inside the 7-day patch window: the daily window would have opened days ago, this one has not.
+    expect(gate({ ...patches, lastPushedAt: hoursAgo(AT_10AM, 30) })).toEqual({ send: false });
+    expect(gate({ ...patches, lastPushedAt: hoursAgo(AT_10AM, 6 * 24) })).toEqual({ send: false });
+    // Past it: an install that only ever sees patch releases is still nudged, once a week.
+    expect(gate({ ...patches, lastPushedAt: hoursAgo(AT_10AM, 7 * 24 + 1) })).toEqual({
+      send: true,
+      versions: ["1.3.1", "1.3.2"],
+    });
+    // No push on record — a first-ever patch digest waits for nothing.
+    expect(gate({ ...patches, lastPushedAt: null })).toEqual({ send: true, versions: ["1.3.1", "1.3.2"] });
+    // The 09:00 rule still applies on top of the weekly window.
+    expect(
+      gate({ ...patches, lastPushedAt: hoursAgo(AT_10AM, 8 * 24), now: new Date(2026, 0, 15, 3, 0, 0) }),
+    ).toEqual({ send: false });
+  });
+
+  it("a minor keeps the DAILY window, and carries the waiting patch releases with it", () => {
+    const mixed = { current: "1.3.0", latest: "1.4.0", newerVersions: ["1.3.1", "1.3.2", "1.4.0"] };
+    expect(gate(mixed)).toEqual({ send: true, versions: ["1.3.1", "1.3.2", "1.4.0"] });
+    // 30 h after the last push: too soon for a patch train, in time for a minor.
+    expect(gate({ ...mixed, lastPushedAt: hoursAgo(AT_10AM, 30) })).toEqual({
+      send: true,
+      versions: ["1.3.1", "1.3.2", "1.4.0"],
+    });
+  });
+
+  it("an urgent patch keeps the DAILY window", () => {
+    const patches = { current: "1.3.0", latest: "1.3.1", newerVersions: ["1.3.1"] };
+    const urgent = { version: "1.3.1", reason: "The reaper deletes live entries." };
+    // Not urgent: the weekly window holds it, 30 h after the last push.
+    expect(gate({ ...patches, lastPushedAt: hoursAgo(AT_10AM, 30) })).toEqual({ send: false });
+    // Urgent: the same delta, the same clock, and it goes.
+    expect(gate({ ...patches, lastPushedAt: hoursAgo(AT_10AM, 30), urgent })).toEqual({
+      send: true,
+      versions: ["1.3.1"],
+    });
+    // The 09:00 floor is never skipped, not even by an urgent release.
+    expect(
+      gate({ ...patches, lastPushedAt: hoursAgo(AT_10AM, 30), urgent, now: new Date(2026, 0, 15, 3, 0, 0) }),
+    ).toEqual({ send: false });
+  });
+
+  it("an urgent patch pushes today even after this morning's digest", () => {
+    // THE WINDOW IS SKIPPED, NOT SHORTENED. A fix for data loss published at 11:00 must not wait for
+    // tomorrow because an ordinary digest went out at 09:00.
+    const patches = { current: "1.3.0", latest: "1.3.1", newerVersions: ["1.3.1"] };
+    const urgent = { version: "1.3.1", reason: "The reaper deletes live entries." };
+    const thisMorning = { lastPushedAt: hoursAgo(AT_10AM, 1), lastNotified: "1.3.0" };
+    // Without the marker, one hour after a push is far inside every window.
+    expect(gate({ ...patches, ...thisMorning })).toEqual({ send: false });
+    expect(gate({ ...patches, ...thisMorning, urgent })).toEqual({ send: true, versions: ["1.3.1"] });
+    // A MINOR one hour after a push still waits: the skip belongs to the urgent release, not to the
+    // clock, and nothing else was given the right to interrupt.
+    expect(
+      gate({ current: "1.3.0", latest: "1.4.0", newerVersions: ["1.4.0"], ...thisMorning }),
+    ).toEqual({ send: false });
+    // The floor still holds over the skip.
+    expect(gate({ ...patches, ...thisMorning, urgent, now: new Date(2026, 0, 15, 3, 0, 0) })).toEqual({
+      send: false,
+    });
+  });
+
+  it("an urgent version already announced does not re-push", () => {
+    // IT IS SPENT ONCE. Having been told about 1.3.1, the operator is back on the ordinary cadence:
+    // 1.3.2 lands above it and takes the DAILY window, not another interruption.
+    const urgent = { version: "1.3.1", reason: "The reaper deletes live entries." };
+    const after = {
+      current: "1.3.0",
+      latest: "1.3.2",
+      newerVersions: ["1.3.1", "1.3.2"],
+      lastNotified: "1.3.1",
+      urgent,
+    };
+    expect(gate({ ...after, lastPushedAt: hoursAgo(AT_10AM, 3) })).toEqual({ send: false });
+    expect(gate({ ...after, lastPushedAt: hoursAgo(AT_10AM, 30) })).toEqual({
+      send: true,
+      versions: ["1.3.2"],
+    });
+    // And the release itself is never announced twice: the same version, already the top of the
+    // delta, is refused before any window is looked at.
+    expect(
+      gate({ current: "1.3.0", latest: "1.3.1", newerVersions: ["1.3.1"], lastNotified: "1.3.1", urgent }),
+    ).toEqual({ send: false });
+  });
+
+  it("an urgent patch earlier in the delta makes the whole train daily", () => {
+    // 1.3.1 is urgent, 1.3.2 is an ordinary patch above it. The delta is still urgent, and the push
+    // names both — a release held back is folded, never dropped.
+    const train = { current: "1.3.0", latest: "1.3.2", newerVersions: ["1.3.1", "1.3.2"] };
+    const urgent = { version: "1.3.1", reason: "The reaper deletes live entries." };
+    expect(gate({ ...train, lastPushedAt: hoursAgo(AT_10AM, 30) })).toEqual({ send: false });
+    expect(gate({ ...train, lastPushedAt: hoursAgo(AT_10AM, 30), urgent })).toEqual({
+      send: true,
+      versions: ["1.3.1", "1.3.2"],
+    });
+  });
+
+  it("before 09:00 it waits — a release published at night does not buzz a phone", () => {
+    expect(gate({ now: new Date(2026, 0, 15, 3, 0, 0) })).toEqual({ send: false });
+    expect(gate({ now: new Date(2026, 0, 15, 9, 0, 0) })).toEqual({ send: true, versions: ["0.12.0"] });
+  });
+
+  it("a legacy record with no push timestamp reads as no push yet, and sends", () => {
+    expect(gate({ lastPushedAt: null })).toEqual({ send: true, versions: ["0.12.0"] });
+    expect(gate({ lastPushedAt: "not-a-date" })).toEqual({ send: true, versions: ["0.12.0"] });
+  });
+});
+
+describe("stampOf", () => {
+  it("is order-independent and changes on any mtime/size change", () => {
+    const a = [
+      { path: "b.ts", mtimeMs: 2, size: 20 },
+      { path: "a.ts", mtimeMs: 1, size: 10 },
+    ];
+    const b = [
+      { path: "a.ts", mtimeMs: 1, size: 10 },
+      { path: "b.ts", mtimeMs: 2, size: 20 },
+    ];
+    expect(stampOf(a)).toBe(stampOf(b)); // same set, different order → same stamp
+    expect(stampOf(a)).not.toBe(stampOf([{ path: "a.ts", mtimeMs: 9, size: 10 }, { path: "b.ts", mtimeMs: 2, size: 20 }]));
+    expect(stampOf(a)).not.toBe(stampOf([{ path: "a.ts", mtimeMs: 1, size: 99 }, { path: "b.ts", mtimeMs: 2, size: 20 }]));
+  });
+});
+
+// A fake store + a scripted clock for the monitor.
+function fakeStore(
+  initial: string | null = null,
+  pushedAt: string | null = null,
+): UpdateStore & { saved: string[]; pushes: string[]; closed: string[]; writes: number } {
+  let last = initial;
+  let stamp = pushedAt;
+  let dismissed: string | null = null;
+  let dismissedCrew: string | null = null;
+  let dismissedCrewAt: number | null = null;
+  const saved: string[] = [];
+  const pushes: string[] = [];
+  const closed: string[] = [];
+  const counter = { writes: 0 };
+  return {
+    saved,
+    pushes,
+    closed,
+    get writes() {
+      return counter.writes;
+    },
+    lastNotified: () => last,
+    lastPushedAt: () => stamp,
+    setLastNotified: async (v, at) => {
+      counter.writes += 1;
+      last = v;
+      stamp = at;
+      saved.push(v);
+      pushes.push(at);
+    },
+    dismissedVersion: () => dismissed,
+    dismissedCrewVersion: () => dismissedCrew,
+    dismissedCrewAt: () => dismissedCrewAt,
+    setDismissed: async (scope, v, notified, at) => {
+      counter.writes += 1;
+      if (scope === "offer") {
+        dismissed = v;
+      } else {
+        dismissedCrew = v;
+        dismissedCrewAt = at ?? null;
+      }
+      closed.push(`${scope}:${v}`);
+      if (notified !== undefined) {
+        last = notified.version;
+        stamp = notified.pushedAt;
+        saved.push(notified.version);
+        pushes.push(notified.pushedAt);
+      }
+    },
+  };
+}
+
+describe("the update run record on the snapshot", () => {
+  it("the bridge resumes update state from disk instead of coming up with nothing to say", () => {
+    // A bridge restarted BY an update must report the run it is part of. The record is read per
+    // call, never cached, because the process that writes it is the detached updater (M15/04).
+    const run = {
+      schema: 1,
+      state: "verifying",
+      from: "v1.0.0",
+      to: "v1.1.0",
+      startedAt: 1,
+      updatedAt: 2,
+      pid: 7,
+      attempt: 0,
+    } as const;
+    const { monitor } = makeMonitor({ runState: () => run });
+    expect(monitor.status().run).toEqual(run);
+  });
+
+  it("names the package command only where the host resolved one", () => {
+    // Assigned, never spread as `undefined`: an install with none must carry NO key. The phone's
+    // fallback to the preflight remedy depends on the difference between absent and empty.
+    expect("packageCommand" in makeMonitor().monitor.status()).toBe(false);
+    const packaged = makeMonitor({ installKind: "packaged", packageCommand: "sudo pacman -Syu issance-bin" });
+    expect(packaged.monitor.status().packageCommand).toBe("sudo pacman -Syu issance-bin");
+  });
+
+  it("an install that has never updated carries no run key at all", () => {
+    const { monitor } = makeMonitor();
+    expect("run" in monitor.status()).toBe(false);
+  });
+});
+
+describe("restart needed — the files moved under a running process", () => {
+  it("is quiet while disk still names the version this process runs", () => {
+    const status = makeMonitor().monitor.status();
+    expect(status.restartNeeded).toBe(false);
+    // Nothing to restart, nothing to name: the command key is absent, not empty.
+    expect("restartCommand" in status).toBe(false);
+  });
+
+  it("is raised the moment a live read disagrees with the version captured at boot", () => {
+    // Exactly what `pacman -Syu` does: the files become 1.6.0 while this process is still 1.5.0.
+    let onDisk = "1.5.0";
+    const { monitor, tick } = makeMonitor({
+      current: "1.5.0",
+      bootVersion: "1.5.0",
+      liveVersion: () => onDisk,
+    });
+    expect(monitor.status().restartNeeded).toBe(false);
+    onDisk = "1.6.0";
+    tick(10_000); // past the throttle the read shares with `bridgeStale`
+    expect(monitor.status().restartNeeded).toBe(true);
+
+    // Not latched: a package manager that puts the old files back leaves a process that matches disk
+    // again, and asking for a restart nobody needs is worse than saying nothing.
+    onDisk = "1.5.0";
+    tick(10_000);
+    expect(monitor.status().restartNeeded).toBe(false);
+  });
+
+  it("is raised when the EXECUTABLE moved and no version string did — the same-version rebuild", () => {
+    // `pacman -U` of a new pkgrel: the files on disk still name 1.5.0, the process still runs 1.5.0,
+    // and the binary behind it is a different file. Version-only detection is blind to this.
+    let replaced = false;
+    const { monitor, tick } = makeMonitor({
+      current: "1.5.0",
+      installKind: "packaged",
+      bootVersion: "1.5.0",
+      liveVersion: () => "1.5.0",
+      exeReplaced: () => replaced,
+    });
+    expect(monitor.status().restartNeeded).toBe(false);
+    replaced = true;
+    tick(10_000); // the same throttle the version read is behind
+    const status = monitor.status();
+    expect(status.restartNeeded).toBe(true);
+    expect(status.restartCommand).toBe("issance restart");
+
+    // Not latched, exactly as the version half is not.
+    replaced = false;
+    tick(10_000);
+    expect(monitor.status().restartNeeded).toBe(false);
+  });
+
+  it("restart command for the install kind, never a hard-coded string", () => {
+    // Two spellings, and the kind is the whole of what picks one (M14/01 §5.3).
+    expect(restartCommandFor("detached-checkout", null)).toBe("herdr plugin action invoke restart --plugin herdr.issance");
+    // A named instance is registered with Hangar under its own suffixed plugin id, and the bare id is
+    // the host's FIRST issance — so printing it would restart a service this one does not own.
+    expect(restartCommandFor("detached-checkout", "next")).toBe(
+      "herdr plugin action invoke restart --plugin herdr.issance-next",
+    );
+    // A PACKAGED install takes the `issance` verb like any other non-Hangar kind. Our package ships no
+    // unit file at all — `issance start` writes the operator's own `--user` unit — so the system-unit
+    // spelling would name a unit that does not exist and ask for a password to restart it.
+    for (const kind of ["packaged", "linked-clone", "binary", "unknown"] as const) {
+      expect(restartCommandFor(kind, "next")).toBe("issance restart");
+    }
+    expect(restartCommandFor("packaged", null)).not.toContain("sudo");
+
+    // And the snapshot names the one this machine takes, off the same function.
+    const swapped = { bootVersion: "1.5.0", liveVersion: () => "1.6.0" };
+    for (const kind of ["packaged", "detached-checkout", "binary"] as const) {
+      const status = makeMonitor({ installKind: kind, ...swapped }).monitor.status();
+      expect(status.restartCommand).toBe(restartCommandFor(kind, null));
+    }
+  });
+});
+
+/** Tag names as the `/tags` endpoint reports them — one parser, so the monitor's fixtures name what
+ *  the CLI's binary updater reads too. The sha is arbitrary here: the banner never looks at it. */
+const apiTags = (...names: string[]): ApiTag[] => names.map((name) => ({ name, sha: `sha-${name}` }));
+
+function makeMonitor(over: Partial<UpdateMonitorDeps> = {}) {
+  const notified: string[] = [];
+  /** Every push, with the link change and the urgent record it carried — the digest body is built
+   *  from the three. */
+  const pushes: {
+    versions: string[];
+    linkChange: { from: number; to: number } | null;
+    urgent: { version: string; reason: string } | null;
+  }[] = [];
+  const store = fakeStore();
+  // 10:00 on a fixed LOCAL day: past the digest's earliest hour, so these tests exercise the monitor
+  // rather than the clock. `tick` moves it forward within the same morning unless a test says otherwise.
+  let clock = new Date(2026, 0, 15, 10, 0, 0).getTime();
+  const monitor = new UpdateMonitor({
+    repo: "issance/issance-app",
+    current: "0.11.0",
+    installKind: "detached-checkout",
+    instance: null,
+    packageCommand: null,
+    bootVersion: "0.11.0",
+    liveVersion: () => "0.11.0",
+    // The executable is where it was unless a case moves it — the ordinary machine.
+    exeReplaced: () => false,
+    startupStamp: "STAMP@boot",
+    fetchTags: async () => apiTags("v0.12.0"),
+    // A CREW, and a release that says nothing about the wire — the shape of every release before
+    // 1.8.0, and the default every case that is not about the link inherits (M27/06).
+    crewProtocol: 2,
+    crewMode: () => "lead",
+    fetchReleaseReading: async () => null,
+    bridgeStamp: () => "STAMP@boot",
+    store,
+    // No run on disk unless a case says so — the shape every install that has never updated has.
+    runState: () => null,
+    now: () => clock,
+    updatesEnabled: () => true,
+    notify: (versions, linkChange, urgent) => {
+      notified.push(...versions);
+      pushes.push({ versions, linkChange, urgent });
+    },
+    ...over,
+  });
+  return { monitor, notified, pushes, store, tick: (ms: number) => (clock += ms) };
+}
+
+describe("UpdateMonitor", () => {
+  it("surfaces releaseAvailable + latest + latestUrl after a successful check", async () => {
+    // Use a REAL issance release (v0.10.3) with `current` below it, so the asserted release URL exists.
+    const { monitor } = makeMonitor({
+      current: "0.9.0",
+      fetchTags: async () => apiTags("v0.2.0", "v0.10.0", "v0.10.3"),
+    });
+    expect(monitor.status()).toMatchObject({ current: "0.9.0", latest: null, latestUrl: null, releaseAvailable: false, checkedAt: null });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({
+      latest: "0.10.3",
+      latestUrl: "https://github.com/issance/issance-app/releases/tag/v0.10.3",
+      releaseAvailable: true,
+    });
+    expect(monitor.status().checkedAt).not.toBeNull();
+  });
+
+  it("reports the install kind it was constructed with — the banner spells its commands from it", () => {
+    const { monitor } = makeMonitor({ installKind: "binary" });
+    expect(monitor.status().installKind).toBe("binary");
+  });
+
+  it("splits the answer: the newest release of MY major, and a higher major named apart from it", async () => {
+    // The banner has to say WHICH kind of behind you are (ADR 0020) — a routine update fixes one and
+    // refuses the other, so one field could not carry both.
+    const { monitor } = makeMonitor({
+      current: "0.31.1",
+      fetchTags: async () => apiTags("v0.31.1", "v0.32.0", "v1.0.0", "v1.0.1"),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({
+      latest: "0.32.0",
+      releaseAvailable: true,
+      majorAvailable: "1.0.1",
+      majorUrl: "https://github.com/issance/issance-app/releases/tag/v1.0.1",
+    });
+  });
+
+  it("a 1.x install sees only 1.x releases, and no major above it", async () => {
+    const { monitor } = makeMonitor({
+      current: "1.0.0-beta.5",
+      fetchTags: async () => apiTags("v0.32.0", "v1.0.0"),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({
+      latest: "1.0.0", // the beta is behind its own release
+      releaseAvailable: true,
+      majorAvailable: null,
+      majorUrl: null,
+    });
+  });
+
+  it("a beta install is offered the next beta — the banner follows the train too", async () => {
+    // The banner and the verb share `latestUpdateInMajor`, so this is the same rule, not a copy of it.
+    const { monitor, notified } = makeMonitor({
+      current: "1.0.0-beta.44",
+      fetchTags: async () => apiTags("v0.32.0", "v1.0.0-beta.44", "v1.0.0-beta.45", "nightly"),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({
+      latest: "1.0.0-beta.45",
+      latestUrl: "https://github.com/issance/issance-app/releases/tag/v1.0.0-beta.45",
+      releaseAvailable: true,
+      majorAvailable: null,
+    });
+    expect(notified).toEqual(["1.0.0-beta.45"]);
+  });
+
+  it("a beta install already on the newest beta is offered nothing", async () => {
+    const { monitor, notified } = makeMonitor({
+      current: "1.0.0-beta.45",
+      fetchTags: async () => apiTags("v1.0.0-beta.44", "v1.0.0-beta.45"),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({ latest: "1.0.0-beta.45", releaseAvailable: false });
+    expect(notified).toEqual([]);
+  });
+
+  it("a beta install is pointed at the RELEASE once it exists, skipping the betas after it", async () => {
+    const { monitor } = makeMonitor({
+      current: "1.0.0-beta.44",
+      fetchTags: async () => apiTags("v1.0.0-beta.45", "v1.0.0", "v1.1.0-rc.1"),
+    });
+    await monitor.checkRelease();
+    // v1.0.0, not beta.45 (superseded) and not v1.1.0-rc.1 (the consent ended at the release).
+    expect(monitor.status()).toMatchObject({ latest: "1.0.0", releaseAvailable: true });
+  });
+
+  it("a STABLE install stays blind to prereleases — no banner for a beta, ever", async () => {
+    const { monitor, notified } = makeMonitor({
+      current: "1.0.0",
+      fetchTags: async () => apiTags("v1.0.0", "v1.1.0-beta.1", "v1.1.0-rc.2"),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({ latest: "1.0.0", releaseAvailable: false });
+    expect(notified).toEqual([]);
+  });
+
+  it("githubReleaseUrl reconstructs the vX.Y.Z tag page", () => {
+    expect(githubReleaseUrl("issance/issance-app", "0.10.3")).toBe(
+      "https://github.com/issance/issance-app/releases/tag/v0.10.3",
+    );
+  });
+
+  it("fires the push exactly once per new version, persisting BEFORE notifying", async () => {
+    const order: string[] = [];
+    const store = fakeStore();
+    const wrapped: UpdateStore = {
+      lastNotified: store.lastNotified,
+      lastPushedAt: store.lastPushedAt,
+      dismissedVersion: store.dismissedVersion,
+      dismissedCrewVersion: store.dismissedCrewVersion,
+      dismissedCrewAt: store.dismissedCrewAt,
+      setDismissed: store.setDismissed,
+      setLastNotified: async (v, at) => {
+        order.push(`persist:${v}`);
+        await store.setLastNotified(v, at);
+      },
+    };
+    const { monitor, notified } = makeMonitor({
+      store: wrapped,
+      notify: (versions) => order.push(`notify:${versions.join(",")}`),
+    });
+    await monitor.checkRelease();
+    await monitor.checkRelease(); // same latest → no re-nag
+    expect(order).toEqual(["persist:0.12.0", "notify:0.12.0"]); // persisted first, fired once
+    expect(notified).toEqual([]); // notify routed into `order` above
+  });
+
+  it("the off switch suppresses everything — the updates pref off means no push, at any hour", async () => {
+    const { monitor, notified, store } = makeMonitor({ updatesEnabled: () => false });
+    await monitor.checkRelease();
+    expect(notified).toEqual([]);
+    expect(store.saved).toEqual([]); // nothing announced either, so turning it back on still tells you
+    expect(monitor.status().releaseAvailable).toBe(true); // the banner still shows; only the push is gated
+  });
+
+  it("the snapshot reports releaseAvailable independent of the digest window", async () => {
+    // Pushed an hour ago -> the window is shut, but the card must still name the new release.
+    const store = fakeStore("0.11.5", new Date(2026, 0, 15, 9, 0, 0).toISOString());
+    const { monitor, notified } = makeMonitor({ store });
+    await monitor.checkRelease();
+    expect(notified).toEqual([]); // window closed
+    expect(monitor.status()).toMatchObject({ latest: "0.12.0", releaseAvailable: true });
+  });
+
+  it("folds a closed window into one digest that names every version it held back", async () => {
+    const store = fakeStore("0.11.0", new Date(2026, 0, 15, 9, 0, 0).toISOString());
+    const { monitor, notified, tick } = makeMonitor({
+      store,
+      fetchTags: async () => apiTags("v0.12.0", "v0.12.1", "v0.13.0"),
+    });
+    await monitor.checkRelease();
+    expect(notified).toEqual([]); // still inside the window
+    tick(25 * 3600_000); // next morning, window open
+    await monitor.checkRelease();
+    expect(notified).toEqual(["0.12.0", "0.12.1", "0.13.0"]);
+    expect(store.saved).toEqual(["0.13.0"]); // the newest is what "already announced" now means
+    await monitor.checkRelease();
+    expect(notified).toEqual(["0.12.0", "0.12.1", "0.13.0"]); // ignoring a digest never re-fires it
+  });
+
+  it("a patch-only train rides the weekly digest, and the card is current the whole time", async () => {
+    const store = fakeStore("1.3.0", new Date(2026, 0, 14, 10, 0, 0).toISOString()); // pushed a day ago
+    const { monitor, notified, tick } = makeMonitor({
+      current: "1.3.0",
+      store,
+      fetchTags: async () => apiTags("v1.3.1", "v1.3.2"),
+    });
+    await monitor.checkRelease();
+    expect(notified).toEqual([]); // the daily window is open; the patch window is not
+    expect(monitor.status().releaseAvailable).toBe(true); // the card is current regardless
+    tick(7 * 24 * 3600_000); // a week on
+    await monitor.checkRelease();
+    expect(notified).toEqual(["1.3.1", "1.3.2"]);
+  });
+
+  it("snoozeDigest marks the current latest announced and closes the window", async () => {
+    const { monitor, notified, store } = makeMonitor();
+    await monitor.checkRelease();
+    expect(notified).toEqual(["0.12.0"]);
+    await monitor.snoozeDigest();
+    expect(store.saved).toEqual(["0.12.0", "0.12.0"]);
+    expect(store.pushes).toHaveLength(2);
+  });
+
+  it("is fail-soft: a fetch error keeps prior state and sends nothing", async () => {
+    const { monitor, notified } = makeMonitor({
+      fetchTags: async () => {
+        throw new Error("network down");
+      },
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({ latest: null, releaseAvailable: false, checkedAt: null });
+    expect(notified).toEqual([]);
+  });
+
+  it("does not notify when latest is not newer than current", async () => {
+    const { monitor, notified } = makeMonitor({ fetchTags: async () => apiTags("v0.11.0", "v0.10.0") });
+    await monitor.checkRelease();
+    expect(monitor.status().releaseAvailable).toBe(false);
+    expect(notified).toEqual([]);
+  });
+
+  it("de-dupes concurrent checks — one fetch backs both callers, then the guard clears", async () => {
+    let calls = 0;
+    let release!: (tags: ApiTag[]) => void;
+    const gate = new Promise<ApiTag[]>((r) => {
+      release = r;
+    });
+    const { monitor } = makeMonitor({
+      fetchTags: () => {
+        calls++;
+        return gate;
+      },
+    });
+    const a = monitor.checkRelease();
+    const b = monitor.checkRelease(); // lands while the first is still in flight → same promise
+    release(apiTags("v0.12.0"));
+    await Promise.all([a, b]);
+    expect(calls).toBe(1); // NOT two hits on the API
+    expect(monitor.status().latest).toBe("0.12.0");
+
+    await monitor.checkRelease(); // guard cleared → a later check fetches afresh
+    expect(calls).toBe(2);
+  });
+
+  it("reports bridgeStale when the on-disk stamp diverges from the boot stamp (throttled)", async () => {
+    let disk = "STAMP@boot";
+    const { monitor, tick } = makeMonitor({ bridgeStamp: () => disk });
+    expect(monitor.status().bridgeStale).toBe(false);
+    disk = "STAMP@rebuilt";
+    // Within the throttle window the cached value stands...
+    expect(monitor.status().bridgeStale).toBe(false);
+    tick(6_000); // ...past it, the recompute sees the divergence.
+    expect(monitor.status().bridgeStale).toBe(true);
+  });
+});
+
+describe("parseTagsResponse", () => {
+  it("keeps a tag's name and the commit it points at, and drops anything it cannot read", () => {
+    expect(
+      parseTagsResponse([
+        { name: "v1.0.0", commit: { sha: "abc" } },
+        { name: "v1.1.0", commit: { sha: "def" }, zipball_url: "ignored" },
+        { name: 7, commit: { sha: "x" } },
+        { name: "v1.2.0" },
+        { name: "v1.3.0", commit: { sha: "" } },
+        "not an object",
+      ]),
+    ).toEqual([
+      { name: "v1.0.0", sha: "abc" },
+      { name: "v1.1.0", sha: "def" },
+    ]);
+    expect(parseTagsResponse({ message: "rate limited" })).toEqual([]);
+  });
+
+  // An EMPTY sha is worse than a dropped tag: `planUpdate` compares a candidate's commit against the
+  // installed head, and a binary install's head is `""` — so an empty sha would report a real update
+  // as "already current".
+  it("never emits an empty sha", () => {
+    expect(parseTagsResponse([{ name: "v1.0.0", commit: { sha: "" } }])).toEqual([]);
+  });
+});
+
+describe("parseReleaseManifest", () => {
+  const doc = {
+    schemaVersion: 1,
+    repo: "issance/issance-app",
+    tag: "v1.1.0",
+    version: "1.1.0",
+    artifacts: [
+      {
+        name: "issance-1.1.0-linux-x64.tar.gz",
+        platform: "linux-x64",
+        os: "linux",
+        sha256: "deadbeef",
+        size: 42,
+        payloadRoot: "issance-1.1.0-linux-x64",
+      },
+    ],
+    extras: [{ name: "web-dist-1.1.0.tar.gz", role: "web-bundle", sha256: "cafe" }],
+  };
+
+  it("reads the fields it needs and ignores the ones it does not — additive is free", () => {
+    const v = parseReleaseManifest(doc);
+    expect(v.ok).toBe(true);
+    if (!v.ok) return;
+    expect(v.manifest.version).toBe("1.1.0");
+    expect(v.manifest.artifacts).toEqual([
+      {
+        name: "issance-1.1.0-linux-x64.tar.gz",
+        platform: "linux-x64",
+        sha256: "deadbeef",
+        size: 42,
+        payloadRoot: "issance-1.1.0-linux-x64",
+      },
+    ]);
+  });
+
+  it("a schemaVersion it does not know is reported, never attempted", () => {
+    expect(parseReleaseManifest({ ...doc, schemaVersion: 2 })).toEqual({
+      ok: false,
+      reason: "schema",
+      schemaVersion: 2,
+    });
+  });
+
+  it("a document of the wrong shape is unreadable, not half-believed", () => {
+    expect(parseReleaseManifest({ schemaVersion: 1, version: "1.1.0" })).toEqual({ ok: false, reason: "unreadable" });
+    expect(parseReleaseManifest("nope")).toEqual({ ok: false, reason: "unreadable" });
+    expect(parseReleaseManifest(null)).toEqual({ ok: false, reason: "unreadable" });
+  });
+
+  it("drops an artifact entry that cannot name itself, keeping the rest", () => {
+    const v = parseReleaseManifest({ ...doc, artifacts: [{ name: "x" }, ...doc.artifacts] });
+    expect(v.ok).toBe(true);
+    if (!v.ok) return;
+    expect(v.manifest.artifacts).toHaveLength(1);
+  });
+});
+
+// ── The band's dismissal (M17/08) ─────────────────────────────────────────────
+//
+// A dismissal is a decision about THIS MACHINE's update, so it is kept here rather than in one
+// browser's storage — and it is one act, not two: the version is recorded and the digest is snoozed
+// in the same call, because closing the band and then being pushed the same version tomorrow is the
+// app arguing with a decision already made.
+
+const dismissDirs: string[] = [];
+async function tempCfg() {
+  const stateDir = await mkdtemp(join(tmpdir(), "issance-update-dismiss-"));
+  dismissDirs.push(stateDir);
+  return { ...loadConfig(), stateDir };
+}
+
+afterAll(async () => {
+  await Promise.all(dismissDirs.map((d) => rm(d, { recursive: true, force: true })));
+});
+
+describe("the dismissed version", () => {
+  it("round-trips both scopes through the store, in one file beside the push record", async () => {
+    const cfg = await tempCfg();
+    const store = new UpdateStateStore(cfg);
+    await store.load();
+    expect(store.dismissedVersion()).toBeNull(); // nothing saved yet reads as nothing dismissed
+    expect(store.dismissedCrewVersion()).toBeNull();
+
+    await store.setDismissed("offer", "1.6.0", { version: "1.6.0", pushedAt: "2026-09-07T09:00:00.000Z" });
+    await store.setDismissed("crew", "1.5.0");
+
+    const reloaded = new UpdateStateStore(cfg);
+    await reloaded.load();
+    expect(reloaded.dismissedVersion()).toBe("1.6.0");
+    // Two decisions, two fields: the crew notice was put down at a DIFFERENT version and neither
+    // overwrote the other.
+    expect(reloaded.dismissedCrewVersion()).toBe("1.5.0");
+    // The offer's dismissal folded the snooze into the same write — a crash between two writes
+    // cannot leave a band closed with the push still armed for it.
+    expect(reloaded.lastNotified()).toBe("1.6.0");
+    expect(reloaded.lastPushedAt()).toBe("2026-09-07T09:00:00.000Z");
+  });
+
+  it("reads a record that carries neither key as nothing dismissed", async () => {
+    const cfg = await tempCfg();
+    await Bun.write(
+      join(cfg.stateDir, "update-state.json"),
+      JSON.stringify({ lastNotified: "1.5.0", lastPushedAt: "2026-09-06T09:00:00.000Z" }),
+    );
+    const store = new UpdateStateStore(cfg);
+    await store.load();
+    expect(store.dismissedVersion()).toBeNull();
+    expect(store.dismissedCrewVersion()).toBeNull();
+    expect(store.lastNotified()).toBe("1.5.0"); // and the record beside them is still believed
+  });
+
+  it("reads the crew key on its own", async () => {
+    const cfg = await tempCfg();
+    await Bun.write(join(cfg.stateDir, "update-state.json"), JSON.stringify({ dismissedCrewVersion: "1.5.0" }));
+    const store = new UpdateStateStore(cfg);
+    await store.load();
+    expect(store.dismissedCrewVersion()).toBe("1.5.0");
+  });
+
+  it("prefers the crew key when a record carries both", async () => {
+    const cfg = await tempCfg();
+    await Bun.write(
+      join(cfg.stateDir, "update-state.json"),
+      JSON.stringify({ dismissedCrewVersion: "1.5.0", [`dismissed${"Pack"}Version`]: "1.4.0" }),
+    );
+    const store = new UpdateStateStore(cfg);
+    await store.load();
+    expect(store.dismissedCrewVersion()).toBe("1.5.0");
+  });
+
+  it("a dismissed offer for the release upstream names also snoozes the digest, in one write", async () => {
+    const { monitor, store } = makeMonitor();
+    await monitor.checkRelease();
+    expect(store.saved).toEqual(["0.12.0"]); // the first push announced it
+    const before = store.writes;
+
+    await monitor.dismiss("0.12.0");
+    expect(store.closed).toEqual(["offer:0.12.0"]);
+    expect(store.lastNotified()).toBe("0.12.0");
+    expect(store.writes - before).toBe(1); // one act, one write
+    expect(monitor.status().dismissedVersion).toBe("0.12.0");
+  });
+
+  it("a dismiss with scope crew hides a notice and leaves lastNotified alone", async () => {
+    const { monitor, store } = makeMonitor();
+    await monitor.checkRelease();
+    const notified = store.lastNotified();
+
+    await monitor.dismiss("0.12.0", "crew");
+    expect(store.closed).toEqual(["crew:0.12.0"]);
+    // The push is about THIS machine; the notice was about another one. Hiding it silences nothing.
+    expect(store.lastNotified()).toBe(notified);
+    expect(monitor.status().dismissedCrewVersion).toBe("0.12.0");
+    expect(monitor.status().dismissedVersion).toBeNull(); // and the offer is untouched
+  });
+
+  it("a crew close is stamped with the monitor's clock, and the stamp rides the status (1.21.1)", async () => {
+    const { monitor } = makeMonitor();
+    await monitor.checkRelease();
+    // Nothing closed yet: the key is absent, never null, so a solo golden body is unchanged.
+    expect("dismissedCrewAt" in monitor.status()).toBe(false);
+
+    await monitor.dismiss("0.12.0", "crew");
+    expect(monitor.status().dismissedCrewAt).toBeNumber();
+
+    // An OFFER close is not a crew close and moves no crew stamp.
+    const crewAt = monitor.status().dismissedCrewAt;
+    await monitor.dismiss("0.12.0", "offer");
+    expect(monitor.status().dismissedCrewAt).toBe(crewAt);
+  });
+
+  it("round-trips the crew stamp through the store, and a record without one reads as null", async () => {
+    const cfg = await tempCfg();
+    const store = new UpdateStateStore(cfg);
+    await store.load();
+    expect(store.dismissedCrewAt()).toBeNull();
+    await store.setDismissed("crew", "1.21.0", undefined, 1_791_909_000_000);
+    const reloaded = new UpdateStateStore(cfg);
+    await reloaded.load();
+    expect(reloaded.dismissedCrewVersion()).toBe("1.21.0");
+    expect(reloaded.dismissedCrewAt()).toBe(1_791_909_000_000);
+
+    // The live release lane's record of 2026-10-13, written by 1.21.0: a version and no stamp.
+    const legacy = await tempCfg();
+    await Bun.write(
+      join(legacy.stateDir, "update-state.json"),
+      JSON.stringify({
+        lastNotified: "1.21.0",
+        lastPushedAt: "2026-10-13T16:14:27.462Z",
+        dismissedVersion: "1.18.1",
+        dismissedCrewVersion: "1.21.0",
+      }),
+    );
+    const old = new UpdateStateStore(legacy);
+    await old.load();
+    expect(old.dismissedCrewVersion()).toBe("1.21.0");
+    expect(old.dismissedCrewAt()).toBeNull();
+  });
+
+  it("a dismissed offer for a version that is not latest leaves lastNotified alone", async () => {
+    const { monitor, store } = makeMonitor();
+    await monitor.checkRelease();
+    const notified = store.lastNotified();
+
+    // Closing a band about 0.11.9 says nothing about the 0.12.0 the digest would push, and moving
+    // the record there would swallow the version upstream is actually naming.
+    await monitor.dismiss("0.11.9");
+    expect(monitor.status().dismissedVersion).toBe("0.11.9");
+    expect(store.lastNotified()).toBe(notified);
+  });
+
+  it("a dismiss is not a mute — a newer release is a different version and raises the band", async () => {
+    const { monitor } = makeMonitor();
+    await monitor.checkRelease();
+    await monitor.dismiss("0.12.0");
+    expect(monitor.status()).toMatchObject({ latest: "0.12.0", dismissedVersion: "0.12.0" });
+    // The snapshot keeps saying a release is available; only the BAND reads the two together, and it
+    // reads them as different facts the moment upstream moves on.
+    expect(monitor.status().releaseAvailable).toBe(true);
+  });
+});
+
+// ── The release reading and the link change (M27/06) ─────────────────────────
+
+describe("the release reading", () => {
+  it("names the asset under the release's own tag, constructed from repo and version", () => {
+    expect(releaseReadingUrl("issance/issance-app", "1.8.0")).toBe(
+      "https://github.com/issance/issance-app/releases/download/v1.8.0/issance-release.json",
+    );
+  });
+
+  it("parses the document, and refuses anything that is not one", () => {
+    expect(parseReleaseReading({ version: "1.8.0", crewProtocol: 2 })).toEqual({
+      version: "1.8.0",
+      crewProtocol: 2,
+    });
+    // Unknown fields are ignored — a later release may add to it.
+    expect(parseReleaseReading({ version: "1.8.0", crewProtocol: 2, extra: "x" })).toEqual({
+      version: "1.8.0",
+      crewProtocol: 2,
+    });
+    // MALFORMED, every way it can be: not an object, no version, no number, a fractional number.
+    expect(parseReleaseReading(null)).toBeNull();
+    expect(parseReleaseReading([1, 2])).toBeNull();
+    expect(parseReleaseReading({ crewProtocol: 2 })).toBeNull();
+    expect(parseReleaseReading({ version: "1.8.0" })).toBeNull();
+    expect(parseReleaseReading({ version: "1.8.0", crewProtocol: "2" })).toBeNull();
+    expect(parseReleaseReading({ version: "1.8.0", crewProtocol: 2.5 })).toBeNull();
+  });
+
+  it("reads the urgent marker when it is there, and ignores a malformed one (ADR 0046)", () => {
+    const reason = "The cache reaper deletes live entries, take this today.";
+    expect(parseReleaseReading({ version: "1.9.1", crewProtocol: 2, urgent: { reason } })).toEqual({
+      version: "1.9.1",
+      crewProtocol: 2,
+      urgent: { reason },
+    });
+    // ABSENT is the ordinary release, and it carries no key at all.
+    expect(parseReleaseReading({ version: "1.9.1", crewProtocol: 2 })).toEqual({
+      version: "1.9.1",
+      crewProtocol: 2,
+    });
+    // MALFORMED, every way it can be — each one reads as "not urgent", never as an unreadable
+    // document: urgency is a courtesy on the cadence, so a bad field may not lose the reading.
+    for (const urgent of [null, "today", 3, [], {}, { reason: "" }, { reason: "   " }, { reason: 7 }]) {
+      expect(parseReleaseReading({ version: "1.9.1", crewProtocol: 2, urgent })).toEqual({
+        version: "1.9.1",
+        crewProtocol: 2,
+      });
+    }
+  });
+
+  it("newestUrgent picks the NEWEST marked release in the delta, or null", () => {
+    const at = (version: string, reason: string | null) => ({
+      version,
+      reading:
+        reason === null
+          ? { version, crewProtocol: 2 }
+          : { version, crewProtocol: 2, urgent: { reason } },
+    });
+    expect(
+      newestUrgent([at("1.9.1", "first"), at("1.9.2", null), at("1.9.3", "second")]),
+    ).toEqual({ version: "1.9.3", reason: "second" });
+    // Order in is not order out: the newest marked one wins whichever way the list arrived.
+    expect(newestUrgent([at("1.9.3", "second"), at("1.9.1", "first")])).toEqual({
+      version: "1.9.3",
+      reason: "second",
+    });
+    // An urgent release BELOW an ordinary one still makes the delta urgent.
+    expect(newestUrgent([at("1.9.1", "first"), at("1.9.2", null)])).toEqual({
+      version: "1.9.1",
+      reason: "first",
+    });
+    // Nothing marked, nothing read at all, and an empty delta all answer the same way.
+    expect(newestUrgent([at("1.9.1", null), at("1.9.2", null)])).toBeNull();
+    expect(newestUrgent([{ version: "1.9.1", reading: null }])).toBeNull();
+    expect(newestUrgent([])).toBeNull();
+  });
+});
+
+describe("UpdateMonitor — the urgent marker (ADR 0046)", () => {
+  const REASON = "The cache reaper deletes live entries, take this today.";
+
+  it("reads the WHOLE delta, not only the newest release, and caches each sidecar", async () => {
+    const asked: string[] = [];
+    const { monitor, pushes, store } = makeMonitor({
+      current: "1.9.0",
+      // 1.9.1 is urgent; 1.9.2 above it is an ordinary patch. The delta is urgent either way.
+      fetchTags: async () => apiTags("v1.9.1", "v1.9.2"),
+      fetchReleaseReading: async (version) => {
+        asked.push(version);
+        return version === "1.9.1"
+          ? { version, crewProtocol: 2, urgent: { reason: REASON } }
+          : { version, crewProtocol: 2 };
+      },
+    });
+    // A push a day ago: the weekly patch window would hold this, the daily one does not.
+    await store.setLastNotified("1.9.0", new Date(new Date(2026, 0, 15, 10, 0, 0).getTime() - 30 * 3600_000).toISOString());
+    await monitor.checkRelease();
+
+    expect(monitor.status().urgent).toEqual({ version: "1.9.1", reason: REASON });
+    expect(pushes).toEqual([
+      { versions: ["1.9.1", "1.9.2"], linkChange: null, urgent: { version: "1.9.1", reason: REASON } },
+    ]);
+    // THE PUSH SAYS WHY, and says it first — the reason is what made the phone buzz today.
+    expect(updateDigestBody("1.9.0", ["1.9.1", "1.9.2"], null, { version: "1.9.1", reason: REASON })).toBe(
+      `${REASON} 2 updates since 1.9.0: 1.9.1, 1.9.2`,
+    );
+    expect(asked.toSorted()).toEqual(["1.9.1", "1.9.2"]);
+
+    // A SECOND CHECK ASKS NOTHING AGAIN: a published release's sidecar never changes.
+    asked.length = 0;
+    await monitor.checkRelease();
+    expect(asked).toEqual([]);
+    expect(monitor.status().urgent).toEqual({ version: "1.9.1", reason: REASON });
+  });
+
+  it("is absent when no release says it, and a failed read is never urgent", async () => {
+    const quiet = makeMonitor({
+      current: "1.9.0",
+      fetchTags: async () => apiTags("v1.9.1"),
+      fetchReleaseReading: async (version) => ({ version, crewProtocol: 2 }),
+    });
+    await quiet.monitor.checkRelease();
+    expect(quiet.monitor.status().urgent).toBeUndefined();
+
+    const unreadable = makeMonitor({
+      current: "1.9.0",
+      fetchTags: async () => apiTags("v1.9.1"),
+      fetchReleaseReading: async () => null, // a timeout, a 404, a foreign document
+    });
+    await unreadable.monitor.checkRelease();
+    expect(unreadable.monitor.status().urgent).toBeUndefined();
+  });
+
+  it("asks the newest ten releases and no more", async () => {
+    const asked: string[] = [];
+    const tags = Array.from({ length: 14 }, (_, i) => `v1.9.${i + 1}`);
+    const { monitor } = makeMonitor({
+      current: "1.9.0",
+      fetchTags: async () => apiTags(...tags),
+      fetchReleaseReading: async (version) => {
+        asked.push(version);
+        return { version, crewProtocol: 2 };
+      },
+    });
+    await monitor.checkRelease();
+    // The newest ten of the delta, plus nothing: 1.9.14 is the newest and is asked once, through the
+    // same cache the link-change read uses.
+    expect(asked.toSorted()).toEqual(
+      ["1.9.10", "1.9.11", "1.9.12", "1.9.13", "1.9.14", "1.9.5", "1.9.6", "1.9.7", "1.9.8", "1.9.9"],
+    );
+  });
+});
+
+describe("UpdateMonitor — reading a sidecar, and remembering the answer", () => {
+  it("asks about a 404 once, and asks again after a failure", async () => {
+    const asked: string[] = [];
+    // 0.12.0 published no sidecar (a 404, definite: no release before 1.8.0 did); 0.12.1's read
+    // fails (a timeout, this minute only). From 1.8.0 on a 404 is a different fact, see below.
+    const { monitor } = makeMonitor({
+      current: "0.11.0",
+      fetchTags: async () => apiTags("v0.12.0", "v0.12.1"),
+      fetchReleaseReading: async (version) => {
+        asked.push(version);
+        return version === "0.12.0" ? "absent" : null;
+      },
+    });
+    await monitor.checkRelease();
+    expect(asked.toSorted()).toEqual(["0.12.0", "0.12.1"]);
+
+    asked.length = 0;
+    await monitor.checkRelease();
+    // The absence was a fact about a published release and is remembered; the failure was not.
+    expect(asked).toEqual(["0.12.1"]);
+    // And both are still offered: a release from before the sidecar is published, whatever it answers.
+    expect(monitor.status()).toMatchObject({ latest: "0.12.1", newerVersions: ["0.12.0", "0.12.1"] });
+  });
+
+  it("survives every read failing — the delta still reports, and nothing is urgent", async () => {
+    const { monitor, pushes } = makeMonitor({
+      current: "1.9.0",
+      crewMode: () => "lead",
+      crewProtocol: 1,
+      fetchTags: async () => apiTags("v1.9.1", "v1.9.2", "v1.10.0"),
+      fetchReleaseReading: async () => null, // every one of them times out
+    });
+    await monitor.checkRelease();
+    const status = monitor.status();
+    // The tag list is the answer; the sidecar is a footnote on it, and a footnote may not fail it.
+    expect(status.latest).toBe("1.10.0");
+    expect(status.releaseAvailable).toBe(true);
+    expect(status.newerVersions).toEqual(["1.9.1", "1.9.2", "1.10.0"]);
+    expect(status.checkedAt).not.toBeNull();
+    expect(status.urgent).toBeUndefined();
+    expect(status.linkChange).toBeUndefined();
+    expect(pushes).toEqual([
+      { versions: ["1.9.1", "1.9.2", "1.10.0"], linkChange: null, urgent: null },
+    ]);
+  });
+});
+
+describe("UpdateMonitor — a tag is not a release yet (#503)", () => {
+  // release.yml pushes the tag first and publishes the release last, so for a few minutes the tag
+  // exists and every asset under it answers 404. The phone was offered 1.22.6 in that window and its
+  // update failed twice. A release from 1.8.0 on always carries `issance-release.json`, so that
+  // sidecar answering 404 is the proof the version cannot be installed yet.
+  const NEWEST = "1.22.7";
+  const TAGS = apiTags("v1.22.5", "v1.22.6", `v${NEWEST}`);
+  /** A sidecar that answers 404 for the versions named, and a normal reading for the rest. */
+  const notOut =
+    (asked: string[], ...versions: string[]) =>
+    async (version: string): Promise<ReleaseReadingResult> => {
+      asked.push(version);
+      return versions.includes(version) ? "absent" : { version, crewProtocol: 2 };
+    };
+
+  it("does not offer the newest tag while its sidecar answers 404, and offers the one below it", async () => {
+    const asked: string[] = [];
+    const { monitor, pushes } = makeMonitor({
+      current: "1.22.5",
+      fetchTags: async () => TAGS,
+      fetchReleaseReading: notOut(asked, NEWEST),
+    });
+    await monitor.checkRelease();
+
+    const status = monitor.status();
+    expect(status).toMatchObject({
+      latest: "1.22.6",
+      latestUrl: "https://github.com/issance/issance-app/releases/tag/v1.22.6",
+      releaseAvailable: true,
+      newerVersions: ["1.22.6"],
+    });
+    // The push names what is out, and never the version that is only tagged.
+    expect(pushes.map((p) => p.versions)).toEqual([["1.22.6"]]);
+    // One request per version for the whole check: the probe, the link-change read and the urgency
+    // sweep share the one answer rather than asking three times.
+    expect(asked.toSorted()).toEqual(["1.22.6", NEWEST]);
+  });
+
+  it("offers nothing when the only newer tag is not published, and pushes nothing", async () => {
+    const { monitor, notified } = makeMonitor({
+      current: "1.22.6",
+      fetchTags: async () => TAGS,
+      fetchReleaseReading: notOut([], NEWEST),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({
+      latest: "1.22.6",
+      releaseAvailable: false,
+      newerVersions: [],
+    });
+    expect(monitor.status().checkedAt).not.toBeNull();
+    expect(notified).toEqual([]);
+  });
+
+  it("offers a version whose sidecar answers 200", async () => {
+    const asked: string[] = [];
+    const { monitor, notified } = makeMonitor({
+      current: "1.22.5",
+      fetchTags: async () => TAGS,
+      fetchReleaseReading: notOut(asked),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({ latest: NEWEST, releaseAvailable: true, newerVersions: ["1.22.6", NEWEST] });
+    expect(notified).toEqual(["1.22.6", NEWEST]);
+  });
+
+  it("asks again at the next check, and offers the version once its release is out", async () => {
+    let published = false;
+    const asked: string[] = [];
+    const { monitor, notified, tick } = makeMonitor({
+      current: "1.22.6",
+      fetchTags: async () => TAGS,
+      fetchReleaseReading: async (version) => {
+        asked.push(version);
+        return version === NEWEST && !published ? "absent" : { version, crewProtocol: 2 };
+      },
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({ latest: "1.22.6", releaseAvailable: false });
+
+    // The next ordinary check, no timer of its own: the 404 was not remembered, so it is asked again.
+    published = true;
+    tick(6 * 3600_000);
+    asked.length = 0;
+    await monitor.checkRelease();
+    expect(asked).toEqual([NEWEST]);
+    expect(monitor.status()).toMatchObject({ latest: NEWEST, releaseAvailable: true, newerVersions: [NEWEST] });
+    expect(notified).toEqual([NEWEST]);
+
+    // And once it is out it is a published release like any other: never asked about again.
+    asked.length = 0;
+    await monitor.checkRelease();
+    expect(asked).toEqual([]);
+  });
+
+  it("keeps the offer when the sidecar fetch fails: a flaky read never hides an update", async () => {
+    const { monitor } = makeMonitor({
+      current: "1.22.6",
+      fetchTags: async () => TAGS,
+      fetchReleaseReading: async () => null, // a timeout, a 5xx, a body that is not the document
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({ latest: NEWEST, releaseAvailable: true, newerVersions: [NEWEST] });
+  });
+
+  it("skips several unpublished tags in a row and lands on the newest that is out", async () => {
+    const { monitor } = makeMonitor({
+      current: "1.22.4",
+      fetchTags: async () => apiTags("v1.22.4", "v1.22.5", "v1.22.6", `v${NEWEST}`),
+      fetchReleaseReading: notOut([], "1.22.6", NEWEST),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({ latest: "1.22.5", newerVersions: ["1.22.5"] });
+  });
+
+  it("treats a 404 below 1.8.0 as a published release, which is what it always was", async () => {
+    const { monitor } = makeMonitor({
+      current: "0.11.0",
+      fetchTags: async () => apiTags("v0.12.0"),
+      fetchReleaseReading: async () => "absent",
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({ latest: "0.12.0", releaseAvailable: true });
+  });
+
+  it("does not name a higher major whose release is not out", async () => {
+    const { monitor } = makeMonitor({
+      current: "1.22.6",
+      fetchTags: async () => apiTags("v1.22.6", "v2.0.0", "v2.0.1"),
+      fetchReleaseReading: notOut([], "2.0.1"),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({
+      latest: "1.22.6",
+      majorAvailable: "2.0.0",
+      majorUrl: "https://github.com/issance/issance-app/releases/tag/v2.0.0",
+    });
+
+    const none = makeMonitor({
+      current: "1.22.6",
+      fetchTags: async () => apiTags("v1.22.6", "v2.0.0"),
+      fetchReleaseReading: notOut([], "2.0.0"),
+    });
+    await none.monitor.checkRelease();
+    expect(none.monitor.status()).toMatchObject({ majorAvailable: null, majorUrl: null });
+  });
+
+  describe("through the real sidecar fetcher", () => {
+    /** A loopback mirror that answers `/issance-release.json` with `reply(version)` for the versions
+     *  it is asked about, and records every request path. */
+    function mirror(reply: (version: string) => Response) {
+      const paths: string[] = [];
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch(req) {
+          const path = new URL(req.url).pathname;
+          paths.push(path);
+          const m = /^\/AltanS\/issance\/releases\/download\/v([^/]+)\/issance-release\.json$/.exec(path);
+          return m?.[1] === undefined ? new Response("no", { status: 400 }) : reply(m[1]);
+        },
+      });
+      return { base: `http://127.0.0.1:${server.port}`, paths, stop: () => server.stop(true) };
+    }
+    const reading = (version: string) => Response.json({ version, crewProtocol: 2 });
+
+    it("reads 404 as absent, 200 as the document, and a 5xx or a refused connection as a failure", async () => {
+      const m = mirror((v) => (v === "1.22.7" ? new Response("Not Found", { status: 404 }) : v === "1.22.8" ? new Response("boom", { status: 502 }) : reading(v)));
+      try {
+        const read = releaseFetchers("issance/issance-app", { ISSANCE_UPDATE_MIRROR: m.base }).fetchReleaseReading;
+        expect(await read("1.22.7")).toBe("absent");
+        expect(await read("1.22.8")).toBeNull();
+        expect(await read("1.22.6")).toMatchObject({ version: "1.22.6", crewProtocol: 2 });
+      } finally {
+        m.stop();
+      }
+      // The listener is gone: the connection is refused, which is a failure and not an absence.
+      expect(await releaseFetchers("issance/issance-app", { ISSANCE_UPDATE_MIRROR: m.base }).fetchReleaseReading("1.22.6")).toBeNull();
+    });
+
+    it("hides the 404 tag, offers it on a 200, and keeps it on a 5xx or a refused connection", async () => {
+      let status = 404;
+      const m = mirror((v) =>
+        v === NEWEST ? (status === 200 ? reading(v) : new Response("x", { status })) : reading(v),
+      );
+      try {
+        const fetchReleaseReading = releaseFetchers("issance/issance-app", { ISSANCE_UPDATE_MIRROR: m.base }).fetchReleaseReading;
+        const { monitor, tick } = makeMonitor({ current: "1.22.6", fetchTags: async () => TAGS, fetchReleaseReading });
+
+        await monitor.checkRelease();
+        expect(monitor.status()).toMatchObject({ latest: "1.22.6", releaseAvailable: false });
+
+        for (const [answer, offered] of [[500, true], [404, false], [200, true]] as const) {
+          status = answer;
+          tick(6 * 3600_000);
+          await monitor.checkRelease();
+          expect(monitor.status().releaseAvailable).toBe(offered);
+          expect(monitor.status().latest).toBe(offered ? NEWEST : "1.22.6");
+        }
+      } finally {
+        m.stop();
+      }
+      // A mirror that is not there at all is a failure too, and the update is still offered.
+      const down = releaseFetchers("issance/issance-app", { ISSANCE_UPDATE_MIRROR: m.base }).fetchReleaseReading;
+      const refused = makeMonitor({ current: "1.22.6", fetchTags: async () => TAGS, fetchReleaseReading: down });
+      await refused.monitor.checkRelease();
+      expect(refused.monitor.status()).toMatchObject({ latest: NEWEST, releaseAvailable: true });
+    });
+  });
+});
+
+describe("UpdateMonitor — the link change", () => {
+  const asset = (crewProtocol: number) => async (version: string) => ({ version, crewProtocol });
+
+  it("is set when the release speaks a DIFFERENT wire, and rides the push", async () => {
+    const { monitor, pushes } = makeMonitor({
+      current: "1.7.0",
+      crewProtocol: 1,
+      crewMode: () => "lead",
+      fetchTags: async () => apiTags("v1.8.0"),
+      fetchReleaseReading: asset(2),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status().linkChange).toEqual({ from: 1, to: 2 });
+    // The push says it too, appended to a body that is otherwise what it always was.
+    expect(pushes).toEqual([{ versions: ["1.8.0"], linkChange: { from: 1, to: 2 }, urgent: null }]);
+    expect(updateDigestBody("1.7.0", ["1.8.0"], { from: 1, to: 2 })).toBe(
+      "issance 1.8.0 is available. Changes the crew link. Update the lead first, members follow.",
+    );
+  });
+
+  it("is absent when the release speaks the wire this install already speaks", async () => {
+    const { monitor, pushes } = makeMonitor({
+      current: "1.8.0",
+      crewProtocol: 2,
+      crewMode: () => "peer",
+      fetchTags: async () => apiTags("v1.8.1"),
+      fetchReleaseReading: asset(2),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status().linkChange).toBeUndefined();
+    expect(pushes[0]?.linkChange).toBeNull();
+    // And the body is byte-identical to the one every release before this always produced.
+    expect(updateDigestBody("1.8.0", ["1.8.1"], null)).toBe("issance 1.8.1 is available");
+  });
+
+  it("is absent when the release published no asset at all — every release before 1.8.0", async () => {
+    // A 404 is what the fetcher answers with null, and null is "the release says nothing".
+    const { monitor } = makeMonitor({
+      current: "1.6.0",
+      crewProtocol: 2,
+      crewMode: () => "lead",
+      fetchTags: async () => apiTags("v1.7.0"),
+      fetchReleaseReading: async () => null,
+    });
+    await monitor.checkRelease();
+    expect(monitor.status().linkChange).toBeUndefined();
+  });
+
+  it("is absent when the asset is MALFORMED, and the check still answers", async () => {
+    // The fetcher parses before it returns, so a truncated or foreign document reaches the monitor
+    // as null. What matters here is that the rest of the check is untouched by it.
+    const { monitor } = makeMonitor({
+      current: "1.7.0",
+      crewProtocol: 1,
+      crewMode: () => "lead",
+      fetchTags: async () => apiTags("v1.8.0"),
+      fetchReleaseReading: async () => parseReleaseReading({ version: "1.8.0", crewProtocol: "two" }),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({ latest: "1.8.0", releaseAvailable: true });
+    expect(monitor.status().linkChange).toBeUndefined();
+  });
+
+  it("is absent on a SOLO install — there is no link to change", async () => {
+    const { monitor } = makeMonitor({
+      current: "1.7.0",
+      crewProtocol: 1,
+      crewMode: () => "solo",
+      fetchTags: async () => apiTags("v1.8.0"),
+      fetchReleaseReading: asset(2),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status().linkChange).toBeUndefined();
+  });
+});
+
+describe("the GitHub credential (#254)", () => {
+  it("reads the three names in their order, trimmed, and skips a blank one", () => {
+    expect(GITHUB_TOKEN_ENVS).toEqual(["ISSANCE_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]);
+    expect(githubCredential({})).toBeNull();
+    expect(githubCredential({ GH_TOKEN: "   " })).toBeNull();
+    expect(githubCredential({ GITHUB_TOKEN: " ghp_x " })).toEqual({ token: "ghp_x", source: "GITHUB_TOKEN" });
+    expect(githubCredential({ GH_TOKEN: "a", GITHUB_TOKEN: "b" })).toEqual({ token: "a", source: "GH_TOKEN" });
+    expect(githubCredential({ ISSANCE_GITHUB_TOKEN: "c", GH_TOKEN: "a" })).toEqual({
+      token: "c",
+      source: "ISSANCE_GITHUB_TOKEN",
+    });
+    // A blank first name does not shadow a set second one.
+    expect(githubCredential({ ISSANCE_GITHUB_TOKEN: "", GH_TOKEN: "a" })?.source).toBe("GH_TOKEN");
+  });
+
+  it("sends the token to api.github.com alone — never to a release asset, a look-alike host, or a bad url", () => {
+    const credential = { token: "t", source: "GH_TOKEN" as const };
+    const base = { accept: "application/json" };
+    expect(githubHeaders("https://api.github.com/repos/a/b/tags?per_page=100", credential, base)).toEqual({
+      accept: "application/json",
+      authorization: "Bearer t",
+    });
+    expect(githubHeaders("https://github.com/a/b/releases/download/v1.0.0/x.json", credential, base)).toBe(base);
+    expect(githubHeaders("https://api.github.com.evil.example/x", credential, base)).toBe(base);
+    expect(githubHeaders("https://evil.example/api.github.com/x", credential, base)).toBe(base);
+    expect(githubHeaders("not a url", credential, base)).toBe(base);
+    expect(githubHeaders("https://api.github.com/x", null, base)).toBe(base);
+    expect(isGithubApiUrl("https://api.github.com:443/x")).toBe(true);
+    expect(isGithubApiUrl("http://api.github.com:8080/x")).toBe(false);
+  });
+});
+
+describe("the rehearsal mirror (ISSANCE_UPDATE_MIRROR), a loopback-only test seam", () => {
+  it("is off when unset or blank, and GitHub is asked as before", () => {
+    expect(updateMirror({})).toEqual({ ok: true, base: null });
+    expect(updateMirror({ ISSANCE_UPDATE_MIRROR: "  " })).toEqual({ ok: true, base: null });
+    expect(githubTagsUrl("issance/issance-app")).toBe("https://api.github.com/repos/issance/issance-app/tags?per_page=100");
+    expect(releaseReadingUrl("issance/issance-app", "1.8.0", null)).toBe(
+      "https://github.com/issance/issance-app/releases/download/v1.8.0/issance-release.json",
+    );
+  });
+
+  it("takes this machine's loopback, with a port and a path, and moves every release URL there", () => {
+    for (const [value, base] of [
+      ["http://127.0.0.1:8899/", "http://127.0.0.1:8899"],
+      ["http://localhost:8899", "http://localhost:8899"],
+      ["http://127.0.0.1/mirror/", "http://127.0.0.1/mirror"],
+    ] as const) {
+      expect(updateMirror({ ISSANCE_UPDATE_MIRROR: value })).toEqual({ ok: true, base });
+    }
+    const base = "http://127.0.0.1:8899";
+    expect(githubTagsUrl("issance/issance-app", base)).toBe(`${base}/repos/issance/issance-app/tags?per_page=100`);
+    expect(releaseReadingUrl("issance/issance-app", "1.8.0", base)).toBe(
+      `${base}/issance/issance-app/releases/download/v1.8.0/issance-release.json`,
+    );
+  });
+
+  it("refuses everything else: another host, https, a folder, a look-alike, a user part, IPv6", () => {
+    for (const value of [
+      "http://10.0.0.5:8899",
+      "https://127.0.0.1:8899",
+      "file:///C:/mirror",
+      "http://127.0.0.1.example.com",
+      "http://localhost@example.com",
+      "http://[::1]:8899",
+      "http://127.0.0.1:8899/?x=1",
+      "http://127.0.0.1@evil.com",
+      "http://localhost.evil.com",
+      "http://127.0.0.1:80@evil",
+      "http://localhost:1/../x",
+      "http://localhost:1/a/./b",
+      "https://127.0.0.1",
+      "http://127.0.0.1:8899 x",
+      "http://127.0.0.1:8899#top",
+      "http://127.0.0.1:123456",
+      "http://127.0.0.1:8899/x\\y",
+    ]) {
+      expect(updateMirror({ ISSANCE_UPDATE_MIRROR: value })).toEqual({ ok: false, value });
+    }
+  });
+
+  it("the bridge refuses a bad value outright: no request at all, never GitHub in its place", async () => {
+    const reads = releaseFetchers("issance/issance-app", { ISSANCE_UPDATE_MIRROR: "http://10.0.0.5:8899", GH_TOKEN: "t" });
+    await expect(reads.fetchTags()).rejects.toThrow("is not an http://127.0.0.1 or http://localhost URL");
+    expect(await reads.fetchReleaseReading("1.0.0")).toBeNull();
+    expect(reads.warning).toContain("The release check is off until it is fixed or unset.");
+    expect(releaseFetchers("issance/issance-app", {}).warning).toBeNull();
+  });
+
+  it("the bridge asks the mirror with no token and refuses its redirect (a local server)", async () => {
+    const seen: (string | null)[] = [];
+    let hop = false;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        seen.push(req.headers.get("authorization"));
+        if (hop) return new Response(null, { status: 302, headers: { location: "http://127.0.0.1:1/elsewhere" } });
+        return Response.json([{ name: "v1.2.3", commit: { sha: "abc" } }]);
+      },
+    });
+    try {
+      const reads = releaseFetchers("issance/issance-app", { ISSANCE_UPDATE_MIRROR: `http://127.0.0.1:${server.port}`, GH_TOKEN: "t" });
+      expect(reads.warning).toContain("WARNING: ISSANCE_UPDATE_MIRROR is set");
+      expect(await reads.fetchTags()).toEqual([{ name: "v1.2.3", sha: "abc" }]);
+      hop = true;
+      await expect(reads.fetchTags()).rejects.toThrow();
+      expect(await reads.fetchReleaseReading("1.2.3")).toBeNull();
+      expect(seen.every((h) => h === null)).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("never gets the GitHub token", () => {
+    const credential = { token: "t", source: "GH_TOKEN" as const };
+    const base = { accept: "application/json" };
+    expect(githubHeaders(githubTagsUrl("issance/issance-app", "http://127.0.0.1:8899"), credential, base)).toBe(base);
+  });
+});
+
+describe("ISSANCE_UPDATE_MIRROR is read in one module, and stays out of the operator's pages", () => {
+  const ROOT = join(import.meta.dir, "..");
+  const sources = (dir: string): string[] =>
+    readdirSync(join(ROOT, dir), { recursive: true, encoding: "utf8" })
+      .filter((p) => p.endsWith(".ts") && !p.endsWith(".test.ts"))
+      .map((p) => join(ROOT, dir, p));
+
+  it("no file but bridge/update.ts names it; everything else asks `updateMirror` or `releaseFetchers`", () => {
+    const naming = [...sources("bridge"), ...sources("cli")]
+      .filter((f) => readFileSync(f, "utf8").includes("ISSANCE_UPDATE_MIRROR"))
+      .map((f) => relative(ROOT, f).replaceAll("\\", "/"));
+    expect(naming).toEqual(["bridge/update.ts"]);
+  });
+
+  it("neither the CHANGELOG nor docs/ mention it: it is a test seam, not a setting", () => {
+    const pages = [join(ROOT, "CHANGELOG.md"), ...readdirSync(join(ROOT, "docs")).filter((p) => p.endsWith(".md")).map((p) => join(ROOT, "docs", p))];
+    expect(pages.filter((p) => readFileSync(p, "utf8").includes("ISSANCE_UPDATE_MIRROR"))).toEqual([]);
+  });
+});
+
+describe("the tag list past one page (counsel: about 92 tags, and GitHub pages at 100)", () => {
+  /** 130 tags in the API's order: 100 older ones fill page 1, and the newest stable sits at 120. */
+  const ORDER = [
+    ...Array.from({ length: 100 }, (_, i) => `v0.${i + 1}.0`),
+    ...Array.from({ length: 19 }, (_, i) => `v0.${i + 101}.0`),
+    "v1.1.0",
+    "v1.2.0-rc.1",
+    ...Array.from({ length: 9 }, (_, i) => `v0.${i + 120}.0`),
+  ];
+  const json = (names: readonly string[]) => names.map((name) => ({ name, commit: { sha: `sha-${name}` } }));
+  const pages = (all: readonly string[]) => (url: string) => {
+    const page = Number(/[?&]page=(\d+)/.exec(url)?.[1] ?? "1");
+    return Promise.resolve({ ok: true as const, value: json(all.slice((page - 1) * TAG_PAGE_SIZE, page * TAG_PAGE_SIZE)) });
+  };
+
+  it("reads page after page until a short one, and keeps the first page's URL as it was", async () => {
+    expect(ORDER).toHaveLength(130);
+    expect(ORDER.indexOf("v1.1.0")).toBe(119);
+    const asked: string[] = [];
+    const fetchPage = pages(ORDER);
+    const all = await readAllTags("issance/issance-app", null, (url) => {
+      asked.push(url);
+      return fetchPage(url);
+    });
+    expect(asked).toEqual([
+      "https://api.github.com/repos/issance/issance-app/tags?per_page=100",
+      "https://api.github.com/repos/issance/issance-app/tags?per_page=100&page=2",
+    ]);
+    expect(all.ok && all.tags.map((t) => t.name)).toEqual(ORDER);
+    // The newest stable is the same one a single page of all 130 would give; the rc is still a prerelease.
+    const stable = (all.ok ? all.tags : []).map((t) => t.name).filter((n) => /^v\d+\.\d+\.\d+$/.test(n));
+    expect(stable.toSorted((a, b) => compareSemver(b.slice(1), a.slice(1)))[0]).toBe("v1.1.0");
+  });
+
+  it("asks once for a repository with one page, as before, and on a mirror too", async () => {
+    const asked: string[] = [];
+    const base = "http://127.0.0.1:8899";
+    const all = await readAllTags("issance/issance-app", base, (url) => {
+      asked.push(url);
+      return pages(ORDER.slice(0, 92))(url);
+    });
+    expect(asked).toEqual([`${base}/repos/issance/issance-app/tags?per_page=100`]);
+    expect(all.ok && all.tags).toHaveLength(92);
+  });
+
+  it("a failed page fails the whole read, and the reading stops at the page bound", async () => {
+    const failed = await readAllTags("o/r", null, (url) =>
+      Promise.resolve(url.includes("page=2") ? { ok: false as const, failure: "HTTP 502" } : pages(ORDER)(url)),
+    );
+    expect(failed).toEqual({ ok: false, failure: "HTTP 502" });
+    let n = 0;
+    const endless = await readAllTags("o/r", null, () => {
+      n++;
+      return Promise.resolve({ ok: true as const, value: json(Array.from({ length: TAG_PAGE_SIZE }, (_, i) => `v0.${n}.${i}`)) });
+    });
+    expect(n).toBe(TAG_PAGES_MAX);
+    expect(endless.ok && endless.tags).toHaveLength(TAG_PAGE_SIZE * TAG_PAGES_MAX);
+  });
+});
+
+describe("UpdateMonitor on a release line (M60 spec 01)", () => {
+  const lineSeam = (record: () => UpdateLineRecord) => (tags: readonly string[], installed: string) =>
+    lineReading(record(), tags, installed);
+
+  it("Edge offers the newest Edge build; the snapshot names the line", async () => {
+    const { monitor } = makeMonitor({
+      current: "1.22.6",
+      fetchTags: async () => apiTags("v1.22.6", "v1.23.0-edge.1", "v1.23.0-edge.2"),
+      lineOffer: lineSeam(() => ({ ...DEFAULT_UPDATE_LINE, line: "edge" })),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({
+      latest: "1.23.0-edge.2",
+      releaseAvailable: true,
+      newerVersions: ["1.23.0-edge.1", "1.23.0-edge.2"],
+      line: "edge",
+    });
+    expect(monitor.status().back).toBeUndefined();
+  });
+
+  it("a switch re-resolves from the tags in hand, with no request, and names the way back", async () => {
+    let record: UpdateLineRecord = { ...DEFAULT_UPDATE_LINE, line: "edge" };
+    let fetches = 0;
+    const { monitor } = makeMonitor({
+      current: "1.23.0-edge.2",
+      fetchTags: async () => {
+        fetches++;
+        return apiTags("v1.22.6", "v1.23.0-edge.1", "v1.23.0-edge.2");
+      },
+      lineOffer: lineSeam(() => record),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({ latest: "1.23.0-edge.2", releaseAvailable: false, line: "edge" });
+    record = { ...record, line: "stable" };
+    monitor.lineChanged();
+    expect(fetches).toBe(1);
+    expect(monitor.status()).toMatchObject({ line: "stable", releaseAvailable: false, back: { to: "1.22.6", exceptions: [] } });
+  });
+
+  it("names the record's line before any check succeeded, and a switch shows at once (case 15)", async () => {
+    // The rig's bridge, and any offline machine: the release check never answers, so no tags were
+    // ever resolved. The line is still the record's, on the card, on the Crew page and in the
+    // crew header alike; before this seam the status carried no line and both pages said Stable.
+    let record: UpdateLineRecord = DEFAULT_UPDATE_LINE;
+    const { monitor } = makeMonitor({
+      current: "1.22.6",
+      fetchTags: () => Promise.reject(new Error("nothing accepted a connection")),
+      lineOffer: lineSeam(() => record),
+      line: () => record.line,
+    });
+    await monitor.checkRelease();
+    expect(monitor.status()).toMatchObject({ line: "stable", latest: null, releaseAvailable: false });
+    record = { ...record, line: "edge" };
+    monitor.lineChanged();
+    expect(monitor.status().line).toBe("edge");
+    record = { ...record, line: "stable" };
+    monitor.lineChanged();
+    expect(monitor.status().line).toBe("stable");
+    expect(monitor.status().back).toBeUndefined();
+  });
+
+  it("the record's line wins over the last resolve's, so a switch needs no lineChanged to show", async () => {
+    let record: UpdateLineRecord = { ...DEFAULT_UPDATE_LINE, line: "edge" };
+    const { monitor } = makeMonitor({
+      current: "1.22.6",
+      fetchTags: async () => apiTags("v1.22.6", "v1.23.0-edge.1"),
+      lineOffer: lineSeam(() => record),
+      line: () => record.line,
+    });
+    await monitor.checkRelease();
+    expect(monitor.status().line).toBe("edge");
+    record = { ...record, line: "stable" };
+    expect(monitor.status().line).toBe("stable");
+  });
+
+  it("a monitor with no line seam reports no line, and resolves as it always did", async () => {
+    const { monitor } = makeMonitor({ current: "1.22.6", fetchTags: async () => apiTags("v1.22.6", "v1.23.0-edge.1") });
+    await monitor.checkRelease();
+    expect(monitor.status().line).toBeUndefined();
+    expect(monitor.status().releaseAvailable).toBe(false);
+  });
+
+  it("an unpublished Edge tag is not offered (#503 holds on Edge too)", async () => {
+    const { monitor } = makeMonitor({
+      current: "1.22.6",
+      fetchTags: async () => apiTags("v1.22.6", "v1.23.0-edge.1", "v1.23.0-edge.2"),
+      fetchReleaseReading: async (v) => (v === "1.23.0-edge.2" ? "absent" : null),
+      lineOffer: lineSeam(() => ({ ...DEFAULT_UPDATE_LINE, line: "edge" })),
+    });
+    await monitor.checkRelease();
+    expect(monitor.status().latest).toBe("1.23.0-edge.1");
+  });
+
+  it("Edge nudges at once: no window holds the push back; Stable keeps the window", () => {
+    const base = {
+      current: "1.22.6",
+      latest: "1.23.0-edge.2",
+      newerVersions: ["1.23.0-edge.2"],
+      lastNotified: "1.23.0-edge.1",
+      lastPushedAt: hoursAgo(AT_10AM, 2),
+      now: AT_10AM,
+    };
+    expect(shouldNotify(base)).toEqual({ send: false });
+    expect(shouldNotify({ ...base, edge: true })).toEqual({ send: true, versions: ["1.23.0-edge.2"] });
+    // The 09:00 floor still holds on Edge.
+    const early = new Date(AT_10AM.getTime());
+    early.setHours(6);
+    expect(shouldNotify({ ...base, edge: true, now: early })).toEqual({ send: false });
+  });
+});

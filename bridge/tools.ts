@@ -1,0 +1,192 @@
+import { accessSync, constants, statSync } from "node:fs";
+import { join } from "node:path";
+
+import { HOST, type Host } from "./host.ts";
+
+// Finding an external tool (`hangar`, `git`, `systemctl`, `tailscale`, `journalctl`) when there may
+// be no PATH at all.
+//
+// It lives on the bridge side and is re-exported by `cli/tools.ts`, because both processes now spawn
+// `tailscale`: the CLI to publish and tear down the one managed front door, and the bridge to take
+// that same mapping down when it comes up as a peer (`bridge/front-door.ts`). PURE — it reads the
+// filesystem only to ask "is this an executable file", and it is handed the env and the home dir.
+//
+// Hangar spawns plugin actions with no login shell: nothing sourced a profile, so PATH is minimal or
+// absent and `command -v` finds nothing (the pre-shim issance-ctl.sh — the bug that burned four
+// `update` invocations). So PATH is a hint, not the mechanism: we search it when it is there and
+// then fall back to an explicit list of absolute directories.
+//
+// ABSOLUTE entries only. An empty or relative PATH entry means "the current directory" — resolving
+// a tool through it would let whatever directory we happen to be in supply `git`.
+
+/** Absolute directories searched after PATH. `home` is the resolved home dir, never `$HOME` raw. */
+export function fallbackDirs(home: string): string[] {
+  return [
+    join(home, ".local", "bin"),
+    join(home, ".bun", "bin"),
+    join(home, ".cargo", "bin"),
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/local/sbin",
+    "/usr/sbin",
+    "/sbin",
+    "/opt/homebrew/bin",
+  ];
+}
+
+/**
+ * The full search list: absolute PATH entries first (if any), then {@link fallbackDirs}.
+ *
+ * The separator comes from `host`, not from a literal `":"` — Windows separates PATH with `;`,
+ * and a `:` split there does not merely miss entries, it shreds every one of them at its drive
+ * letter (`C:\Program Files\Git\cmd` becomes `C` and `\Program Files\Git\cmd`), so the
+ * absolute-only filter below drops the lot and PATH contributes nothing at all.
+ *
+ * `host` is a parameter defaulting to the running machine's rather than a read of it, the way
+ * `bridge/config.ts`'s `defaultSocketPath` takes its own platform: it makes the Windows branch
+ * reachable from a test on any machine. We do not test on Windows hardware, so an injected host is
+ * the only way this branch is ever exercised.
+ */
+export function searchDirs(
+  path: string | undefined,
+  home: string,
+  host: Host = HOST,
+): string[] {
+  const fromPath = (path ?? "")
+    .split(host.path.delimiter)
+    .map((d) => d.trim())
+    .filter((d) => d.length > 0 && host.path.isAbsolute(d));
+  const seen = new Set<string>();
+  return [...fromPath, ...fallbackDirs(home)].filter((d) => {
+    if (seen.has(d)) return false;
+    seen.add(d);
+    return true;
+  });
+}
+
+/**
+ * An environment variable read case-insensitively on Windows, exactly as the OS itself reads it.
+ *
+ * Windows spells them `Path` and `PathExt`, and case only stops mattering while the environment is
+ * still the live `process.env` — Node's win32 proxy is case-insensitive. Every copy made of it is
+ * a plain object that is not, and this module is handed such copies (the CLI merges `.env` over the
+ * ambient environment before it builds `Exec`). So `env.PATH` reads `undefined` under PowerShell
+ * while working under a shell that happens to export the name uppercase, such as Git Bash — the
+ * tool search then silently falls back to the POSIX directory list and reports every Windows tool
+ * as "not installed on this host".
+ */
+export function envGet(
+  env: Record<string, string | undefined>,
+  name: string,
+  host: Host,
+): string | undefined {
+  return env[envKey(env, name, host)];
+}
+
+/**
+ * The key `name` is actually spelled under in `env` — `Path` rather than `PATH` on a Windows copy —
+ * or `name` itself when no spelling of it is present. A caller that WRITES the variable back needs
+ * this, not just the value: setting `PATH` beside an existing `Path` leaves the child with two
+ * entries that differ only in case, and which one Windows honours is not ours to pick.
+ */
+export function envKey(
+  env: Record<string, string | undefined>,
+  name: string,
+  host: Host = HOST,
+): string {
+  if (env[name] !== undefined || !host.caseInsensitive) return name;
+  const wanted = name.toLowerCase();
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === wanted) return key;
+  }
+  return name;
+}
+
+/**
+ * The suffixes a bare tool name may carry, most-bare first. `[""]` everywhere but Windows, where
+ * executability is spelled in the extension: `git`, `hangar` and `python3` exist only as `git.exe`,
+ * `hangar.exe`, `python3.exe`, and a lookup for the bare name finds nothing — which reads downstream
+ * as "not installed" rather than "we looked in the wrong place".
+ */
+export function toolExts(
+  env: Record<string, string | undefined>,
+  host: Host = HOST,
+): string[] {
+  if (host.exeSuffix === "") return [""];
+  const raw = envGet(env, "PATHEXT", host) ?? ".COM;.EXE;.BAT;.CMD";
+  const ext = raw.split(";").map((e) => e.trim()).filter((e) => e !== "");
+  return ["", ...ext];
+}
+
+/**
+ * Pure lookup: the first directory in `dirs` holding an executable `name`, or null. Each directory
+ * is tried against every suffix in `exts` before moving on, so PATH order still decides.
+ */
+export function findIn(
+  name: string,
+  dirs: string[],
+  isExecutable: (p: string) => boolean,
+  exts: readonly string[] = [""],
+): string | null {
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      const candidate = join(dir, name + ext);
+      if (isExecutable(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * A regular file the process may execute. A directory passes `access(X_OK)` (it is searchable), so
+ * without the `isFile()` check Windows 11 resolves `powershell` to the directory
+ * `C:\Windows\System32\PowerShell` that PowerShell 7 leaves ahead of `WindowsPowerShell\v1.0` on PATH,
+ * and the spawn that follows fails with "Executable not found" (issue 344). `statSync` follows
+ * symlinks, so a link to a binary still counts; a missing path throws and stays false.
+ */
+export function isExecutableFile(p: string): boolean {
+  try {
+    accessSync(p, constants.X_OK);
+    return statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve `name` to an absolute path, or null. Callers report a legible "X not found".
+ *
+ * An ALREADY-ABSOLUTE `name` is not searched for — it is checked where it is. Without that,
+ * `join(dir, "/usr/bin/tmux")` asks after `/usr/bin/usr/bin/tmux` in every directory and the caller
+ * is told the binary does not exist. On Windows the suffixes are still tried, so a bare path finds
+ * its `.exe`. It matters because the mux adapters resolve their binary themselves, from an
+ * operator setting (`ISSANCE_TMUX_BIN`) or a fixed candidate list (`bridge/mux/<name>/exec.ts`), and
+ * `issance doctor` runs that same resolved path through the `Exec` seam, which resolves every tool
+ * through here.
+ */
+export function findTool(
+  name: string,
+  env: Record<string, string | undefined>,
+  home: string,
+  host: Host = HOST,
+): string | null {
+  const exts = lookupExts(env, host);
+  if (host.path.isAbsolute(name)) {
+    // Bun writes `issance.exe`; a caller holding the bare absolute path still means that file.
+    const ext = exts.find((e) => isExecutableFile(name + e));
+    return ext === undefined ? null : name + ext;
+  }
+  return findIn(name, searchDirs(envGet(env, "PATH", host), home, host), isExecutableFile, exts);
+}
+
+/**
+ * The suffixes {@link findTool} tries, in order. Off Windows that is `[""]`. On Windows a `PATHEXT`
+ * suffix comes BEFORE the bare name: npm's global folder holds an extensionless sh shim (`claude`)
+ * beside `claude.cmd`, the shim is an executable file to `isExecutableFile`, and Windows cannot
+ * spawn it. The bare name stays last, for a `name` that already carries its extension.
+ */
+function lookupExts(env: Record<string, string | undefined>, host: Host): string[] {
+  const exts = toolExts(env, host);
+  return host.exeSuffix === "" ? exts : [...exts.filter((e) => e !== ""), ""];
+}

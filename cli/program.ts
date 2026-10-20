@@ -1,0 +1,1188 @@
+import { appendFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { Command as Program, CommanderError } from "commander";
+
+import { type BeaconEmitDeps, runBeaconEmit } from "./beacon.ts";
+import { type HoldDeps, netConnect, runBeaconHold } from "./hold.ts";
+import { CODEX_NOTIFY_HARNESS, runCodexNotify } from "./codex-notify.ts";
+import { cmdBuild } from "./build.ts";
+import {
+  cmdConfig,
+  cmdConfigCheck,
+  cmdConfigInit,
+  cmdConfigShow,
+  configDeps,
+  CONFIG_SUBCOMMANDS,
+  type ConfigDeps,
+} from "./config.ts";
+import { collieVersion, loadContext } from "./context.ts";
+import {
+  cmdHooks,
+  cmdHooksInstall,
+  cmdHooksStatus,
+  cmdHooksUninstall,
+  type HooksDeps,
+  HOOKS_SUBCOMMANDS,
+} from "./hooks.ts";
+import { lifecycleDeps, updateDeps } from "./deps.ts";
+import { cmdDoctor, doctorDeps } from "./doctor.ts";
+import { cmdDocs, cmdSkill } from "./docs.ts";
+import {
+  cmdSkillInstall,
+  cmdSkillPrint,
+  cmdSkillStatus,
+  cmdSkillSync,
+  cmdSkillUninstall,
+  cmdSkillVerb,
+  type SkillDeps,
+} from "./skill-install.ts";
+import { asksForHelp, EXIT, type Io, realIo } from "./io.ts";
+import {
+  cmdExecBridge,
+  cmdLogs,
+  cmdStart,
+  cmdStatus,
+  cmdStop,
+  cmdUninstall,
+  cmdRestart,
+  cmdUrl,
+  type LifecycleDeps,
+} from "./lifecycle.ts";
+import { cmdLink, cmdUnlink, type LinkDeps, realLinkFs } from "./link.ts";
+import { cmdMuxProbe } from "./mux-probe.ts";
+import {
+  cmdJoin,
+  cmdLeave,
+  cmdCrew,
+  cmdCrewApprovePromote,
+  cmdCrewInvite,
+  cmdCrewRemove,
+  cmdCrewRename,
+  cmdCrewRotate,
+  cmdCrewSetAddress,
+  cmdCrewStatus,
+  cmdPromote,
+  cmdReconnect,
+  crewAudit,
+  crewDeps,
+  CREW_SUBCOMMANDS,
+} from "./crew.ts";
+import {
+  cmdDevices,
+  cmdDevicesClearExpiry,
+  cmdDevicesList,
+  cmdDevicesRevoke,
+  cmdDevicesSetExpiry,
+  cmdPair,
+  DEVICES_SUBCOMMANDS,
+  type PairingDeps,
+} from "./pairing.ts";
+import {
+  cmdPush,
+  cmdPushForget,
+  cmdPushList,
+  cmdPushTest,
+  type PushDeps,
+  PUSH_SUBCOMMANDS,
+} from "./push.ts";
+import { cmdPushKeys } from "./push-keys.ts";
+import { cmdQr } from "./qr.ts";
+import { loadUi, renderInputs, takePlainFlag, type Ui, wantsRich } from "./render.ts";
+import { cmdCrewDeputy } from "./crew-deputy.ts";
+import { cmdCrewUpdate } from "./crew-update.ts";
+import { cmdCrewAdd, crewAddDeps, type CrewAddDeps } from "./remote.ts";
+import { cmdServe, cmdServeVerb, cmdUnserve } from "./serve.ts";
+import {
+  cmdStt,
+  cmdSttOff,
+  cmdSttSetup,
+  cmdSttStatus,
+  cmdSttTest,
+  STT_SUBCOMMANDS,
+  type SttDeps,
+} from "./stt.ts";
+import { cmdSttWhistle } from "./stt-whistle.ts";
+import { cmdDurable, cmdDurableAttach, cmdDurableDetach, cmdDurableList, DURABLE_SUBCOMMANDS, type DurableAttachDeps } from "./durable-attach.ts";
+import { realExec, realFiles } from "./sys.ts";
+import { HOST } from "../bridge/host.ts";
+import { cmdSupervise, realSuperviseDeps } from "./task-scheduler.ts";
+import { cmdApplyUpdate, cmdUpdate } from "./update.ts";
+import {
+  askSocket,
+  cmdWalky,
+  cmdWalkyInbox,
+  cmdWalkyReply,
+  cmdWalkySend,
+  cmdWalkyStatus,
+  cmdWalkyWho,
+  WALKY_SUBCOMMANDS,
+  type WalkyDeps,
+} from "./walky.ts";
+import { cmdUpdateCheck, updateCheckDeps, wantsCheck } from "./update-check.ts";
+
+// The `issance` binary's dispatch: argv in, exit code out. This module owns ONLY the dispatch —
+// every verb's behaviour lives in its own module under `cli/`, taking the resolved context as an
+// argument.
+//
+// It is reached through a dynamic `import()` from `cli/main.ts`, which is what keeps commander off
+// the path a bare checkout takes to `build` — see that file's header. `build` and `_apply-update`
+// are therefore dispatched BEFORE this module loads; they stay in {@link COMMANDS} because the
+// table is the single declaration of the verb list, and `cli/main.test.ts` pins the two together.
+//
+// ── COMMANDER PARSES; THE TABLE STILL DECLARES ───────────────────────────────
+// `commander` owns argv → verb, the subcommand tree and the usage errors. It does NOT own the verb
+// list: {@link COMMANDS} is still the single declaration, in the order the usage line prints, and
+// the program is built from it. That keeps two things true that a hand-written `program.command(…)`
+// wall would quietly break — the usage line can't drift from the table, and a verb can't be added
+// without a summary.
+//
+// Everything about the grammar is byte-for-byte what the hand-rolled dispatcher did, because the
+// spellings are a contract: a README recipe, muscle memory from `issance-ctl.sh <verb>`, and a
+// <0.8.0 Hangar install's cached action set (ADR 0006) all land on this table. So commander is
+// configured to never exit the process itself (`exitOverride`), never write to the real streams
+// (`configureOutput` → the {@link Io} seam), and never print its own help text (`configureHelp`) —
+// the exit-code families of `cli/io.ts` and the help layout below are what callers already parse.
+
+export { EXIT, realIo, type Io };
+
+/**
+ * One invocation's presentation decision, resolved once in {@link run} and handed to every verb.
+ *
+ * `rich` is the answer to "did this land on a terminal a TTY view is worth drawing on?" — see
+ * `cli/render.ts` for why it is decided here rather than at each point of output.
+ */
+export interface Session {
+  readonly io: Io;
+  /**
+   * The terminal renderer, or `null`. Lazy and memoised, and called ONLY by the three verbs that
+   * have a surface — resolving it is what pulls react, ink and yoga into the process, and a piped
+   * or plain `issance url` must not pay for a UI it will never draw.
+   */
+  ui(): Promise<Ui | null>;
+}
+
+export interface Command {
+  readonly name: string;
+  readonly summary: string;
+  /** Internal verbs are dispatchable but stay out of the usage line, as in the shell. */
+  readonly internal?: boolean;
+  /**
+   * A verb that owns a subcommand tree declares it here, and commander builds real child commands
+   * from it. The parent's own `run` stays the fallback — it is what answers a bare `issance crew`
+   * and an unknown subcommand, with the usage block those two have always printed.
+   */
+  readonly subcommands?: readonly Subcommand[];
+  run(args: readonly string[], session: Session): number | Promise<number>;
+}
+
+export interface Subcommand {
+  readonly name: string;
+  readonly summary: string;
+  run(args: readonly string[], session: Session): number | Promise<number>;
+}
+
+/**
+ * A crew verb's dependencies: the lifecycle set's seams, plus the trust store, the transport, the
+ * clock and the audit log (`cli/crew.ts`'s `crewDeps`).
+ *
+ * `restart`, `serve` and `unserve` are passed as the real lifecycle verbs because a membership change
+ * is not complete until the running bridge has it: the trust store is read once per process, and mode,
+ * push gate and roster are resolved at construction.
+ */
+async function crewVerbDeps(io: Io, ui: Ui | null = null): Promise<CrewAddDeps> {
+  const deps = lifecycleDeps(io);
+  // `crewAddDeps` layers the SSH transport, the two prompts and the bundle on top — `crew add` is
+  // the one verb that reaches another machine, and every one of those is a seam its tests replace.
+  return crewAddDeps(
+    crewDeps(
+      {
+        ctx: deps.ctx,
+        io,
+        ui,
+        exec: deps.exec,
+        files: deps.files,
+        restart: (into?: Io) => cmdRestart(into === undefined ? deps : { ...deps, io: into }),
+        // Threaded exactly like `restart`: `cmdStart` (reached through `restart` on the rich `crew
+        // add` path) calls this with the SAME swapped `io` it was given, so a serve republish that
+        // happens mid-restart lands on the surface's held-chatter `Io` instead of escaping to the
+        // real terminal (the bug this comment used to have no fix for — see cli/lifecycle.ts).
+        serve: (into?: Io) => Promise.resolve(cmdServe(into === undefined ? deps : { ...deps, io: into })),
+        unserve: () => cmdUnserve(deps),
+      },
+      await crewAudit(deps.ctx),
+    ),
+  );
+}
+
+/**
+ * The pairing verbs' seams: the resolved context (for `stateDir` — the SAME directory the bridge
+ * resolves, which is the whole reason an enrolment made here is visible to the running service), the
+ * output seam, the filesystem, and the process seam `pair` asks the tailnet for the URL its QR
+ * carries. No service manager: the bridge re-reads both files per request, so nothing restarts.
+ */
+function pairingDeps(io: Io): PairingDeps {
+  const ctx = loadContext(io.err);
+  return {
+    ctx,
+    io,
+    files: realFiles,
+    exec: realExec(ctx.env, ctx.home),
+    // The bridge's own trail: `devices revoke` records the launcher rows it removes there (ADR 0094).
+    appendAudit: (line) => appendFileSync(join(ctx.stateDir, "audit.log"), `${line}\n`, { mode: 0o600 }),
+  };
+}
+
+/**
+ * The push verbs' seams: the resolved context and the output seam, nothing else. The subscription
+ * store is read and written by `bridge/push.ts` — the CLI holds no second parser for it.
+ */
+function pushDeps(io: Io): PushDeps {
+  return { ctx: loadContext(io.err), io };
+}
+
+/**
+ * `link` / `unlink`: where the checkout is, the output seam, the filesystem (only to answer "has this
+ * been built?"), and the symlink seam. No service manager and no network — publishing a name touches
+ * one entry in `~/.local/bin` and nothing else.
+ */
+function linkDeps(io: Io): LinkDeps {
+  return { ctx: loadContext(io.err), io, files: realFiles, fs: realLinkFs };
+}
+
+/**
+ * `hooks`: the same three seams as `link` — it edits the agent's `settings.json` and reads the
+ * published PATH name to decide what command to write into it (ADR 0021). No service manager, no
+ * network, and nothing under the state dir.
+ */
+function hooksDeps(io: Io): HooksDeps {
+  return { ctx: loadContext(io.err), io, files: realFiles, fs: realLinkFs };
+}
+
+/** `skill install|uninstall|sync|status|print`: the context, the filesystem and the symlink probe, like `hooks`. */
+function skillDeps(io: Io): SkillDeps {
+  return { ctx: loadContext(io.err), io, files: realFiles, fs: realLinkFs };
+}
+
+/**
+ * `stt`: the pairing set (context + filesystem — `stt.json` lives beside the pairing files, under the
+ * state dir the bridge resolves), plus `exec` to locate the operator's `codex` binary and the two
+ * prompts `setup` asks its questions through.
+ *
+ * The prompts are Bun's built-ins behind a tty check, exactly as `crew add` guards them: a question
+ * nobody can answer must abort legibly rather than read EOF as consent — and on the codex path that
+ * question IS the consent (ADR 0029).
+ */
+/** `walky`: the context and the filesystem (the socket checks), stdin for a body, and the socket itself. */
+function walkyDeps(io: Io): WalkyDeps {
+  return {
+    ctx: loadContext(io.err),
+    files: realFiles,
+    uid: process.getuid?.(),
+    io,
+    platform: HOST.platform,
+    readStdin: () => Bun.stdin.text(),
+    stdinIsTty: process.stdin.isTTY === true,
+    ask: (path, line) => askSocket(path, line),
+  };
+}
+
+/** The sub-verbs of `walky`. */
+const WALKY_TREE: readonly Subcommand[] = [
+  {
+    name: "who",
+    summary: "the agent panes you can message: address, machine, harness, label, state",
+    run: (args, s) => cmdWalkyWho(walkyDeps(s.io), args),
+  },
+  {
+    name: "send",
+    summary: "message one pane, a machine or everyone: `walky send <address> <text>` (no text: stdin)",
+    run: (args, s) => cmdWalkySend(walkyDeps(s.io), args),
+  },
+  {
+    name: "reply",
+    summary: "answer a message by its id: `walky reply <id> <text>` (no text: stdin)",
+    run: (args, s) => cmdWalkyReply(walkyDeps(s.io), args),
+  },
+  {
+    name: "inbox",
+    summary: "read one message by id, or this pane's unread ones and mark them read (`--keep`, `--all`)",
+    run: (args, s) => cmdWalkyInbox(walkyDeps(s.io), args),
+  },
+  {
+    name: "status",
+    summary: "a message's receipt: `walky status <id>`",
+    run: (args, s) => cmdWalkyStatus(walkyDeps(s.io), args),
+  },
+];
+
+function sttDeps(io: Io): SttDeps {
+  const ctx = loadContext(io.err);
+  const deps: SttDeps = {
+    ctx,
+    io,
+    files: realFiles,
+    exec: realExec(ctx.env, ctx.home),
+    interactive: process.stdin.isTTY === true,
+    prompt: (question) => (process.stdin.isTTY === true ? prompt(question) : null),
+  };
+  // A progress line only on a terminal: a log would get a carriage return per tick.
+  if (process.stdout.isTTY === true) deps.progress = (text) => void process.stdout.write(text);
+  return deps;
+}
+
+/**
+ * `beacon emit`: the state dir, the filesystem, stdin, and the AGENT's pid.
+ *
+ * There is no `Io` in this set, and that is the point — a hook's stdout is injected into the
+ * conversation, so the verb has no way to print even by accident. The context's own stderr notes are
+ * dropped for the same reason. `process.ppid` is the `claude` process: a hook command runs as its
+ * direct child (probed 2026-08-20 — see `cli/beacon.ts`).
+ */
+/** `config`'s seams: the context (which already carries the file layer), the io and the filesystem. */
+function configVerbDeps(io: Io): ConfigDeps {
+  return configDeps(loadContext(io.err), io, realFiles);
+}
+
+/**
+ * `durable`: the context, the filesystem, the one network read `list` makes of this instance's own
+ * bridge, and the restart verb. The restart is built here and called ONLY by `--restart`; it is the
+ * same `cmdRestart` the `restart` verb runs, so it restarts the unit that owns this binary's checkout.
+ */
+function durableVerbDeps(io: Io): DurableAttachDeps {
+  const deps = lifecycleDeps(io);
+  return {
+    ctx: deps.ctx,
+    io,
+    files: deps.files,
+    exec: deps.exec,
+    fetch: (url, init) => fetch(url, init),
+    restart: () => cmdRestart(deps),
+  };
+}
+
+function beaconDeps(): BeaconEmitDeps {
+  return {
+    ctx: loadContext(() => {}),
+    files: realFiles,
+    readStdin: () => Bun.stdin.text(),
+    agentPid: process.ppid,
+    uid: process.getuid?.(),
+  };
+}
+
+function holdDeps(): HoldDeps {
+  return {
+    ctx: loadContext(() => {}),
+    files: realFiles,
+    readStdin: () => Bun.stdin.text(),
+    agentPid: process.ppid,
+    uid: process.getuid?.(),
+    connect: netConnect,
+    print: async (text) => {
+      await Bun.write(Bun.stdout, `${text}\n`);
+    },
+  };
+}
+
+/** A verb whose body is a lifecycle function over {@link lifecycleDeps}. */
+function lifecycleCommand(
+  name: string,
+  summary: string,
+  body: (deps: LifecycleDeps, args: readonly string[]) => number | Promise<number>,
+  opts: { internal?: boolean; rich?: boolean; repairAcl?: boolean } = {},
+): Command {
+  return {
+    name,
+    summary,
+    internal: opts.internal === true,
+    // `rich` is what marks a verb as having a terminal surface. Without it the renderer is never
+    // even loaded — see `Session.ui`. `repairAcl` is the bridge process's alone (M43 spec 04).
+    run: async (args, s) =>
+      body(lifecycleDeps(s.io, opts.rich === true ? await s.ui() : null, { repairAcl: opts.repairAcl === true }), args),
+  };
+}
+
+/** A `crew` sub-verb whose body takes the crew dependency set; `rich` marks a surface in `cli/ui/`. */
+function crewSubcommand(
+  name: (typeof CREW_SUBCOMMANDS)[number],
+  summary: string,
+  body: (deps: CrewAddDeps, args: readonly string[]) => number | Promise<number>,
+  rich = false,
+): Subcommand {
+  return {
+    name,
+    summary,
+    run: async (args, s) => body(await crewVerbDeps(s.io, rich ? await s.ui() : null), args),
+  };
+}
+
+/**
+ * The `crew` subcommand tree, built ONCE and shared by both spellings of the verb.
+ *
+ * Order is `CREW_SUBCOMMANDS`' order, which is the order `cli/crew.ts`'s own usage block prints —
+ * the two are pinned to each other in `cli/main.test.ts`. Every row resolves its seams through
+ * `crewVerbDeps`, so the dispatcher stays a table and `cli/crew.ts` owns the behaviour.
+ */
+function crewTree(): readonly Subcommand[] {
+  return [
+    crewSubcommand("invite", "mint a single-use, 10-minute enrollment token (on the lead)", cmdCrewInvite),
+    crewSubcommand("join", "join a crew: `crew join <lead-address>` (run on the joining machine)", cmdJoin),
+    crewSubcommand("leave", "leave the crew — drops the crew secret and every pin on this machine", (deps) =>
+      cmdLeave(deps),
+    ),
+    crewSubcommand("add", "install and enroll a peer over SSH: `crew add <ssh-host>` (on the lead)", cmdCrewAdd, true),
+    crewSubcommand(
+      "update",
+      "level peers to this lead's build over SSH: `crew update <member>… | --all` (on the lead)",
+      cmdCrewUpdate,
+      true,
+    ),
+    crewSubcommand("status", "mode, members, reachability, secret pickup and why a link is refused", cmdCrewStatus, true),
+    crewSubcommand("rotate", "reissue the crew secret and hand it to every reachable peer", (deps) =>
+      cmdCrewRotate(deps),
+    ),
+    crewSubcommand("rename", "give the crew a new name: `crew rename <name>` (on the lead)", cmdCrewRename),
+    crewSubcommand("remove", "unpin and forget a member (on the lead)", cmdCrewRemove),
+    crewSubcommand(
+      "set-address",
+      "correct where this lead dials a member: `crew set-address <member> <host:port>`",
+      cmdCrewSetAddress,
+    ),
+    crewSubcommand(
+      "deputy",
+      "name the ONE peer that may take over and arm it over ssh: `crew deputy <member> | --revoke`",
+      (deps, args) => cmdCrewDeputy(deps, args),
+    ),
+    crewSubcommand(
+      "approve-promote",
+      "consent, on the lead, for one member to take over (10 minutes, single-use)",
+      cmdCrewApprovePromote,
+    ),
+  ];
+}
+
+/** The one tree. `crew` and its `crew` alias both point at THIS array, so neither can drift. */
+const CREW_TREE: readonly Subcommand[] = crewTree();
+
+const CREW_SUMMARY = `crew administration: ${CREW_SUBCOMMANDS.join(", ")}`;
+
+/**
+ * Reached only when no subcommand matched — a bare `issance crew` (or `issance pack`), or a misspelt
+ * sub-verb. `cmdCrew` owns that message, and has since before commander: it names every sub-verb
+ * with its own one-line summary, which is more than an "unknown command" line would say.
+ */
+const crewRun: Command["run"] = async (args, s) => cmdCrew(await crewVerbDeps(s.io), args);
+
+/**
+ * The one line the `crew` spelling prints that `crew` does not (ADR 0038).
+ *
+ * It is a note to a PERSON, so it goes to stderr and only when stderr is a terminal: a script, a
+ * pipe and a Hangar action see nothing at all, and stdout is byte-identical under both spellings,
+ * which is what `scripts/issance-cli.test.sh` asserts on `status`.
+ */
+export const OLD_SPELLING_NOTICE =
+  "note: `issance pack` is now `issance crew`. The old spelling keeps working until 2.0.0.";
+
+/**
+ * `run`, with the notice in front of it. The ONE place the gate is spelled, so the bare alias and
+ * every alias row are told the same thing by the same line of code.
+ */
+export function withOldSpellingNotice<T extends Command["run"]>(body: T): Command["run"] {
+  return (args, s) => {
+    if (s.io.errIsTty === true) s.io.err(OLD_SPELLING_NOTICE);
+    return body(args, s);
+  };
+}
+
+/** A `crew` row: the notice, then the crew row's OWN function. `aliasOf` is what pins that. */
+export type AliasRow = Subcommand & { readonly aliasOf: Subcommand };
+
+/**
+ * Wrap one crew row as its `crew` alias.
+ *
+ * The wrapper is the only thing the two spellings do not share, and it holds nothing but the
+ * notice: `aliasOf` carries the crew row itself, so `cli/crew.test.ts` can pin by identity that no
+ * sub-verb reaches one spelling and misses the other.
+ */
+export function crewAliasRow(sub: Subcommand): AliasRow {
+  return {
+    name: sub.name,
+    summary: sub.summary,
+    aliasOf: sub,
+    run: withOldSpellingNotice((args, s) => sub.run(args, s)),
+  };
+}
+
+// Declaration order is the order of the usage line, and it is the order `scripts/issance-ctl.sh`
+// dispatched in before M6/01 turned that script into a bootstrap shim — so muscle memory carried
+// over from `issance-ctl.sh <verb>` still finds every verb where it was.
+export const COMMANDS: readonly Command[] = [
+  // `start` and `status` share one banner (`statusBanner`), so they share its surface too.
+  lifecycleCommand("start", "start the bridge service (and publish the front door)", cmdStart, { rich: true }),
+  lifecycleCommand("stop", "stop the bridge service", (deps) => cmdStop(deps)),
+  lifecycleCommand("restart", "stop then start", cmdRestart),
+  lifecycleCommand(
+    "uninstall",
+    "remove the service, the front door and its ownership record",
+    cmdUninstall,
+  ),
+  {
+    name: "update",
+    summary:
+      "advance to the newest release of this major (--check is a read-only preflight, and --check --local checks this instance only, skipping crew members; --major crosses one; --rollback flips current back to the previous version; --status shows the run)",
+    // `--check` is a different verb wearing `update`'s name: a read-only preflight that answers
+    // "could this update succeed right now?" and touches nothing (`cli/update-check.ts`). It is
+    // routed HERE, before `cmdUpdate` is ever constructed, so no part of the real update path can
+    // run behind it.
+    run: (args, s) =>
+      wantsCheck(args) ? cmdUpdateCheck(updateCheckDeps(s.io), args) : cmdUpdate(updateDeps(s.io), args),
+  },
+  {
+    name: "_apply-update",
+    summary: "internal: the second half of `update`, run post-pull",
+    internal: true,
+    run: (args, s) => cmdApplyUpdate(updateDeps(s.io), args),
+  },
+  // Declared beside `_apply-update` because it is the same kind of verb: plumbing another issance
+  // spells, never an operator. `crew add` runs it on the member it has just installed, to learn
+  // which multiplexer that machine should drive (`cli/mux-probe.ts`).
+  {
+    name: "_mux-probe",
+    summary: "internal: which multiplexers are running here, as one JSON line",
+    internal: true,
+    run: (_args, s) => {
+      const deps = lifecycleDeps(s.io);
+      return cmdMuxProbe({ ctx: deps.ctx, io: s.io, exec: deps.exec, files: deps.files });
+    },
+  },
+  // The Whistle host engine's child (ADR 0096): the bridge spells it once per dictation, with a WAV
+  // path it wrote. Dispatched from cli/main.ts's bootstrap; declared here so the table stays the one
+  // declaration and the usage line keeps it hidden.
+  {
+    name: "_whistle-transcribe",
+    summary: "internal: transcribe one WAV with the Whistle engine, for the bridge",
+    internal: true,
+    run: async (args, s) => {
+      const { cmdWhistleTranscribe } = await import("./whistle-transcribe.ts");
+      return cmdWhistleTranscribe(args, { io: s.io, env: process.env });
+    },
+  },
+  lifecycleCommand(
+    "_exec-bridge",
+    "internal: the process the supervisor watches",
+    cmdExecBridge,
+    // The bridge itself: the one process that may repair a secret file's access list on Windows.
+    { internal: true, repairAcl: true },
+  ),
+  // The Windows launcher (cli/task-scheduler.ts): Task Scheduler runs it, and it runs and relaunches
+  // `_exec-bridge`. Not a lifecycle command: everything it needs is on its own command line, so it
+  // resolves no context, reads no `.env` and asks Hangar nothing at logon, before Hangar is up.
+  {
+    name: "_supervise",
+    summary: "internal: the Windows launcher Task Scheduler runs",
+    internal: true,
+    run: (args, s) => cmdSupervise(realSuperviseDeps(s.io, realFiles), args),
+  },
+  lifecycleCommand(
+    "build",
+    "typecheck both sides, compile the binary and build the PWA (staged, atomic swap)",
+    cmdBuild,
+  ),
+  // Invoked directly, `serve` also prints where to point a phone (the pre-shim issance-ctl.sh) —
+  // `start` does not, because its banner already carries the URL. That extra line is `cmdServeVerb`,
+  // which lives beside the publish decision it depends on (a peer prints none — F24).
+  lifecycleCommand("serve", "publish the single managed `tailscale serve` front door", cmdServeVerb),
+  lifecycleCommand("unserve", "tear down the front door we published", cmdUnserve),
+  lifecycleCommand("status", "is it running, and on what URLs", cmdStatus, { rich: true }),
+  lifecycleCommand("url", "print the bridge URL", cmdUrl),
+  lifecycleCommand("qr", "print the bridge URL as a scannable QR code", (deps) => cmdQr(deps)),
+  {
+    name: "version",
+    summary: "print the version actually being served",
+    run(_args, s) {
+      const ctx = loadContext(s.io.err);
+      s.io.out(collieVersion(ctx.root));
+      return EXIT.OK;
+    },
+  },
+  // `push-keys` and `push-test` keep their hyphenated spellings because the Hangar action set cached
+  // at install time names them (ADR 0006) — the shim delegates both here. `push keys` / `push test`
+  // below are the same functions under the parent verb.
+  {
+    name: "push-keys",
+    summary: "generate the VAPID keypair and write it into this install's .env",
+    run: (args, s) => cmdPushKeys(pushDeps(s.io), args),
+  },
+  {
+    name: "push-test",
+    summary: "send a one-off Web Push to every subscribed device",
+    run: (args, s) => cmdPushTest(pushDeps(s.io), args),
+  },
+  lifecycleCommand("logs", "tail the service log (default 50 lines)", (deps, args) =>
+    cmdLogs(deps, args),
+  ),
+  // Read-only by contract (cli/doctor.ts), so its deps are the lifecycle seams with every mutating
+  // one left out — no service manager, no front door, no store write.
+  {
+    name: "doctor",
+    summary: "check this install for the traps that fail silently",
+    run: async (args, s) => {
+      const deps = lifecycleDeps(s.io);
+      return cmdDoctor(
+        doctorDeps({ ctx: deps.ctx, io: s.io, exec: deps.exec, files: deps.files, ui: await s.ui() }),
+        args,
+      );
+    },
+  },
+  // ── The name on PATH (ADR 0021) ────────────────────────────────────────────
+  // The other publish/tear-down pair: `serve` publishes a URL, `link` publishes a NAME. Both only
+  // ever tear down what matches their own record — the handler file there, the link's target here
+  // (ADR 0001). Declared beside `doctor` rather than beside `serve` because, like it, they are verbs
+  // the shell dispatcher never had.
+  {
+    name: "link",
+    summary: "put `issance` on your PATH: ~/.local/bin/issance → this checkout's binary",
+    run: (_args, s) => cmdLink(linkDeps(s.io)),
+  },
+  {
+    name: "unlink",
+    summary: "remove that name again (only when it points at THIS checkout)",
+    run: (_args, s) => cmdUnlink(linkDeps(s.io)),
+  },
+  // ── Agent beacons (M11) ────────────────────────────────────────────────────
+  // Declared beside `link` because they share its subject: `hooks install` writes the published PATH
+  // name into the agent's own settings, and that name is a symlink to this checkout (ADR 0021). The
+  // emitter is internal — it is spelled by a hook, never typed — and its whole contract is that it
+  // prints nothing and exits 0 (cli/beacon.ts).
+  {
+    name: "hooks",
+    summary: `agent hooks that report a pane's identity: ${HOOKS_SUBCOMMANDS.join(", ")}`,
+    subcommands: [
+      {
+        name: "install",
+        summary: "register the beacon hooks: `hooks install claude` (add `--hold-permissions` to hold permissions), or `hooks install codex`",
+        run: (args, s) => cmdHooksInstall(hooksDeps(s.io), args),
+      },
+      {
+        name: "uninstall",
+        summary: "remove only the entries issance owns: `hooks uninstall claude`, or `hooks uninstall codex`",
+        run: (args, s) => cmdHooksUninstall(hooksDeps(s.io), args),
+      },
+      {
+        name: "status",
+        summary: "what each settings file carries right now (reads only)",
+        run: (args, s) => cmdHooksStatus(hooksDeps(s.io), args),
+      },
+    ],
+    run: (args, s) => cmdHooks(hooksDeps(s.io), args),
+  },
+  {
+    name: "beacon",
+    summary: "internal: `beacon emit` and `beacon hold`, the agent hooks issance installs",
+    internal: true,
+    subcommands: [
+      {
+        name: "emit",
+        summary: "internal: write this pane's beacon from the hook payload on stdin",
+        // `issance beacon emit codex <payload>` is the Codex notify command (cli/codex-notify.ts).
+        run: (args) => (args[0] === CODEX_NOTIFY_HARNESS ? runCodexNotify(beaconDeps, args.slice(1)) : runBeaconEmit(beaconDeps)),
+      },
+      {
+        name: "hold",
+        summary: "internal: hold one permission request for a tap on the phone (M56 spec 12)",
+        run: () => runBeaconHold(holdDeps),
+      },
+    ],
+    // A bare `issance beacon`, or a misspelt sub-verb, is still an invocation from a hook — so it gets
+    // the same silence and the same exit 0 as every other path through the emitter.
+    run: () => EXIT.OK,
+  },
+  // ── Device pairing ─────────────────────────────────────────────────────────
+  // The operator's terminal is the out-of-band channel enrolment bootstraps from — see the header of
+  // `cli/pairing.ts`. Both verbs touch only the two files under the state dir, which the bridge
+  // re-reads per request, so neither restarts anything.
+  {
+    name: "pair",
+    summary:
+      "mint a one-time code and a QR for a phone to pair with (scan it, or enter the code in Settings); `--expires 30d` limits its lifetime",
+    run: (args, s) => cmdPair(pairingDeps(s.io), args),
+  },
+  {
+    name: "devices",
+    summary: `paired devices: ${DEVICES_SUBCOMMANDS.join(", ")}`,
+    subcommands: [
+      {
+        name: "list",
+        summary: "the paired devices, with when each was paired, last seen, and expires",
+        run: (_args, s) => cmdDevicesList(pairingDeps(s.io)),
+      },
+      {
+        name: "revoke",
+        summary: "drop one device by label: `devices revoke <label>`",
+        run: (args, s) => cmdDevicesRevoke(pairingDeps(s.io), args),
+      },
+      {
+        name: "set-expiry",
+        summary: "give a device a lifetime from now: `devices set-expiry <label> 30d`",
+        run: (args, s) => cmdDevicesSetExpiry(pairingDeps(s.io), args),
+      },
+      {
+        name: "clear-expiry",
+        summary: "remove a device's expiry: `devices clear-expiry <label>`",
+        run: (args, s) => cmdDevicesClearExpiry(pairingDeps(s.io), args),
+      },
+    ],
+    // Bare or misspelt lands here, and `cmdDevices` owns that message — as `cmdCrew` does.
+    run: (args, s) => cmdDevices(pairingDeps(s.io), args),
+  },
+  // ── Push subscriptions ─────────────────────────────────────────────────────
+  // Next to `devices` because it answers the same shape of question — who is registered with this
+  // bridge, and how do I drop one. `list` and `forget` need no VAPID: the store is a file.
+  {
+    name: "push",
+    summary: `subscribed devices: ${PUSH_SUBCOMMANDS.join(", ")}`,
+    subcommands: [
+      {
+        name: "list",
+        summary: "the subscribed devices, with when each subscribed and from what",
+        run: (_args, s) => cmdPushList(pushDeps(s.io)),
+      },
+      {
+        name: "forget",
+        summary: "drop rows by endpoint substring: `push forget <substring>|--all`",
+        run: (args, s) => cmdPushForget(pushDeps(s.io), args),
+      },
+      {
+        name: "keys",
+        summary: "generate the VAPID keypair into this install's .env (also spelled `push-keys`)",
+        run: (args, s) => cmdPushKeys(pushDeps(s.io), args),
+      },
+      {
+        name: "test",
+        summary: "send a one-off Web Push to every subscribed device (also spelled `push-test`)",
+        run: (args, s) => cmdPushTest(pushDeps(s.io), args),
+      },
+    ],
+    run: (args, s) => cmdPush(pushDeps(s.io), args),
+  },
+  // ── Speech-to-text (ADR 0029) ──────────────────────────────────────────────
+  // Declared beside `pair` and `push` because it is the third thing the operator's own terminal is
+  // the only right place for: `stt setup` writes a provider credential — or records a consent to
+  // impersonate — into the state dir, and the bridge picks it up per request with no restart.
+  {
+    name: "stt",
+    summary: `speech-to-text (off until you run it): ${STT_SUBCOMMANDS.join(", ")}`,
+    subcommands: [
+      {
+        name: "setup",
+        summary: "pick a provider and write it into the state dir (interactive, or all by flag)",
+        run: (args, s) => cmdSttSetup(sttDeps(s.io), args),
+      },
+      {
+        name: "whistle",
+        summary: "fetch the Whistle speech model (--host: use it on this host, --from, --remove)",
+        run: (args, s) => cmdSttWhistle(sttDeps(s.io), args),
+      },
+      {
+        name: "test",
+        summary: "one real round trip through what is configured",
+        run: (_args, s) => cmdSttTest(sttDeps(s.io)),
+      },
+      {
+        name: "status",
+        summary: "the provider, where each setting came from, and whether it is on",
+        run: (_args, s) => cmdSttStatus(sttDeps(s.io)),
+      },
+      {
+        name: "off",
+        summary: "remove stt.json — speech-to-text is absent again",
+        run: (_args, s) => cmdSttOff(sttDeps(s.io)),
+      },
+    ],
+    // Bare or misspelt lands here, and `cmdStt` owns that message — as `cmdDevices` does.
+    run: (args, s) => cmdStt(sttDeps(s.io), args),
+  },
+  // ── The config file (ADR 0040) ─────────────────────────────────────────────
+  // Declared beside `stt` because it is the same shape of verb: a tree the operator's own terminal
+  // drives, over a file in their own config dir, with no route and no Hangar plugin action.
+  {
+    name: "config",
+    summary: `the config file: ${CONFIG_SUBCOMMANDS.join(", ")}`,
+    subcommands: [
+      {
+        name: "show",
+        summary: "every setting, its effective value, and which layer it came from",
+        run: (args, s) => cmdConfigShow(configVerbDeps(s.io), args),
+      },
+      {
+        name: "check",
+        summary: "validate the two files that would be read, or one named file",
+        run: (args, s) => cmdConfigCheck(configVerbDeps(s.io), args),
+      },
+      {
+        name: "init",
+        summary: "write a commented file with every setting and its default (--instance, --print)",
+        run: (args, s) => cmdConfigInit(configVerbDeps(s.io), args),
+      },
+    ],
+    // Bare or misspelt lands here, and `cmdConfig` owns that message — as `cmdStt` does.
+    run: (args, s) => cmdConfig(configVerbDeps(s.io), args),
+  },
+  // ── Durable programs (M55, ADR 0104) ───────────────────────────────────────
+  // Declared beside `config` because it is the same shape of verb: a tree the operator's own
+  // terminal drives, over a file in their own config dir. `attach` and `detach` write
+  // `sources.json` and restart nothing unless `--restart` is given.
+  {
+    name: "durable",
+    summary: `durable agents this issance shows as sessions: ${DURABLE_SUBCOMMANDS.join(", ")}`,
+    subcommands: [
+      {
+        name: "attach",
+        summary: "add a durable agent: <name> --socket <path> | --url <url> --token-env <VAR> (--restart)",
+        run: (args, s) => cmdDurableAttach(durableVerbDeps(s.io), args),
+      },
+      {
+        name: "detach",
+        summary: "remove a durable agent by name (--restart)",
+        run: (args, s) => cmdDurableDetach(durableVerbDeps(s.io), args),
+      },
+      {
+        name: "list",
+        summary: "the attached durable agents and what the running bridge says of each",
+        run: (_args, s) => cmdDurableList(durableVerbDeps(s.io)),
+      },
+    ],
+    run: async (args, s) => await cmdDurable(durableVerbDeps(s.io), args),
+  },
+  // ── Walky talky (M62) ──────────────────────────────────────────────────────
+  // Messages between agent sessions, typed by an agent inside its pane or by the operator outside one.
+  // The verb talks to the running bridge over its local socket and changes nothing on disk itself.
+  // One spelling: `wt` was dropped before release, since Windows Terminal's binary is `wt.exe`.
+  {
+    name: "walky",
+    summary: `walky talky, messages between agent sessions: ${WALKY_SUBCOMMANDS.join(", ")}`,
+    subcommands: WALKY_TREE,
+    run: (args, s) => cmdWalky({ io: s.io }, args),
+  },
+  // ── The crew (M4/07, renamed in M24) ──────────────────────────────────────
+  // The only way a machine enters or leaves a crew. The verb is `crew`; `crew` is an alias onto the
+  // same tree, declared below it, and it prints one note on a terminal (ADR 0038).
+  // The two ALIASES. `crew join` and `crew leave` are the canonical spellings — every other crew
+  // verb is a `crew` sub-verb, and these two were the exception for no reason anyone could state.
+  // They stay because 1.0.0 documented them and scripts type them: same function, same seams, same
+  // exit codes, one name each. `cli/crew.test.ts` pins that the two spellings are one code path.
+  {
+    name: "join",
+    summary: "same as `crew join`",
+    run: async (args, s) => cmdJoin(await crewVerbDeps(s.io), args),
+  },
+  {
+    name: "leave",
+    summary: "same as `crew leave`",
+    run: async (_args, s) => cmdLeave(await crewVerbDeps(s.io)),
+  },
+  {
+    name: "crew",
+    summary: CREW_SUMMARY,
+    subcommands: CREW_TREE,
+    run: crewRun,
+  },
+  // The `crew` ALIAS. Every row is `CREW_TREE`'s own row with one line in front of it, the notice
+  // and nothing else, so the two spellings cannot drift apart, and `cli/crew.test.ts` pins that by
+  // identity for every sub-verb. `internal` keeps the alias out of the usage line while commander
+  // still dispatches it: a 1.6.0 script, a README recipe and muscle memory all type `issance pack`,
+  // and none of them is asked to change. The notice is TTY-gated, so only the person reading a
+  // terminal is told. ADR 0038 removes this entry in 2.0.0.
+  {
+    name: "pack",
+    summary: "same as `crew`",
+    internal: true,
+    subcommands: CREW_TREE.map(crewAliasRow),
+    run: withOldSpellingNotice(crewRun),
+  },
+  {
+    name: "promote",
+    summary: "make THIS machine the lead (run on the peer taking over; --force if the lead is gone)",
+    run: async (args, s) => cmdPromote(await crewVerbDeps(s.io), args),
+  },
+  {
+    name: "reconnect",
+    summary: "a member moved: re-point at its new address without re-enrolling anything",
+    run: async (args, s) => cmdReconnect(await crewVerbDeps(s.io), args),
+  },
+  // The manual, printed out of the binary rather than fetched or read off disk (`cli/docs-embed.ts`
+  // says why). Both verbs are read-only and neither draws a terminal view, so `--plain` is moot.
+  {
+    name: "skill",
+    summary:
+      "print the agent-facing brief on issance (also `issance --skill`), or install the walky talky skill into a harness: install, uninstall, sync, status, print",
+    subcommands: [
+      {
+        name: "install",
+        summary: "write the walky talky skill: `skill install <claude|codex|opencode|pi|gemini|all>`",
+        run: (args, s) => cmdSkillInstall(skillDeps(s.io), args),
+      },
+      {
+        name: "uninstall",
+        summary: "remove only the file or block issance wrote: `skill uninstall <harness|all>`",
+        run: (args, s) => cmdSkillUninstall(skillDeps(s.io), args),
+      },
+      {
+        name: "sync",
+        summary:
+          "bring every harness on this machine up to this build's skill, as `issance update` does after each update (`--dry-run`, `--json`)",
+        run: (args, s) => cmdSkillSync(skillDeps(s.io), args),
+      },
+      {
+        name: "status",
+        summary: "what each target carries now: installed, stale, absent or refused (`--check` answers with the exit code)",
+        run: (args, s) => cmdSkillStatus(skillDeps(s.io), args),
+      },
+      {
+        name: "print",
+        summary: "print the text an install writes: `skill print <harness|all|generic>`",
+        run: (args, s) => cmdSkillPrint(skillDeps(s.io), args),
+      },
+    ],
+    run(args, s) {
+      // A bare `issance skill` (and `issance --skill`) prints the general brief, as it always did. Flags
+      // are ignored as before; a word that is no sub-verb gets the usage block.
+      const word = args.find((a) => !a.startsWith("-"));
+      if (word !== undefined) return cmdSkillVerb(skillDeps(s.io), word, args.slice(args.indexOf(word) + 1));
+      const ctx = loadContext(s.io.err);
+      return cmdSkill(s.io, collieVersion(ctx.root));
+    },
+  },
+  {
+    name: "docs",
+    summary:
+      "print an operator page embedded in this binary (no argument lists them, `docs <name>` prints one, `--all` prints every one behind a marker)",
+    run: (args, s) => cmdDocs(s.io, args),
+  },
+  {
+    name: "help",
+    summary: "print this help",
+    run(_args, s) {
+      for (const line of helpText()) s.io.out(line);
+      return EXIT.OK;
+    },
+  },
+];
+
+export function findCommand(
+  name: string,
+  commands: readonly Command[] = COMMANDS,
+): Command | undefined {
+  return commands.find((c) => c.name === name);
+}
+
+/** The one-line usage, naming every non-internal verb. */
+export function usageLine(commands: readonly Command[] = COMMANDS): string {
+  const names = commands.filter((c) => c.internal !== true).map((c) => c.name);
+  return `usage: issance {${names.join("|")}}`;
+}
+
+/**
+ * The help body, as lines. Commander is told to print exactly this instead of its own layout
+ * (`configureHelp({ formatHelp })`), so `issance help`, `issance -h` and `issance --help` are one text
+ * with one exit code, and the shape a script may already be grepping does not move.
+ */
+export function helpText(commands: readonly Command[] = COMMANDS): string[] {
+  const lines = [usageLine(commands), ""];
+  for (const c of commands) {
+    if (c.internal === true) continue;
+    lines.push(`  ${c.name.padEnd(12)} ${c.summary}`);
+  }
+  lines.push("");
+  lines.push(`  ${"--plain".padEnd(12)} never draw the terminal view — print the lines a pipe would get`);
+  return lines;
+}
+
+/**
+ * The reflexes every operator has, spelled as the verbs they mean.
+ *
+ * `issance --version` used to print `error: unknown command \`--version\`` and the usage line — a verb
+ * table where `version` exists and `--version` is a typo is a distinction only the implementer cares
+ * about. `-V` is the long option's conventional short form; `-v` is left alone, because it is the one
+ * a future `--verbose` would want and a flag that changed meaning later is worse than one that never
+ * existed.
+ *
+ * `--skill` is the third of them, and it is here for the same reason: an agent reaching for the brief
+ * types the flag spelling as often as the verb, and the two must not answer differently.
+ *
+ * Only the FIRST argument is rewritten. `issance logs --version` is an argument to `logs`, exactly as
+ * every other flag reaching a verb is (`buildProgram` turns commander's own help off, and only
+ * `-h`/`--help` are caught, by `helpGuard`), and this must not start guessing at it.
+ */
+export function normalizeArgv(argv: readonly string[]): readonly string[] {
+  const first = argv[0];
+  if (first === "--version" || first === "-V") return ["version", ...argv.slice(1)];
+  if (first === "--skill") return ["skill", ...argv.slice(1)];
+  return argv;
+}
+
+/** Feed a commander write (one string, possibly multi-line, usually newline-terminated) to `Io`. */
+function emit(sink: (line: string) => void, chunk: string): void {
+  const lines = chunk.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  for (const line of lines) sink(line);
+}
+
+/**
+ * `issance <verb> --help` prints that verb's usage and runs nothing.
+ *
+ * Commander's help is off (every flag grammar lives in the verb), so `--help` and `-h` used to reach
+ * the verb body as ordinary arguments, and `issance update --help` began a real update (#392). The
+ * check sits here, in front of every verb and sub-verb body, so no verb can forget it and none has
+ * to know about it. `helpAsked` is decided in {@link run} from the RAW argv, because commander drops
+ * the literal `--` before an action sees its arguments, and only an argument before that `--` is a
+ * help request (see `asksForHelp`).
+ *
+ * No verb in the table forwards its arguments to another program, so none is exempt: `logs` reads
+ * its one optional argument as a line count, and the `tailscale` calls under `serve` carry fixed
+ * arguments of ours. A verb that ever passes the operator's arguments on to a child program must
+ * bypass this guard, because there `--help` belongs to that program.
+ */
+async function helpGuard(
+  session: Session,
+  helpAsked: boolean,
+  name: string,
+  summary: string,
+  internal: boolean,
+  args: readonly string[],
+  body: Command["run"],
+): Promise<number> {
+  if (!helpAsked) return body(args, session);
+  // A `_` verb is only ever spelled by another issance (`_apply-update` by `update`), never by
+  // a person. A `--help` there means a caller built a wrong argv, so it fails loudly: an update whose
+  // second half answered usage with exit 0 would report success with nothing swapped.
+  if (internal) {
+    session.io.err(`error: \`issance ${name}\` is internal and has no usage; nothing was run`);
+    return EXIT.USAGE;
+  }
+  session.io.out(`usage: issance ${name} [options]`);
+  session.io.out("");
+  session.io.out(`  ${summary}`);
+  return EXIT.OK;
+}
+
+/**
+ * Build the commander program for one invocation. The exit code is not commander's to decide, so
+ * every action stashes its verb's return value here and {@link run} reads it back out.
+ */
+function buildProgram(
+  session: Session,
+  commands: readonly Command[],
+  setCode: (code: number) => void,
+  helpAsked: boolean,
+): Program {
+  const program = new Program();
+  program
+    .name("issance")
+    // Nothing in this process may `process.exit()` — the binary's exit code is `run`'s return value,
+    // and a library that exits behind our back would take the 3/4/5 crew codes with it.
+    .exitOverride()
+    .configureOutput({
+      writeOut: (chunk) => emit(session.io.out, chunk),
+      writeErr: (chunk) => emit(session.io.err, chunk),
+      // Commander's own error prose never reaches the user: every usage error this CLI can produce
+      // is written by the code that knows what the operator was reaching for.
+      outputError: () => {},
+    })
+    // The root's help is this file's `helpText`; a subcommand keeps commander's own layout, which
+    // nothing has ever pinned.
+    .configureHelp({ formatHelp: (cmd) => (cmd === program ? `${helpText(commands).join("\n")}\n` : "") })
+    // An unrecognised verb is not commander's error to report — it falls through to the root action
+    // below, which names it in the words the shell dispatcher used.
+    .allowUnknownOption(true)
+    .allowExcessArguments(true)
+    .argument("[verb...]")
+    .action((verb: string[]) => {
+      const name = verb[0];
+      if (name !== undefined && name !== "") session.io.err(`error: unknown command \`${name}\``);
+      session.io.err(usageLine(commands));
+      setCode(EXIT.USAGE);
+    });
+
+  for (const c of commands) {
+    const leaf = program
+      .command(c.name, { hidden: c.internal === true })
+      .description(c.summary)
+      // Every verb still receives its argv verbatim: the flag grammars live in the verbs (and are
+      // pinned there, against fake deps), so commander forwards rather than re-parses. Commander's
+      // own help is off for the same reason, so `-h` and `--help` are caught by {@link helpGuard}
+      // below, before any verb body runs, and not by commander.
+      .allowUnknownOption(true)
+      .allowExcessArguments(true)
+      .helpOption(false)
+      .argument("[args...]");
+    if (c.subcommands === undefined) {
+      leaf.action(async (args: string[]) => setCode(await helpGuard(session, helpAsked, c.name, c.summary, c.name.startsWith("_"), args, c.run)));
+      continue;
+    }
+    // A parent with children: commander matches a child by name, and anything else — including
+    // nothing at all — reaches the parent's own action. That action is NOT behind the guard: it is
+    // already a usage printer (bare, misspelt or `--help`, it prints its subcommand block and exits
+    // 2, and `scripts/issance-cli.test.sh` pins that), so it changes nothing and has nothing to stop.
+    leaf.action(async (args: string[]) => setCode(await c.run(args, session)));
+    for (const sub of c.subcommands) {
+      leaf
+        .command(sub.name)
+        .description(sub.summary)
+        .allowUnknownOption(true)
+        .allowExcessArguments(true)
+        .helpOption(false)
+        .argument("[args...]")
+        .action(async (args: string[]) =>
+          setCode(await helpGuard(session, helpAsked, `${c.name} ${sub.name}`, sub.summary, c.name.startsWith("_"), args, sub.run)),
+        );
+    }
+  }
+  return program;
+}
+
+export async function run(
+  argv: readonly string[],
+  io: Io,
+  commands: readonly Command[] = COMMANDS,
+  isTTY = false,
+): Promise<number> {
+  const { plain, rest } = takePlainFlag(argv);
+  const rich = wantsRich(renderInputs(process.env, isTTY, plain));
+  let loaded: Ui | null = null;
+  const session: Session = {
+    io,
+    async ui() {
+      if (!rich) return null;
+      loaded ??= await loadUi();
+      return loaded;
+    },
+  };
+  let code: number = EXIT.OK;
+  const argvIn = normalizeArgv(rest);
+  // A leading `--` is commander's own "operands follow", so `issance -- update --help` is still a
+  // request for the usage of `update`; the scan starts after it.
+  const helpAsked = asksForHelp(argvIn[0] === "--" ? argvIn.slice(1) : argvIn);
+  const program = buildProgram(
+    session,
+    commands,
+    (c) => {
+      code = c;
+    },
+    helpAsked,
+  );
+  try {
+    await program.parseAsync(argvIn, { from: "user" });
+    return code;
+  } catch (err) {
+    if (err instanceof CommanderError) {
+      // Help is output, not a diagnostic: commander has already written it through `writeOut`.
+      if (err.code === "commander.helpDisplayed" || err.code === "commander.help") return EXIT.OK;
+      io.err(usageLine(commands));
+      return EXIT.USAGE;
+    }
+    io.err(`error: ${err instanceof Error ? err.message : String(err)}`);
+    return EXIT.FAIL;
+  }
+}

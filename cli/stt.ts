@@ -1,0 +1,993 @@
+import { join } from "node:path";
+
+import type { JsonValue } from "../bridge/json.ts";
+import {
+  coerceSttFile,
+  commandLookup,
+  DEFAULT_CODEX_BIN,
+  DEFAULT_STT_MODEL,
+  resolveSttSettings,
+  STT_ENV_KEYS,
+  STT_FILENAME,
+  STT_PROVIDERS,
+  sttEnvSettings,
+  writeSttSettingsFile,
+  type CodexSttSettings,
+  MAX_LOCAL_CLI_ARGS,
+  type SttProviderName,
+  type SttSettings,
+  type SttWireIdentity,
+} from "../bridge/stt/config.ts";
+import { CODEX_TRANSCRIBE_URL, silentWavBytes } from "../bridge/stt/codex.ts";
+import { codexConsentLines, probeCodexSetup } from "../bridge/stt/codex-setup.ts";
+import { silentMp4AacBytes, silentWebmOpusBytes } from "../bridge/stt/probe-clips.ts";
+import { createSttProvider } from "../bridge/stt/index.ts";
+import { jsonStringField } from "../bridge/stt/json.ts";
+import { commandFileProblem, LOCAL_CLI_TIMEOUT_MS, LocalCliEmptyTranscriptError } from "../bridge/stt/local-cli.ts";
+import { SttError, type SttAudio, type SttProvider, type SttResult } from "../bridge/stt/provider.ts";
+import type { CliContext } from "./context.ts";
+import { EXIT, type Io } from "./io.ts";
+import { parseCrewArgs } from "./crew.ts";
+import { cmdSttWhistle, modelStatus, type WhistleSeams } from "./stt-whistle.ts";
+import type { Exec, Files } from "./sys.ts";
+
+// `stt setup | test | status | off` — the operator's half of speech-to-text (ADR 0029).
+//
+// ── WHY THIS IS A CLI ACT AND NOT A SETTINGS PAGE ────────────────────────────
+// For the reason `issance pair` is one: this surface MINTS OR ACCEPTS A CREDENTIAL. `setup` writes a
+// provider key into the state dir, or — on the codex provider — records the operator's consent to put
+// somebody else's name on the wire. Neither decision can be authorised by a page loaded over the
+// front door; the shell on the host IS the proof, exactly as it is for enrolment (see the header of
+// `cli/pairing.ts`). There is no web setup form for a key or a command, and there is not going to be
+// one. Two narrow exceptions take no key and no command: Whistle (ADR 0096), and switching the host
+// to codex after the same consent, shown in full and accepted with a tap (ADR 0097). The consent's
+// words and the probe are shared with that switch (`bridge/stt/codex-setup.ts`), so they cannot drift.
+//
+// ── THE THREE THINGS THIS MODULE OWES THE BRIDGE ─────────────────────────────
+//  1. It writes `<stateDir>/stt.json`, and the bridge re-reads that file behind an mtime check
+//     (`bridge/stt/config.ts`). So every verb here says "no restart needed" and means it.
+//  2. It never re-implements the resolve. `setup` VALIDATES by calling the bridge's own
+//     `resolveSttSettings`, `test` loads through it, and `status` reports what it decided — one
+//     parser, so a config the CLI calls good can never be a config the bridge calls off.
+//  3. It never prints the API key. `status` shows at most the last four characters, and no verb here
+//     ever echoes a key back at a terminal that may be logged or shoulder-read.
+//
+// Reading a key without echo would need a raw-mode tty read this CLI has nowhere else, so `setup`
+// does not pretend to have one: the prompt says out loud where the value is about to land.
+
+/** The `stt` sub-verbs, in the order the usage block prints them. */
+export const STT_SUBCOMMANDS = ["setup", "whistle", "test", "status", "off"] as const;
+
+/** Flags `setup` takes with no value. Everything else is `--name value` / `--name=value`. */
+const BARE_FLAGS = ["accept-risk"] as const;
+
+export interface SttDeps {
+  ctx: CliContext;
+  io: Io;
+  files: Files;
+  /**
+   * Only ever asked `which(<codex binary>)` or `which(<local-cli command>)` — no verb here runs an
+   * external tool itself; `stt test` reaches one only through the provider.
+   */
+  exec: Exec;
+  /**
+   * Whether there is a terminal to ask at all.
+   *
+   * Asked BEFORE a question is printed, not deduced from a `null` answer afterwards: an unattended
+   * run must not have the lead-in copy of a question nobody can answer scrolling past in its log,
+   * and on the codex path it must not see the consent prompt at all.
+   */
+  interactive: boolean;
+  /**
+   * The free-text ask, behind a seam. `null` means "nobody is there to answer" — the same refusal
+   * {@link interactive} predicts, kept as the belt to that pair of braces.
+   */
+  prompt(question: string): string | null | Promise<string | null>;
+  /**
+   * The identity probe, injected so no test dials `chatgpt.com`. Production leaves it: it is
+   * `bridge/stt/codex.ts`'s `probeCodexIdentity`, which spends one honest request and at most one
+   * impersonating one.
+   */
+  probe?(settings: CodexSttSettings): Promise<SttWireIdentity>;
+  /** The provider builder, injected by `stt test`'s tests. Production leaves it. */
+  create?(settings: SttSettings): SttProvider;
+  /** Injected so a test can pin the reported round trip. */
+  now?(): number;
+  /**
+   * Why a local-cli command file cannot be run, or null when it can. Production leaves it: it is
+   * `bridge/stt/local-cli.ts`'s `commandFileProblem` (a regular file, executable, symlinks followed),
+   * the same check the bridge's own status runs.
+   */
+  commandProblem?(path: string): string | null;
+  /** `stt whistle`'s model store: a stand-in fetch and pin for the tests. Production leaves it. */
+  whistle?: WhistleSeams;
+  /**
+   * Draws a download's progress line, on a terminal only. Absent means "not a terminal", so a piped
+   * or logged run gets the start and the end and no carriage returns.
+   */
+  progress?(text: string): void;
+}
+
+const settingsPath = (deps: SttDeps): string => join(deps.ctx.stateDir, STT_FILENAME);
+
+/** The raw shape `bridge/stt/config.ts` reads a file (or the environment) into. */
+type RawSettings = ReturnType<typeof coerceSttFile>;
+
+/** `stt.json` as it is on disk. Absent, unreadable or malformed all read as "nothing in the file". */
+function readFileSettings(deps: SttDeps): RawSettings {
+  const raw = deps.files.read(settingsPath(deps));
+  if (raw === null) return coerceSttFile(undefined);
+  try {
+    // SAFETY: `JSON.parse` answers with a JSON value, and `coerceSttFile` is its only reader — every
+    // field it names is checked before it is believed.
+    return coerceSttFile(JSON.parse(raw) as JsonValue);
+  } catch {
+    return coerceSttFile(undefined);
+  }
+}
+
+/** The environment keys that are set right now, in the order {@link STT_ENV_KEYS} declares them. */
+function liveEnvKeys(ctx: CliContext): string[] {
+  return Object.values(STT_ENV_KEYS).filter((name) => (ctx.env[name] ?? "").trim() !== "");
+}
+
+// ── setup ────────────────────────────────────────────────────────────────────
+
+const SETUP_USAGE = [
+  "usage: issance stt setup [--provider openai-compatible|codex|local-cli]",
+  "                        [--url <base>] [--model <name>] [--key <api-key>]",
+  "                        [--lang <iso-639-1>]                                (openai-compatible)",
+  "                        [--codex-bin <path>] [--accept-risk]                (codex)",
+  "                        [--command <path>] [--args <list>]                  (local-cli)",
+];
+
+/**
+ * `issance stt setup` — pick a provider, prove it is usable, and write `<stateDir>/stt.json`.
+ *
+ * Interactive by default and fully scriptable by flag: every question below is skipped when the flag
+ * that answers it is present, which is what lets a provisioning run configure a host without a tty.
+ * A run that is neither — no flag, no terminal — REFUSES and writes nothing rather than guessing.
+ */
+export async function cmdSttSetup(deps: SttDeps, args: readonly string[]): Promise<number> {
+  const { flags, bare } = parseCrewArgs(args, BARE_FLAGS);
+
+  const provider = await chooseProvider(deps, flags.provider);
+  if (provider === null) return EXIT.FAIL;
+  let document: RawSettings | null;
+  if (provider === "codex") document = await setupCodex(deps, flags, bare.has("accept-risk"));
+  else if (provider === "local-cli") document = await setupLocalCli(deps, flags);
+  else document = await setupOpenAi(deps, flags);
+  if (document === null) return EXIT.FAIL;
+
+  // The bridge's own resolve is the acceptance test. Anything it would refuse at request time is
+  // refused HERE, while the operator is still standing at the terminal — a microphone button that
+  // only fails after somebody has spoken into it is the outcome this line exists to prevent. The
+  // environment is deliberately empty for this check: what is being validated is the FILE.
+  const warnings: string[] = [];
+  const resolved = resolveSttSettings(document, {}, (m) => warnings.push(m));
+  if (resolved === null) {
+    for (const line of warnings) deps.io.err(`error: ${line}`);
+    deps.io.err("Nothing was written.");
+    return EXIT.FAIL;
+  }
+  // The one field the resolve REWRITES rather than merely accepts: a base URL is canonicalised
+  // (trailing slashes stripped) so `<base>/audio/transcriptions` is one shape whatever was typed.
+  // Storing the canonical form keeps the file and `stt status` agreeing with the request that will
+  // actually be sent. Nothing else is copied back — a defaulted model must stay ABSENT in the file,
+  // or this install would be pinned to today's default forever.
+  if (resolved.provider === "openai-compatible") {
+    document.baseUrl = resolved.baseUrl;
+    // The second rewritten field, for the same reason: the resolve lower-cases a language and
+    // narrows a regional tag (`en-GB` → `en`), and a file saying one thing while the wire carries
+    // another is exactly what `stt status` exists to prevent.
+    if (resolved.language !== undefined) document.language = resolved.language;
+  }
+
+  // Written through a temporary name in the same directory and renamed into place: a `setup` that
+  // died mid-write must leave the previous configuration intact, never a half-file the bridge would
+  // then read as "the operator turned this off".
+  // `writeSttSettingsFile` is the one writer: 0600, through a temporary name renamed into place.
+  const path = settingsPath(deps);
+  try {
+    writeSttSettingsFile(deps.ctx.stateDir, document, deps.files);
+  } catch (err) {
+    deps.io.err(`error: could not write ${path} — ${err instanceof Error ? err.message : String(err)}`);
+    return EXIT.FAIL;
+  }
+
+  deps.io.out(`✓ speech-to-text configured — ${path} (owner-only)`);
+  deps.io.out("  Live immediately — no restart needed. The bridge re-reads this file per request.");
+  deps.io.out("  Check it end to end with `issance stt test`.");
+  reportEnvOverrides(deps);
+  return EXIT.OK;
+}
+
+/** The providers `setup` asks about. Whistle is not one: it has no question, see {@link chooseProvider}. */
+const SETUP_PROVIDERS = STT_PROVIDERS.filter((p): p is Exclude<SttProviderName, "whistle"> => p !== "whistle");
+
+/** Which provider, from the flag or from the operator. `null` when there is no usable answer. */
+async function chooseProvider(
+  deps: SttDeps,
+  flag: string | undefined,
+): Promise<Exclude<SttProviderName, "whistle"> | null> {
+  const named = flag ?? (await askProvider(deps));
+  if (named === null) return null;
+  // Whistle has nothing to ask and is set up by its own verb, which also fetches the model.
+  if (named === "whistle") {
+    deps.io.err("error: Whistle is set up with `issance stt whistle --host`, or from Settings → Speech. Nothing was written.");
+    return null;
+  }
+  const known = SETUP_PROVIDERS.find((p) => p === named);
+  if (known === undefined) {
+    deps.io.err(`error: unknown provider \`${named}\` — expected ${SETUP_PROVIDERS.join(" or ")}.`);
+    for (const line of SETUP_USAGE) deps.io.err(line);
+    return null;
+  }
+  return known;
+}
+
+async function askProvider(deps: SttDeps): Promise<string | null> {
+  if (!deps.interactive) {
+    deps.io.err("error: this run is not interactive, and it would have asked which provider to use.");
+    deps.io.err("       Pass it: `issance stt setup --provider openai-compatible|codex|local-cli`.");
+    return null;
+  }
+  deps.io.out("Which speech-to-text provider?");
+  deps.io.out("  openai-compatible  any endpoint that speaks POST /audio/transcriptions —");
+  deps.io.out("                     the public OpenAI API, or a local whisper.cpp / parakeet.cpp");
+  deps.io.out("                     server, which is the zero-egress choice and the one to prefer.");
+  deps.io.out("  codex              borrow your own `codex` sign-in. No new key, no new account —");
+  deps.io.out("                     and a private endpoint that may break without notice.");
+  deps.io.out("  local-cli          run a transcription command already on this machine, such as");
+  deps.io.out("                     whisper-cli or muesli-cli. Its stdout is the transcript.");
+  const answered = (await deps.prompt("provider [openai-compatible]: "))?.trim();
+  if (answered === undefined) {
+    deps.io.err("error: this run is not interactive, and it would have asked which provider to use.");
+    deps.io.err("       Pass it: `issance stt setup --provider openai-compatible|codex|local-cli`.");
+    return null;
+  }
+  return answered === "" ? "openai-compatible" : answered;
+}
+
+/** The `openai-compatible` document, or null when the operator gave nothing usable. */
+async function setupOpenAi(
+  deps: SttDeps,
+  flags: Readonly<Record<string, string>>,
+): Promise<RawSettings | null> {
+  const url = await ask(deps, flags.url, {
+    lead: [
+      "The API base, INCLUDING its version prefix — the provider appends /audio/transcriptions.",
+      "  local  http://127.0.0.1:8080/v1     (whisper.cpp / parakeet.cpp — nothing leaves the host)",
+      "  cloud  https://api.openai.com/v1    (room audio leaves this machine)",
+    ],
+    question: "base URL: ",
+    missing: "the endpoint — `issance stt setup --url <base>`",
+  });
+  if (url === null) return null;
+  if (url === "") {
+    deps.io.err("error: no endpoint given. Nothing was written.");
+    return null;
+  }
+
+  const model = await ask(deps, flags.model, {
+    lead: [`The model the endpoint understands. Empty takes issance's default, ${DEFAULT_STT_MODEL}.`],
+    question: `model [${DEFAULT_STT_MODEL}]: `,
+    missing: `the model — \`issance stt setup --model <name>\` (default ${DEFAULT_STT_MODEL})`,
+    optional: true,
+  });
+  if (model === null) return null;
+
+  const key = await ask(deps, flags.key, {
+    lead: [
+      "The API key, if the endpoint wants one. LEAVE IT EMPTY for a self-hosted endpoint that takes",
+      "no authentication — keyless is a supported mode, and issance then sends no Authorization header",
+      "at all rather than an empty one.",
+      `This terminal cannot read without echo, so what you type is visible here; it lands in ${STT_FILENAME}`,
+      "at mode 0600 and is never printed again.",
+    ],
+    question: "API key [none]: ",
+    missing: "the API key — `issance stt setup --key <api-key>` (omit it for a keyless endpoint)",
+    optional: true,
+  });
+  if (key === null) return null;
+
+  const language = await ask(deps, flags.lang, {
+    lead: [
+      "The language you speak, as a two-letter ISO-639-1 code — en, de, tr, ja.",
+      "LEAVE IT EMPTY to let the model detect it, which is what you want if you mix languages in one",
+      "sentence. Name one only if short clips keep coming back in a language you did not speak: a few",
+      "seconds of accented audio is too little for the model to detect from, and it guesses.",
+    ],
+    question: "spoken language [auto-detect]: ",
+    missing: "the spoken language — `issance stt setup --lang <iso-639-1>` (omit it for auto-detect)",
+    optional: true,
+  });
+  if (language === null) return null;
+
+  const document: RawSettings = { provider: "openai-compatible", baseUrl: url };
+  if (model !== "") document.model = model;
+  // Same rule as the key: absent means auto-detect, so an empty answer must leave the field OUT
+  // rather than write `""` — a present-and-empty value is a language the resolve would refuse.
+  if (language !== "") document.language = language;
+  // Assigned, never present-and-empty: "no credential" must be the ABSENCE of the field, or the
+  // provider would send `Bearer ` at an endpoint that asked for nothing.
+  if (key !== "") document.apiKey = key;
+  return document;
+}
+
+/** One question: the flag if it is there, the terminal if it is not, `null` when neither can answer. */
+async function ask(
+  deps: SttDeps,
+  flag: string | undefined,
+  copy: { lead: string[]; question: string; missing: string; optional?: boolean },
+): Promise<string | null> {
+  if (flag !== undefined) return flag.trim();
+  // An optional question nobody can answer takes its default in silence. A required one is a
+  // refusal, and it names the flag that would have answered it.
+  const answered = deps.interactive ? await askAt(deps, copy) : null;
+  if (answered !== null) return answered.trim();
+  if (copy.optional === true) return "";
+  deps.io.err(`error: this run is not interactive, and it would have asked for ${copy.missing}.`);
+  deps.io.err("       Nothing was written.");
+  return null;
+}
+
+async function askAt(
+  deps: SttDeps,
+  copy: { lead: string[]; question: string },
+): Promise<string | null> {
+  for (const line of copy.lead) deps.io.out(line);
+  return await deps.prompt(copy.question);
+}
+
+// ── setup: the codex provider ────────────────────────────────────────────────
+
+/**
+ * The paragraph that is the whole difference between this provider and the one ADR 0029 records as
+ * declined. It is printed BEFORE anything is spawned, dialled or written, and the run stops here
+ * unless the operator says the word.
+ */
+function consentParagraph(deps: SttDeps, codexPath: string): void {
+  deps.io.out("");
+  deps.io.out("── Read this before you accept ──────────────────────────────────────────────");
+  // The words are bridge/stt/codex-setup.ts's, the same ones Settings shows before its "I accept".
+  codexConsentLines(codexPath).forEach((paragraph, index) => {
+    if (index > 0) deps.io.out("");
+    for (const line of paragraph) deps.io.out(`  ${line}`);
+  });
+  deps.io.out("─────────────────────────────────────────────────────────────────────────────");
+}
+
+/** The `codex` document, or null when the binary is missing, consent is absent, or the probe failed. */
+async function setupCodex(
+  deps: SttDeps,
+  flags: Readonly<Record<string, string>>,
+  acceptedByFlag: boolean,
+): Promise<RawSettings | null> {
+  const codexBin = locateCodex(deps, flags["codex-bin"]);
+  if (codexBin === null) return null;
+
+  consentParagraph(deps, codexBin);
+  if (!(await accepted(deps, acceptedByFlag))) return null;
+
+  deps.io.out("");
+  deps.io.out("Probing the endpoint — honest identity first…");
+  let identity: SttWireIdentity;
+  let document: RawSettings;
+  try {
+    // The same probe, and the same document, as the Settings switch (bridge/stt/host-http.ts).
+    ({ identity, document } = await probeCodexSetup(codexBin, deps.probe));
+  } catch (err) {
+    // Including the sign-in failures `bridge/stt/codex-auth.ts` re-throws by name: "Codex is not
+    // signed in — run `codex login`" is a different sentence from "both identities were refused",
+    // and it must reach the operator as itself.
+    deps.io.err(`error: ${err instanceof Error ? err.message : String(err)}`);
+    deps.io.err("Nothing was written — the identity is only recorded once the endpoint has accepted it.");
+    return null;
+  }
+
+  if (identity === "codex-cli") {
+    deps.io.out("");
+    deps.io.out("  ⚠ THE HONEST IDENTITY WAS REFUSED. The endpoint accepted issance only while it wore");
+    deps.io.out("    the Codex CLI's own headers (`originator: codex_cli_rs`). issance will impersonate");
+    deps.io.out("    the Codex CLI on every transcription from now on. That is what you just accepted,");
+    deps.io.out("    it is recorded as `wireIdentity: \"codex-cli\"`, and `issance stt off` ends it.");
+  } else {
+    deps.io.out("  ✓ The endpoint accepted issance under its own name. No impersonation is configured;");
+    deps.io.out("    the recorded identity is `honest`, and no `originator` header is ever sent.");
+  }
+  return document;
+}
+
+/**
+ * The `codex` binary, as an absolute path.
+ *
+ * Resolved here rather than left as the bare default, and written into the config as what was found:
+ * the bridge spawns it from a systemd user unit whose PATH is minimal, so a bare name that resolves
+ * in the operator's login shell may resolve nowhere at all in the service (the lesson `cli/tools.ts`
+ * exists for). A value the operator spelled with a slash is theirs and is only checked for existence.
+ */
+function locateCodex(deps: SttDeps, flag: string | undefined): string | null {
+  const named = flag?.trim();
+  if (named !== undefined && named !== "") {
+    if (named.includes("/")) {
+      if (deps.files.exists(named)) return named;
+      deps.io.err(`error: no such file: ${named} (--codex-bin)`);
+      return null;
+    }
+    const found = deps.exec.which(named);
+    if (found !== null) return found;
+    deps.io.err(`error: \`${named}\` was not found on PATH (--codex-bin).`);
+    return null;
+  }
+  const found = deps.exec.which(DEFAULT_CODEX_BIN);
+  if (found !== null) return found;
+  deps.io.err(`error: no \`${DEFAULT_CODEX_BIN}\` binary was found on PATH.`);
+  deps.io.err("       The codex provider borrows that binary's sign-in; install it, or pass");
+  deps.io.err("       `--codex-bin <path>`, or use `--provider openai-compatible`.");
+  return null;
+}
+
+/** Consent: the flag, or the word `yes` typed at a terminal. Nothing else counts. */
+async function accepted(deps: SttDeps, byFlag: boolean): Promise<boolean> {
+  if (byFlag) {
+    deps.io.out("  --accept-risk was passed: the risks above are accepted for this run.");
+    return true;
+  }
+  const answered = deps.interactive
+    ? await deps.prompt('Type "yes" to accept these risks, anything else to stop: ')
+    : null;
+  if (answered === null) {
+    deps.io.err("error: this run is not interactive, so the risks above cannot be accepted at a prompt.");
+    deps.io.err("       Pass `--accept-risk` to accept them in a script. Nothing was written.");
+    return false;
+  }
+  if (answered.trim().toLowerCase() !== "yes") {
+    deps.io.err("Stopped — the risks were not accepted. Nothing was written, and nothing ran.");
+    return false;
+  }
+  return true;
+}
+
+// ── setup: the local-cli provider ────────────────────────────────────────────
+
+/** The `local-cli` document, or null when the command is missing or the arguments do not parse. */
+async function setupLocalCli(
+  deps: SttDeps,
+  flags: Readonly<Record<string, string>>,
+): Promise<RawSettings | null> {
+  const named = await ask(deps, flags.command, {
+    lead: [
+      "The transcription command. issance runs it once per recording, with the recording's path as",
+      "its LAST argument, and reads the transcript from its stdout. An absolute path, or a name on PATH.",
+    ],
+    question: "command: ",
+    missing: "the command — `issance stt setup --command <path>`",
+  });
+  if (named === null) return null;
+  if (named === "") {
+    deps.io.err("error: no command given. Nothing was written.");
+    return null;
+  }
+  const command = locateCommand(deps, named);
+  if (command === null) return null;
+
+  const rawArgs = await ask(deps, flags.args, {
+    lead: [
+      "The arguments that go BEFORE the recording's path, separated by spaces — for example",
+      "`transcribe` or `-m /models/ggml-base.bin -nt`. No shell reads them, so quotes are literal; an",
+      'argument with a space in it needs the JSON form instead: ["-m", "/my models/base.bin"].',
+    ],
+    question: "arguments [none]: ",
+    missing: "the arguments — `issance stt setup --args <list>` (omit it for none)",
+    optional: true,
+  });
+  if (rawArgs === null) return null;
+  const args = parseArgList(rawArgs);
+  if (args === null) {
+    deps.io.err("error: --args is not a list of strings. Use words separated by spaces, or a JSON");
+    deps.io.err('       array of strings such as ["transcribe", "--lang", "en"]. Nothing was written.');
+    return null;
+  }
+
+  deps.io.out("");
+  deps.io.out("  issance will run this as the bridge's own user, once per dictation:");
+  deps.io.out(`    ${[command, ...args].join(" ")} <recording>`);
+  deps.io.out(`  No shell is involved. A run longer than ${LOCAL_CLI_TIMEOUT_MS / 1000} s is killed, and stderr is never shown.`);
+  const document: RawSettings = { provider: "local-cli", command };
+  // Absent rather than `[]`, the same rule as every other optional field in this file.
+  if (args.length > 0) document.args = args;
+  return document;
+}
+
+/**
+ * The command, as an absolute path — the same reasoning as {@link locateCodex}: the bridge runs
+ * under a systemd user unit whose PATH is minimal, so a bare name is resolved HERE, in the
+ * operator's shell, and the path that was found is what gets written.
+ */
+function locateCommand(deps: SttDeps, named: string): string | null {
+  const lookup = commandLookup(named);
+  if (lookup === "relative") {
+    deps.io.err(`error: \`${named}\` is a relative path. Give an absolute path, or a name on PATH (--command).`);
+    return null;
+  }
+  let found: string;
+  if (lookup === "absolute") {
+    if (!deps.files.exists(named)) {
+      deps.io.err(`error: no such file: ${named} (--command)`);
+      return null;
+    }
+    found = named;
+  } else {
+    const hit = deps.exec.which(named);
+    if (hit === null) {
+      deps.io.err(`error: \`${named}\` was not found on PATH (--command).`);
+      return null;
+    }
+    found = hit;
+  }
+  // The bridge's status runs the same check, so a command written here is one it calls runnable.
+  const problem = (deps.commandProblem ?? commandFileProblem)(found);
+  if (problem === null) return found;
+  deps.io.err(`error: ${found} ${problem} (--command). Nothing was written.`);
+  return null;
+}
+
+/**
+ * The file the bridge will run for this command, as this shell sees it: the path itself, or the PATH
+ * hit for a bare name. The service's PATH may differ from this shell's, which is why setup writes the
+ * absolute path it found.
+ */
+function commandProblemOnHost(deps: SttDeps, command: string): string | null {
+  const path = commandLookup(command) === "absolute" ? command : deps.exec.which(command);
+  if (path === null) return "was not found on this shell's PATH";
+  const problem = (deps.commandProblem ?? commandFileProblem)(path);
+  return problem === null ? null : `${path} ${problem}`;
+}
+
+/**
+ * The `--args` value as a list: a JSON array of strings when it opens with `[`, else words split on
+ * whitespace. `null` when it is neither, or longer than the bridge will accept.
+ */
+export function parseArgList(raw: string): string[] | null {
+  const text = raw.trim();
+  if (text === "") return [];
+  let list: string[];
+  if (text.startsWith("[")) {
+    let parsed: JsonValue;
+    try {
+      // SAFETY: `JSON.parse` answers with a JSON value; every element is checked below before use.
+      parsed = JSON.parse(text) as JsonValue;
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(parsed)) return null;
+    list = [];
+    for (const item of parsed) {
+      const word = jsonStringField(item);
+      if (word === null) return null;
+      list.push(word);
+    }
+  } else {
+    list = text.split(/\s+/);
+  }
+  return list.length > MAX_LOCAL_CLI_ARGS ? null : list;
+}
+
+// ── test ─────────────────────────────────────────────────────────────────────
+
+/**
+ * The three clips `stt test` sends, in the order it sends them.
+ *
+ * WAV first, because it is the setup probe and the one container every service demuxes: if it fails,
+ * nothing else about the configuration is worth reading. Then the two containers the PHONE actually
+ * records (`web/src/lib/stt.ts` → `RECORDING_MIME_TYPES`), which is the whole point of the list. A
+ * provider can accept WAV and refuse both of those, and until #148 that was only ever discovered by
+ * a real dictation failing on the phone.
+ *
+ * The extensions are the ones `bridge/stt/http.ts` derives from the same content types, so the
+ * provider sees exactly what a recording from the route would have given it.
+ */
+const STT_PROBE_CLIPS = [
+  {
+    mimeType: "audio/wav",
+    filename: "issance-stt-test.wav",
+    audience: "the setup probe",
+    bytes: silentWavBytes,
+  },
+  {
+    mimeType: "audio/webm;codecs=opus",
+    filename: "issance-stt-test.webm",
+    audience: "Chrome, Android, Firefox",
+    bytes: silentWebmOpusBytes,
+  },
+  {
+    mimeType: "audio/mp4",
+    filename: "issance-stt-test.mp4",
+    audience: "Safari, iOS",
+    bytes: silentMp4AacBytes,
+  },
+] as const;
+
+/**
+ * The one clip `stt test` sends to a provider that takes `wav-16k` only (the built-in Whistle host).
+ *
+ * Phones convert every recording to 16 kHz mono WAV before they upload it to such a provider, so the
+ * 8 kHz setup probe and the webm and mp4 clips are all things the provider would refuse and no phone
+ * would ever send. Testing it with them reports a failure that does not exist.
+ */
+const STT_WAV_16K_CLIP: SttProbeClip = {
+  mimeType: "audio/wav",
+  detail: ", 16 kHz",
+  filename: "issance-stt-test.wav",
+  audience: "what phones send to a Whistle host",
+  bytes: () => silentWavBytes(200, 16_000),
+};
+
+interface SttProbeClip {
+  mimeType: string;
+  /** Extra words after the content type in the printed label. */
+  detail?: string;
+  filename: string;
+  audience: string;
+  bytes: () => Uint8Array<ArrayBuffer>;
+}
+
+/** The clips to send to one provider, and the line that explains a shortened list (or `null`). */
+interface SttProbePlan {
+  clips: readonly SttProbeClip[];
+  note: string | null;
+}
+
+function probeClipsFor(provider: SttProvider): SttProbePlan {
+  if (provider.input === "wav-16k") {
+    return {
+      clips: [STT_WAV_16K_CLIP],
+      note: "note:     webm and mp4 are skipped, because phones convert recordings to 16 kHz WAV for this provider.",
+    };
+  }
+  return { clips: STT_PROBE_CLIPS, note: null };
+}
+
+/**
+ * `issance stt test` — one real round trip per container the phone can produce.
+ *
+ * Each clip is a fifth of a second of generated digital silence. A silent clip legitimately
+ * transcribes to nothing, so an EMPTY answer is a PASS: what this verb proves is that the
+ * credential, the endpoint and the response shape all work, not that anything was heard. That is
+ * said in the output, because a bare empty line reads like a failure.
+ *
+ * It sends three clips rather than one because the container is part of what a provider accepts.
+ * The browser never sends WAV, so a run that only probed WAV could pass on a provider every
+ * recording from the phone would be refused by (#148).
+ */
+export async function cmdSttTest(deps: SttDeps): Promise<number> {
+  const settings = loadSettings(deps);
+  if (settings === null) return EXIT.FAIL;
+
+  const provider = deps.create?.(settings) ?? createSttProvider(settings, { stateDir: deps.ctx.stateDir });
+  const clock = deps.now ?? Date.now;
+  deps.io.out(`provider: ${describeProvider(settings)}`);
+
+  const refused: string[] = [];
+  let wavPassed = false;
+  const { clips, note } = probeClipsFor(provider);
+  if (note !== null) deps.io.out(note);
+  try {
+    for (const clip of clips) {
+      const label = `sending:  0.2 s of generated silence as ${clip.mimeType}${clip.detail ?? ""} (${clip.audience}) …`;
+      const started = clock();
+      try {
+        const result = await transcribeProbe(provider, {
+          audio: clip.bytes(),
+          mimeType: clip.mimeType,
+          filename: clip.filename,
+        });
+        deps.io.out(`${label} ✓ ${clock() - started} ms`);
+        // Once, after the first clip. The transcript is the same empty string on all three, and
+        // repeating the explanation three times would bury the one line that differs per clip.
+        if (clip.mimeType === "audio/wav") {
+          wavPassed = true;
+          deps.io.out(
+            result.text.trim() === ""
+              ? "  transcript: (empty) — expected from silence, and the empty answer still proves the pipeline."
+              : `  transcript: ${result.text}`,
+          );
+        }
+      } catch (err) {
+        refused.push(clip.mimeType);
+        // The kind the bridge would report, then the sentence it carries. A caught value is not a
+        // parsed input, so it is narrowed here rather than handed to a helper that would have to
+        // take `unknown`.
+        let reason = err instanceof Error ? err.message : String(err);
+        if (err instanceof SttError) reason = `${err.kind}: ${err.message}`;
+        deps.io.out(`${label} ✗ ${reason}`);
+      }
+    }
+  } finally {
+    // The codex provider owns a `codex app-server` child. A test run that left one behind would be a
+    // process leak the operator never asked for.
+    provider.close?.();
+  }
+
+  if (refused.length === 0) return EXIT.OK;
+  deps.io.err(`error: the provider refused ${refused.length} of ${clips.length} ${clips.length === 1 ? "clip" : "clips"}.`);
+  if (wavPassed) sayContainerRefusal(deps, refused);
+  return EXIT.FAIL;
+}
+
+/**
+ * One probe clip through the provider. A `local-cli` command that printed nothing is refused on the
+ * route, but here the clip IS silence, so its empty answer is the same pass it is everywhere else.
+ */
+async function transcribeProbe(provider: SttProvider, clip: SttAudio): Promise<SttResult> {
+  try {
+    return await provider.transcribe(clip);
+  } catch (err) {
+    if (err instanceof LocalCliEmptyTranscriptError) return { text: "" };
+    throw err;
+  }
+}
+
+/**
+ * The paragraph for the failure this verb exists to catch: WAV works, the phone's container does not.
+ *
+ * It is spelled out rather than left as "1 of 3 clips failed" because the consequence is invisible
+ * from the host. Everything on this machine will keep working, and every dictation from the affected
+ * browser will fail with "refused" (#148).
+ */
+function sayContainerRefusal(deps: SttDeps, refused: string[]): void {
+  deps.io.err("");
+  deps.io.err(`       Your provider takes audio/wav, but not ${refused.join(" or ")}.`);
+  deps.io.err("       The phone never records wav. It records one of the containers above, so every");
+  deps.io.err('       dictation from those browsers will fail with "refused" on the phone.');
+  deps.io.err("       Point the same key at a model that takes all three, for example");
+  deps.io.err("       `openai/whisper-large-v3-turbo`, or read");
+  deps.io.err('       docs/voice-and-push.md → "Container support is provider-specific".');
+}
+
+/** The settings the BRIDGE would run with: the file, then the environment on top. */
+function loadSettings(deps: SttDeps): SttSettings | null {
+  const warnings: string[] = [];
+  const settings = resolveSttSettings(
+    readFileSettings(deps),
+    sttEnvSettings(deps.ctx.env),
+    (m) => warnings.push(m),
+  );
+  if (settings !== null) return settings;
+  for (const line of warnings) deps.io.err(`error: ${line}`);
+  if (warnings.length === 0) {
+    deps.io.err("error: speech-to-text is off — nothing is configured on this machine.");
+    deps.io.err("       Run `issance stt setup`.");
+  }
+  return null;
+}
+
+/** One line naming the provider and the thing it will actually talk to. Never the credential. */
+function describeProvider(settings: SttSettings): string {
+  if (settings.provider === "codex") {
+    return `codex (${settings.codexBin}, identity ${settings.wireIdentity})`;
+  }
+  if (settings.provider === "local-cli") {
+    return `local-cli (${settings.command}, ${settings.args.length} argument(s) before the recording)`;
+  }
+  if (settings.provider === "whistle") return "whistle (issance's own engine, the model in the state dir)";
+  const language = settings.language === undefined ? "auto-detect" : settings.language;
+  return `openai-compatible (${settings.baseUrl}, model ${settings.model}, language ${language})`;
+}
+
+// ── status ───────────────────────────────────────────────────────────────────
+
+/**
+ * `issance stt status` — what is configured, and where each part of it came from.
+ *
+ * Every row carries its source, because the two-source resolve is the thing that surprises: an
+ * environment variable silently outranks the file `stt setup` wrote, and an operator staring at a
+ * correct `stt.json` needs to be told that in one line rather than deduce it.
+ */
+export async function cmdSttStatus(deps: SttDeps): Promise<number> {
+  const file = readFileSettings(deps);
+  const env = sttEnvSettings(deps.ctx.env);
+  const warnings: string[] = [];
+  const settings = resolveSttSettings(file, env, (m) => warnings.push(m));
+  const path = settingsPath(deps);
+
+  // Where one field's value came from, in the same precedence the bridge resolves in.
+  const source = (name: keyof RawSettings, fallback = "default"): string => {
+    const envName = envKeyOf(name);
+    if (envName !== null && env[name] !== undefined) return STT_ENV_KEYS[envName];
+    if (file[name] !== undefined) return STT_FILENAME;
+    return fallback;
+  };
+  const row = (label: string, value: string, from: string): void =>
+    deps.io.out(`  ${label.padEnd(9)} ${value.padEnd(34)} (${from})`);
+
+  if (settings === null) {
+    if (warnings.length === 0) {
+      deps.io.out("speech-to-text: off — nothing configured. Run `issance stt setup` to turn it on.");
+      // A file that names no provider (a bare change stamp, written when a paired device turned speech
+      // Off) is there, so "absent" would be wrong.
+      deps.io.out(`  config    ${path} (${deps.files.exists(path) ? "no provider" : "absent"})`);
+      await heldModelRow(deps);
+      return EXIT.OK;
+    }
+    // Present but unusable is a real problem, not an "off": something was configured and it is being
+    // ignored, so this exits non-zero even though the verb only reads.
+    deps.io.out("speech-to-text: off — the configuration on this machine cannot be used.");
+    for (const line of warnings) deps.io.err(`  ${line}`);
+    deps.io.out(`  config    ${path}`);
+    await heldModelRow(deps);
+    return EXIT.FAIL;
+  }
+
+  deps.io.out("speech-to-text: on");
+  row("provider", settings.provider, source("provider"));
+  if (settings.provider === "codex") {
+    row("binary", settings.codexBin, source("codexBin", "default"));
+    row("endpoint", CODEX_TRANSCRIBE_URL, "fixed");
+    row("identity", identityLabel(settings.wireIdentity), source("wireIdentity", "default"));
+    // Named only when it is set, and named as IGNORED. The codex endpoint takes one part, `file`,
+    // and no language; an operator who switched providers with the field still in place would
+    // otherwise be left believing it applies.
+    if (file.language !== undefined || env.language !== undefined) {
+      row("language", "ignored — this endpoint takes no language", source("language"));
+    }
+  } else if (settings.provider === "local-cli") {
+    row("command", settings.command, source("command"));
+    row(
+      "args",
+      settings.args.length === 0 ? "none — the recording's path alone" : JSON.stringify(settings.args),
+      settings.args.length === 0 ? "default" : source("args"),
+    );
+    row("runs", `as this user, no shell, killed after ${LOCAL_CLI_TIMEOUT_MS / 1000} s`, "fixed");
+    if (file.language !== undefined || env.language !== undefined) {
+      row("language", "ignored — pass it in args if the command takes one", source("language"));
+    }
+    // The host-side reason the phone never gets: the bridge's status only says "cannot be run".
+    const problem = commandProblemOnHost(deps, settings.command);
+    if (problem !== null) {
+      deps.io.out(`  config    ${path}`);
+      deps.io.err(`error: the command cannot be run: ${problem}.`);
+      deps.io.err("       The phone shows the microphone as unavailable until it can.");
+      deps.io.err("       Fix the file, or run `issance stt setup --provider local-cli` again.");
+      return EXIT.FAIL;
+    }
+  } else if (settings.provider === "whistle") {
+    row("engine", "issance's own, in a child of this binary", "fixed");
+    row("model", (await modelStatus(deps)).line, "state dir");
+  } else {
+    row("endpoint", settings.baseUrl, source("baseUrl"));
+    row("model", settings.model, source("model", "default"));
+    row("api key", keyLabel(settings.apiKey), settings.apiKey === undefined ? "none" : source("apiKey"));
+    row(
+      "language",
+      settings.language ?? "auto-detect — the model decides",
+      settings.language === undefined ? "default" : source("language"),
+    );
+  }
+  deps.io.out(`  config    ${path}${deps.files.exists(path) ? "" : " (absent)"}`);
+  if (settings.provider !== "whistle") await heldModelRow(deps);
+  return EXIT.OK;
+}
+
+/**
+ * The Whistle model's row when a model, or the start of one, is on this host while Whistle is not the
+ * host engine: phones can still use it, and `issance stt whistle --remove` is how it goes. Silent when
+ * there is none, so a host that never heard of Whistle reads exactly as before.
+ */
+async function heldModelRow(deps: SttDeps): Promise<void> {
+  const model = await modelStatus(deps);
+  if (model.present) deps.io.out(`  whistle   ${model.line} (the model only; not this host's engine)`);
+}
+
+/**
+ * The env key that carries one raw field, or null for a field with no environment spelling (`args`,
+ * a list). One switch, so a renamed field cannot silently mis-report.
+ */
+function envKeyOf(name: keyof RawSettings): keyof typeof STT_ENV_KEYS | null {
+  if (name === "baseUrl") return "url";
+  if (name === "apiKey") return "key";
+  if (name === "args") return null;
+  return name;
+}
+
+/** The identity, in the plainest words available. `codex-cli` is never softened. */
+function identityLabel(identity: SttWireIdentity): string {
+  return identity === "codex-cli"
+    ? "codex-cli — impersonating the Codex CLI (accepted at setup)"
+    : "honest — issance names itself on the wire";
+}
+
+/** Enough to recognise a key by, and no more. Never the key. */
+function keyLabel(apiKey: string | undefined): string {
+  if (apiKey === undefined) return "none — the endpoint is dialled without one";
+  return apiKey.length <= 4 ? "set" : `set (…${apiKey.slice(-4)})`;
+}
+
+// ── off ──────────────────────────────────────────────────────────────────────
+
+/**
+ * `issance stt off` — remove `stt.json`, and only `stt.json`.
+ *
+ * Not "clear the state dir": the pairing registry, the trust store and the push subscriptions all
+ * live beside this file and none of them are this verb's business. A second `off` is a clean no-op,
+ * so it is safe in a provisioning script that does not know the current state.
+ */
+export function cmdSttOff(deps: SttDeps): number {
+  const path = settingsPath(deps);
+  const existed = deps.files.exists(path);
+  const named = readFileSettings(deps).provider;
+  const wasWhistle = named === "whistle";
+  try {
+    deps.files.remove(path);
+  } catch (err) {
+    deps.io.err(`error: could not remove ${path} — ${err instanceof Error ? err.message : String(err)}`);
+    return EXIT.FAIL;
+  }
+  // A file with no provider (a bare change stamp from a paired device) is removed, but it was not
+  // switching anything on, so "off from the next request" would be a claim about a change that is not one.
+  if (!existed) deps.io.out(`speech-to-text was already off — no ${path} to remove.`);
+  else if (named === undefined) deps.io.out(`speech-to-text was already off — removed ${path}, which named no provider.`);
+  else deps.io.out(`✓ removed ${path} — speech-to-text is off from the next request (no restart needed).`);
+  if (wasWhistle) {
+    deps.io.out(`  The Whistle model stays in ${join(deps.ctx.stateDir, "whistle")}, so phones can still use it.`);
+    deps.io.out("  To delete it, run `issance stt whistle --remove`.");
+  }
+  reportEnvOverrides(deps, "off");
+  return EXIT.OK;
+}
+
+/**
+ * Name the environment variables that outrank the file, whenever one is set.
+ *
+ * After `setup` it is the difference between "I configured it" and "I configured it and something
+ * else is winning"; after `off` it is the difference between off and still-on. Names only — the
+ * values may include a credential.
+ */
+function reportEnvOverrides(deps: SttDeps, verb: "setup" | "off" = "setup"): void {
+  const live = liveEnvKeys(deps.ctx);
+  if (live.length === 0) return;
+  deps.io.out(
+    verb === "off"
+      ? `  ⚠ but the environment still configures it, and the environment wins: ${live.join(", ")}.`
+      : `  ⚠ the environment overrides part of this, field by field: ${live.join(", ")}.`,
+  );
+  deps.io.out("    Unset them (or edit this install's .env) — `issance stt status` shows what won.");
+}
+
+// ── the parent verb ──────────────────────────────────────────────────────────
+
+export function sttUsage(): string {
+  return `usage: issance stt {${STT_SUBCOMMANDS.join("|")}}`;
+}
+
+/**
+ * Reached only when no sub-verb matched — a bare `issance stt`, or a misspelt one — and it names each
+ * sub-verb with its summary, as `cmdDevices` and `cmdCrew` do.
+ */
+export async function cmdStt(deps: SttDeps, args: readonly string[]): Promise<number> {
+  const [sub, ...rest] = args;
+  switch (sub) {
+    case "setup":
+      return await cmdSttSetup(deps, rest);
+    case "whistle":
+      return await cmdSttWhistle(deps, rest);
+    case "test":
+      return await cmdSttTest(deps);
+    case "status":
+      return await cmdSttStatus(deps);
+    case "off":
+      return cmdSttOff(deps);
+    default:
+      if (sub !== undefined && sub !== "" && sub !== "help") {
+        deps.io.err(`error: unknown stt subcommand \`${sub}\``);
+      }
+      deps.io.err(sttUsage());
+      deps.io.err("  setup    pick a provider and write it into the state dir (interactive or by flag)");
+      deps.io.err("  whistle  fetch Whistle's model, so phones can use it; --host makes it this host's engine");
+      deps.io.err("  test     one real round trip through what is configured");
+      deps.io.err("  status   the provider, where each setting came from, and whether it is on");
+      deps.io.err("  off      remove stt.json — speech-to-text is absent again");
+      return EXIT.USAGE;
+  }
+}

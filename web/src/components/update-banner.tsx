@@ -1,0 +1,152 @@
+import { useState } from "react";
+import { Check, Copy } from "lucide-react";
+
+import { useLocale } from "@/hooks/use-locale";
+import { t } from "@/lib/i18n";
+import { cn } from "@/lib/utils";
+import type { UpdateInfo } from "@/lib/types";
+import { useOptionalRootData } from "@/lib/route-data";
+
+// The footer "update available" chip, sitting next to the build stamp. It reads the snapshot's
+// optional `update` field (surfaced on the root loader data) and, when there's something to do,
+// names it with the one command that fixes it. Everything renders as plain React text nodes.
+
+export interface UpdateNotice {
+  /** The human line, e.g. "Bridge restart needed" / "issance 0.12.0 available". */
+  line: string;
+  /** A copyable command that resolves it, spelled for the install kind — the Hangar plugin action on a
+   *  Hangar-managed checkout (Hangar resolves the plugin's checkout, so it runs from ANY directory), the
+   *  `issance` verb everywhere else. Only the RESTART and MAJOR cases carry one; the release case sends
+   *  you to `href` instead, where the release notes carry the commands. A `packaged` install
+   *  carries one on RESTART only — it never updates itself, so there is no update command to give. */
+  command?: string;
+  /** GitHub release page for the available version — the line links to it. Absent for the restart case. */
+  href?: string;
+}
+
+/**
+ * Decide what (if anything) the footer should nudge, from the snapshot's `update`. Precedence: a
+ * stale running PROCESS outranks an available release — restarting is the cheaper, more urgent fix,
+ * and a release upgrade restarts the service anyway. `null` = nothing to say (an older bridge omits
+ * `update`, or you're current). Kept pure and exported so the precedence is unit-tested directly.
+ */
+export function updateNotice(update: UpdateInfo | undefined): UpdateNotice | null {
+  if (!update) return null;
+  // The command spelling is a function of the install kind (M14/01 §5.3): Hangar's plugin actions
+  // reach only a Hangar-managed (detached) checkout — on a binary install, a linked dev clone or an
+  // unknown layout they name a plugin Hangar does not manage, so those get the `issance` verbs, which
+  // work everywhere the CLI is on PATH. An absent kind is an older bridge from the git-install era,
+  // which is read as Hangar-managed so the advice never regresses mid-upgrade.
+  const herdrManaged = update.installKind === undefined || update.installKind === "detached-checkout";
+  // A packaged install is the one kind that does not update itself at all: its root is not writable,
+  // so `issance update` refuses there by design (ADR 0035). It therefore gets NO update command —
+  // printing one would print the exact command that refuses. Restarting is still its own business
+  // and `issance restart` works, because the binary is on PATH like any other packaged program.
+  const selfUpdates = update.installKind !== "packaged";
+  // A PACKAGE SWAP UNDER A LIVE PROCESS (M17/02). Above `bridgeStale` because it is the stronger
+  // statement about the same machine: not "the source moved", but "the version on disk is no longer
+  // the version running". The command is the HOST's own answer, spelled there from the install kind
+  // — the phone renders it and never derives a second one.
+  if (update.restartNeeded === true && update.restartCommand !== undefined) {
+    return { line: t("settings.updateBanner.restartNeeded"), command: update.restartCommand };
+  }
+  if (update.bridgeStale) {
+    // No release page for "restart needed" — show the one command that restarts it, to copy.
+    return {
+      line: t("settings.updateBanner.restart"),
+      command: herdrManaged
+        ? "herdr plugin action invoke restart --plugin herdr.issance"
+        : "issance restart",
+    };
+  }
+  // Guard on `latest` too: without a version string there's nothing meaningful to name. The release
+  // page (linked) carries the update commands, so the footer just links there.
+  if (update.releaseAvailable && update.latest) {
+    return {
+      line: t("settings.updateBanner.releaseAvailable", { version: update.latest }),
+      href: update.latestUrl ?? undefined,
+    };
+  }
+  // A MAJOR is out. It ranks below a routine release because it is the one thing the plain update
+  // action will NOT take (ADR 0020) — so this line names the consent command instead of leaving the
+  // operator to tap update, see it succeed, and still see a banner.
+  if (update.majorAvailable) {
+    const line = t("settings.updateBanner.majorAvailable", { version: update.majorAvailable });
+    const href = update.majorUrl ?? undefined;
+    // The major line still appears on a packaged install — that a major is out is worth knowing
+    // however it gets taken — but it carries no command. issance can see that its root is unwritable,
+    // which is what makes the update someone else's; nothing on disk says WHOSE, so there is no
+    // command it could honestly name in place of the one it must not print.
+    if (!selfUpdates) return { line, href };
+    return {
+      line,
+      href,
+      command: herdrManaged
+        ? "herdr plugin action invoke update-major --plugin herdr.issance"
+        : "issance update --major",
+    };
+  }
+  return null;
+}
+
+export function UpdateBanner({ className }: { className?: string }) {
+  useLocale();
+  const data = useOptionalRootData();
+  const notice = updateNotice(data?.update);
+  const [copied, setCopied] = useState(false);
+
+  if (!notice) return null;
+
+  async function copy() {
+    if (!notice?.command) return;
+    try {
+      await navigator.clipboard?.writeText(notice.command);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard blocked (insecure context / denied) — the command stays readable regardless.
+    }
+  }
+
+  return (
+    <div
+      className={cn(
+        "text-center text-[11px] leading-relaxed text-muted-foreground",
+        className,
+      )}
+    >
+      {notice.href ? (
+        // Links to the GitHub release page for the available version (its notes carry the update
+        // commands). External navigation — new tab.
+        <a
+          href={notice.href}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="font-medium text-status-working underline decoration-dotted underline-offset-2"
+        >
+          {notice.line}
+        </a>
+      ) : (
+        <span className="font-medium text-status-working">{notice.line}</span>
+      )}
+      {notice.command ? (
+        <>
+          {" · "}
+          <button
+            type="button"
+            onClick={copy}
+            aria-label={t("settings.updateBanner.copyAria", { command: notice.command })}
+            className="inline-flex items-center gap-1 align-middle rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-foreground/80"
+          >
+            <code>{notice.command}</code>
+            {copied ? (
+              <Check className="size-3 text-status-working" />
+            ) : (
+              <Copy className="size-3 opacity-60" />
+            )}
+          </button>
+        </>
+      ) : null}
+    </div>
+  );
+}

@@ -1,0 +1,599 @@
+import { useEffect, useRef, useState } from "react";
+import type {
+  ChangeEvent,
+  CompositionEvent as ReactCompositionEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  RefObject,
+} from "react";
+
+import { useOrderedKeySender } from "@/hooks/use-ordered-key-sender";
+import { t } from "@/lib/i18n";
+import { textToKeySequence } from "@/lib/key-queue";
+import { setStatus } from "@/lib/status";
+
+// Physical-keyboard events that do not change a textarea value still need wire names. Printable
+// text, spaces and line breaks normally arrive through the input/change path instead.
+// A Map, not an object literal: the lookup key is whatever `KeyboardEvent.key` reports, and an
+// object would answer for inherited names ("constructor", "toString") with something that is not a
+// wire key at all.
+const SPECIAL_KEYS = new Map([
+  ["Escape", "Escape"],
+  ["Tab", "Tab"],
+  ["ArrowUp", "Up"],
+  ["ArrowDown", "Down"],
+  ["ArrowLeft", "Left"],
+  ["ArrowRight", "Right"],
+]);
+
+// Safari fires the keydown that confirms an IME candidate (keyCode 229, isComposing false) right
+// AFTER compositionend. Only a 229 keydown inside this window is that echo; ProseMirror uses the
+// same 500 ms. Outside it, 229 is just what some engines report for any key, so it must not decide.
+const IME_CONFIRM_WINDOW_MS = 500;
+
+// How long after a line end (Enter, an arrow, Tab, Escape, a Keys dock key) the keyboard's
+// write-back of the word it still believes is in the field can arrive. The write-back follows the
+// clear within milliseconds; a person composing the same word again takes longer than this.
+const LINE_END_ECHO_WINDOW_MS = 500;
+
+function keyForInputType(inputType: string): string | null {
+  if (inputType === "deleteContentBackward") return "Backspace";
+  if (inputType === "insertLineBreak" || inputType === "insertParagraph") return "Enter";
+  return null;
+}
+
+let graphemeSegmenter: Intl.Segmenter | undefined;
+
+/**
+ * The characters a person sees, one entry each: grapheme clusters through `Intl.Segmenter`, so a
+ * flag, a skin-toned or a ZWJ emoji is ONE character, as it is to the keyboard's Backspace and to a
+ * terminal editor. Code points where the engine has no Segmenter (still not UTF-16 units).
+ */
+export function graphemes(text: string): string[] {
+  // Absent on engines older than the Segmenter (Firefox before 125), whatever the lib types say.
+  if (!("Segmenter" in Intl)) return Array.from(text);
+  graphemeSegmenter ??= new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  return Array.from(graphemeSegmenter.segment(text), (part) => part.segment);
+}
+
+/**
+ * The keys that turn the line already sent into `next`: a Backspace for every character after the
+ * longest shared prefix, then the characters `next` adds past it. Characters are grapheme clusters
+ * (see `graphemes`), so deleting one emoji sends one Backspace.
+ */
+export function keysForLineChange(sent: string, next: string): string[] {
+  const before = graphemes(sent);
+  const after = graphemes(next);
+  let shared = 0;
+  while (shared < before.length && shared < after.length && before[shared] === after[shared]) shared++;
+  const erase = Array.from({ length: before.length - shared }, () => "Backspace");
+  return [...erase, ...textToKeySequence(after.slice(shared).join(""))];
+}
+
+/** The line break a paste can carry; Enter typed on a keyboard never reaches the field. */
+const LINE_BREAK = /\r\n|\r|\n/g;
+
+/** True when `next` is the keyboard writing back the end of the line that just ended: the whole
+ *  line, or its last word or words, starting at a word boundary. */
+function isLineEndWriteBack(ended: string, next: string): boolean {
+  const line = ended.trimEnd();
+  const back = next.trimEnd();
+  if (back.length === 0 || !line.endsWith(back)) return false;
+  const before = line.length - back.length;
+  return before === 0 || /\s/.test(line[before - 1] ?? "");
+}
+
+function keyForKeyDown(key: string): string | undefined {
+  if (key === "Backspace") return "Backspace";
+  if (key === "Enter") return "Enter";
+  return SPECIAL_KEYS.get(key);
+}
+
+interface DirectTypingOptions {
+  paneKey: string;
+  inputRef: RefObject<HTMLTextAreaElement | null>;
+  /** The durable reply draft, read at the moment of arming rather than captured at render. A getter,
+   *  because the password-prompt handoff (components/no-echo-notice.tsx) clears the draft and arms in
+   *  the SAME tick: a value captured at render would still be the secret the operator just typed, and
+   *  the refusal below would block the very remedy being offered. */
+  replyDraft: () => string;
+  canActivate: () => boolean;
+  /** True while the view the mode belongs to has stopped being live: a gone pane, a read-only
+   *  device, or the idle pause. Arming survives none of them — see the disarm effect below. */
+  suspended: boolean;
+  sendKeys: (keys: string[]) => Promise<boolean>;
+  onActivate: () => void;
+  focusInput: () => void;
+  /**
+   * Identity of the agent under the pane (`composer` passes its `agent`
+   * prop, `"shell"` when there is none). A change means the session the
+   * arming belonged to is gone — e.g. the agent exited and the pane fell
+   * back to a shell, which is how a chat message becomes a command. The
+   * mode disarms with a notice rather than streaming into the stranger.
+   */
+  agentKey: string;
+}
+
+// The composer textarea's direct-terminal mode: what you type goes to the pane as keystrokes,
+// with no trailing Enter. This hook owns the armed state, the line typed since the last Enter, the
+// pane-boundary reset, special-key capture, and the lifecycle rules that disarm it.
+//
+// WHY THE FIELD KEEPS THE LINE. A phone keyboard keeps its own copy of the text before the caret and
+// edits that copy, not the field. This hook used to empty the field after every key, and SwiftKey
+// then committed the word it still believed was there a second time, so `cd cd` reached the shell as
+// `cdcd cdcdcd` (issue 534). The field now holds everything typed since the last Enter, `sentLine`
+// holds what the pane has already received of it, and each settled change sends only the difference
+// (keysForLineChange). Don't go back to clearing the field per key.
+//
+// THE LINE-END RULE. The diff is only right while the pane's line is "what it had when the field was
+// last empty, plus `sentLine`, caret at the end". Every key that reaches the pane WITHOUT going through
+// the diff breaks that: Enter, an arrow (history included), Tab, Escape, and every key from the Keys
+// dock (Ctrl chords included). So each of them ENDS THE LINE, the same way Enter does (`endLine`):
+// the field's unsent text goes first, then the key, then the field and `sentLine` both empty. The
+// dock's keys go through this hook's own queue, after the text (`sendPaneKeys`): a request sent
+// beside the queue could overtake a batch still in flight and land before the text. A Backspace on the empty field goes straight to the pane too, but finds no line to end.
+// From there the field holds only what was typed after that key, which the pane
+// inserts at its own caret, so a later Backspace, autocorrect or word delete can never erase text the
+// field did not type (a Tab completion, a recalled history line). A paste that carries a line break
+// ends the line at its last break: the text and its Enters go out, and the field keeps what follows.
+//
+// THE WRITE-BACK GUARD. Emptying the field at a line end is the one place this hook still clears the
+// field under the keyboard, and a composing keyboard (SwiftKey, Gboard) may write the word it still
+// believes is there back into it: a compositionend arriving after Enter, or a fresh composition that
+// re-commits the last word. That is the issue-534 bug class, and it would start the next line with the
+// old word. So the first non-empty settled change after a line end, within LINE_END_ECHO_WINDOW_MS, is
+// dropped (and the field emptied again) when it is the end of the line that just ended AND it came
+// from a composition. Plain typing never composes, so a fast `ls`, Enter, `ls` on a hardware keyboard
+// still sends twice.
+// Transport ordering stays in useOrderedKeySender so this hook never permits concurrent one-shot
+// Hangar writes.
+//
+// It does NOT own the entry point. Arming is an explicit NAMED choice — the "Type" toggle in the
+// composer's Controls row, beside Keys.
+//
+// WHY A NAMED CHOICE AND NOT A GESTURE. The submitted version of this feature armed the mode on a
+// bare long press of the Send button. That reads as a saving of one tap, but the tap is priced per
+// SESSION, not per keystroke: you arm once and then type many keys. What it actually buys is an
+// accidental hold — a pocket, a fumbled scroll, a hesitation over Send with a destructive command in
+// the box — silently pointing the phone keyboard at a live terminal with nothing on screen having
+// asked. This surface's safety story is "you see what is about to go on the wire" (ADR 0005), and a
+// mode you can enter without reading anything sits outside it. A labelled toggle you press on purpose
+// is the cheapest thing that stays inside it. Don't reintroduce a hold as a shortcut.
+//
+// WHY THE MODE DIES WITH THE VIEW. What stands in for a review step here is that you are LOOKING at
+// the pane while you type into it — this is the one write path with no reviewable payload, by design
+// (reviewing each keystroke would defeat it). That condition can quietly stop being true: the mirror
+// is polled, and the poll stops on an idle pause (ADR 0007), on a backgrounded tab, on a pane going
+// away. Hence the disarms below. Never persisted, never restored: there is no path by which this is
+// already armed when you arrive at a screen.
+//
+// Two apparent omissions that are deliberate. A lost connection is NOT a separate trigger — it
+// surfaces as a failed batch, which already disarms, observed directly rather than inferred from a
+// timer. And the reply guard's `composerReady` pre-flight is NOT run on these keystrokes: it refuses
+// to type into an unrecognised screen, and typing into an unrecognised screen is the whole point.
+// Don't "harden" this path by adding it.
+export function useDirectTyping({
+  paneKey,
+  inputRef,
+  replyDraft,
+  canActivate,
+  suspended,
+  // Bound under another name: it is the composer's pressKeys, already a lib/api write, and a bare
+  // `sendKeys(` call here would read as a second door to the scan in lib/key-writes.test.ts.
+  sendKeys: writeKeys,
+  onActivate,
+  focusInput,
+  agentKey,
+}: DirectTypingOptions) {
+  const [active, setActive] = useState(false);
+  const [value, setValue] = useState("");
+  // Live read for the visibility listener below, which outlives any one armed session. Written at
+  // the transitions themselves, not during render: the listener fires between renders, and a ref
+  // that only catches up on the next one would let it misread which state it is reporting on.
+  const activeRef = useRef(false);
+  const backgrounded = useRef(false);
+  const composing = useRef(false);
+  // When the last composition ended, for the Safari confirm window. -Infinity means none yet.
+  const compositionEndedAt = useRef(Number.NEGATIVE_INFINITY);
+  // The part of the field the pane has already received, as typed since the last line end.
+  const sentLine = useRef("");
+  // The line that just ended, for the write-back guard (see the note at the top). One-shot.
+  const lineEndEcho = useRef<{ text: string; compositionOpen: boolean; until: number } | null>(null);
+  const pendingBlur = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Idle watchdog: one 60s one-shot, re-armed on every keystroke (commits
+  // and special keys — not composition intermediates). A mode nobody has
+  // touched for a minute is a mode nobody is looking at; disarm with a
+  // notice rather than hold it open indefinitely. Foreground only: the
+  // backgrounded-tab disarm fires first, and a throttled timer can only fire
+  // late, never extend arming.
+  const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Previous agent identity for the change effect below. `undefined` means
+  // never seen (first mount): only a real observed change disarms, never
+  // the initial value or a poll gap resolving to the same name.
+  const prevAgentKey = useRef<string | undefined>(undefined);
+  const sender = useOrderedKeySender(writeKeys, () => {
+    resetMode();
+    // Stop the phone keyboard too: otherwise continued typing after a transport failure silently
+    // becomes a buffered Reply, which is a different action with an eventual Enter attached.
+    dropKeyboard();
+  });
+
+  function activate() {
+    if (!canActivate()) return;
+    // A buffered reply and live keystrokes cannot safely share one field. Keep the durable draft
+    // exactly where it is and make the user send or clear it before arming direct terminal input.
+    if (replyDraft().length > 0) {
+      setStatus(t("directTyping.status.draftPending"), "info");
+      return;
+    }
+    onActivate();
+    // A new armed session owns the field from here: any blur still pending belongs to an older one,
+    // and this cancellation is what keeps it from landing on the session that replaced it.
+    cancelPendingBlur();
+    setValue("");
+    sentLine.current = "";
+    lineEndEcho.current = null;
+    composing.current = false;
+    activeRef.current = true;
+    setActive(true);
+    setStatus(t("directTyping.status.armed"), "success");
+    // Focus synchronously while the long-press/contextmenu gesture still carries browser user
+    // activation; a deferred focus selects the field but mobile browsers may refuse to open their
+    // software keyboard once that activation has expired. The existing callback still runs after
+    // React swaps the controlled value so selection lands at the end.
+    inputRef.current?.focus();
+    focusInput();
+    // The watchdog starts at the arming, not at the first key: the trap is arming, then typing a
+    // chat message after the agent underneath has exited, so an untouched mode must expire too.
+    pokeIdleTimer();
+  }
+
+  /** Disarm and forget the transient state. Leaves the field alone — callers decide about focus. */
+  function resetMode() {
+    // Disarming revokes the entire armed session, including keys waiting behind a slow batch.
+    // That holds for the person's own Stop too: Stop means halt, and a dropped suffix never runs
+    // as a truncated command. The batch already on the wire cannot be recalled; its late failure
+    // must not disarm a re-arm.
+    sender.reset();
+    cancelIdleTimer();
+    activeRef.current = false;
+    setActive(false);
+    setValue("");
+    sentLine.current = "";
+    lineEndEcho.current = null;
+    composing.current = false;
+    compositionEndedAt.current = Number.NEGATIVE_INFINITY;
+  }
+
+  /** Send what the field holds beyond what the pane already has. */
+  function sendLineChange(next: string) {
+    const keys = keysForLineChange(sentLine.current, next);
+    sentLine.current = next;
+    if (keys.length === 0) return;
+    sender.enqueue(keys);
+    pokeIdleTimer();
+  }
+
+  /** Set the field and React's copy of it together. Synchronous on the DOM: a compositionend still
+   *  on its way reads the DOM value, and a stale one would be sent again. */
+  function replaceField(text: string) {
+    const inputEl = inputRef.current;
+    if (inputEl !== null) inputEl.value = text;
+    setValue(text);
+  }
+
+  /** End the line (the rule at the top): whatever the field still holds unsent, then `key` if one
+   *  is given (a Keys dock key is queued by `sendPaneKeys` instead), then an empty field and record. */
+  function endLine(key: string | null) {
+    const line = inputRef.current?.value ?? "";
+    sendLineChange(line);
+    if (key !== null) {
+      sender.enqueue([key]);
+      pokeIdleTimer();
+    }
+    lineEndEcho.current =
+      line.trim().length > 0
+        ? { text: line, compositionOpen: composing.current, until: Date.now() + LINE_END_ECHO_WINDOW_MS }
+        : null;
+    sentLine.current = "";
+    replaceField("");
+  }
+
+  /** The write-back guard (see the note at the top). True when `next` was dropped. */
+  function dropLineEndWriteBack(next: string, viaComposition: boolean): boolean {
+    const echo = lineEndEcho.current;
+    if (echo === null || next.length === 0) return false;
+    lineEndEcho.current = null;
+    if (Date.now() >= echo.until) return false;
+    if (!viaComposition && !echo.compositionOpen) return false;
+    if (!isLineEndWriteBack(echo.text, next)) return false;
+    replaceField("");
+    return true;
+  }
+
+  /** A settled field value: send the difference, ending the line at a pasted line break. */
+  function settle(next: string, viaComposition: boolean) {
+    if (dropLineEndWriteBack(next, viaComposition)) return;
+    sendLineChange(next);
+    const lines = next.split(LINE_BREAK);
+    if (lines.length === 1) return;
+    // The text and its Enters are on their way; the pane now edits the line after the last break.
+    const tail = lines[lines.length - 1] ?? "";
+    sentLine.current = tail;
+    replaceField(tail);
+  }
+
+  /** Keys from the Keys dock. Outside Type mode they take the composer's own path, unchanged. In
+   *  Type mode they end the line, and they queue on the SAME sender as the field's text, so the dock
+   *  key always follows the text in queue order. Answers the verdict of the batch that carried them. */
+  function sendPaneKeys(keys: string[]): Promise<boolean> {
+    if (!activeRef.current) return writeKeys(keys);
+    endLine(null);
+    pokeIdleTimer();
+    return sender.enqueue(keys);
+  }
+
+  function clearMode() {
+    resetMode();
+    focusInput();
+  }
+
+  function cancelPendingBlur() {
+    if (pendingBlur.current === null) return;
+    clearTimeout(pendingBlur.current);
+    pendingBlur.current = null;
+  }
+
+  function cancelIdleTimer() {
+    if (idleTimer.current === null) return;
+    clearTimeout(idleTimer.current);
+    idleTimer.current = null;
+  }
+
+  // Re-arm the 60s watchdog after key activity. Called at every enqueue
+  // site (commits + special keys); the timer callback goes through the
+  // lifecycle ref like every other disarm-from-outside-render.
+  function pokeIdleTimer() {
+    cancelIdleTimer();
+    idleTimer.current = setTimeout(() => {
+      idleTimer.current = null;
+      if (!activeRef.current) return;
+      lifecycle.current.resetMode();
+      setStatus(t("directTyping.status.idleTimeout"), "info");
+      lifecycle.current.dropKeyboard();
+    }, 60_000);
+  }
+
+  /**
+   * Put the phone keyboard away after a disarm the user did not ask for.
+   *
+   * Deferred, because focusInputEnd() is itself a `setTimeout` and a synchronous blur here is
+   * simply undone by a focus already queued behind it. Deferring means the blur can outlive the
+   * disarm that scheduled it, so ownership is settled by CANCELLATION rather than by a token:
+   * everything that STARTS OR RETARGETS a session — a re-arm (activate), a pane change, unmount, a
+   * second disarm — cancels the pending blur first. An old disarm therefore never reaches a live
+   * session, because it no longer exists by the time one begins.
+   *
+   * Do not read that as "every path that focuses the field cancels": three don't, and don't need to.
+   * `deactivate`/`clearMode`, the `suspended` disarm, and the composer's own takeOverDraft /
+   * insertCommand / uploadFile all focus without cancelling — they are safe because a blur is only
+   * ever pending while the mode is DISARMED (both schedulers call resetMode() in the same frame, and
+   * the first two gate on `active`), and because their focus is itself deferred, so it queues behind
+   * any pending blur and lands last.
+   */
+  function dropKeyboard() {
+    cancelPendingBlur();
+    pendingBlur.current = setTimeout(() => {
+      pendingBlur.current = null;
+      inputRef.current?.blur();
+    }, 0);
+  }
+
+  function deactivate() {
+    clearMode();
+    setStatus(t("directTyping.status.disarmed"), "info");
+  }
+
+  function deactivateSilently() {
+    clearMode();
+  }
+
+  // The effects below are LIFECYCLE handlers, not reactive computations: they must fire on the
+  // condition in their dependency list and on nothing else. `clearMode`/`dropKeyboard`/`resetMode`
+  // are re-created every render, so naming them as dependencies would re-run — and in the pane-key
+  // effect, re-RESET — on every render instead. A latest-value ref says that intent outright, and
+  // keeps each effect calling the current closure rather than a stale capture.
+  const lifecycle = useRef({ clearMode, dropKeyboard, resetMode, endLine });
+  lifecycle.current = { clearMode, dropKeyboard, resetMode, endLine };
+
+  // The stable enqueue callback, not the sender's fresh object, belongs in the native listener's
+  // dependency list. Resetting the sender is part of resetMode on every disarm, not only pane changes.
+  const { enqueue: enqueueKeys } = sender;
+
+  // Arming dies with the view it belongs to. A backgrounded tab, an idle pause and a lost bridge
+  // all mean the same thing: the mirror on screen has stopped tracking the pane, and the next
+  // keystroke would go into a terminal the user is no longer actually looking at. Disarm rather
+  // than hold the mode open across the gap — the cost is one re-arm, the alternative is typing
+  // blind. Never persisted, never restored — see the lifecycle note in send-mode-menu.tsx.
+  useEffect(() => {
+    if (!active || !suspended) return;
+    lifecycle.current.clearMode();
+    setStatus(t("directTyping.status.interrupted"), "info");
+  }, [active, suspended]);
+
+  // The backgrounded-tab disarm has to announce itself on the way BACK, not on the way out. A
+  // status set while the document is hidden is gone before anyone can read it (lib/status.ts
+  // auto-clears non-errors after 2.5s), so the old silent clearMode() produced the one genuinely
+  // confusing failure this mode has: you switch apps mid-command, return to a still-focused field
+  // with the keyboard still up, and the next characters land in the REPLY DRAFT instead of the
+  // terminal — a different action, with an eventual Enter attached. Deferring the message to the
+  // next visible event is what makes that state readable.
+  //
+  // Mounted for the hook's whole life, NOT keyed on `active`: hiding the document is what disarms,
+  // so an effect keyed on `active` tears its own listener down in the same commit and the return
+  // trip has nobody left to report it. The armed state is read through a ref for the same reason.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        if (!activeRef.current) return;
+        backgrounded.current = true;
+        lifecycle.current.resetMode();
+        // Put the keyboard away rather than hand the field back focused. The notice below is the
+        // only thing telling you the mode is gone, and it expires; a primed field outlasts it, and
+        // typing into it is exactly the mistake being warned about.
+        lifecycle.current.dropKeyboard();
+        return;
+      }
+      if (!backgrounded.current) return;
+      backgrounded.current = false;
+      setStatus(t("directTyping.status.backgrounded"), "info");
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
+
+  // Direct input never crosses a pane boundary. Reset also invalidates keys accumulated behind an
+  // in-flight call; the call already on the wire captured the old pane and cannot be recalled.
+  useEffect(() => {
+    lifecycle.current.resetMode();
+    // Explicit: the agent effect below must not read the old pane's identity.
+    // (Harmless once the active-gate lands — a disarmed mode announces
+    // nothing — but the ref should still mean "last seen", not "stale".)
+    prevAgentKey.current = undefined;
+    // The new pane's field is not the one that disarm was about — neither the blur it scheduled nor
+    // the notice it owes. Dropping the debt matters because a pane can change WHILE hidden: a push
+    // notification deep-links into another pane, and without this the return trip announces "the app
+    // was backgrounded" over a pane the mode was never armed on.
+    cancelPendingBlur();
+    backgrounded.current = false;
+  }, [paneKey]);
+
+  // The agent under the pane changed: the arming belonged to the old session
+  // (the agent exited and the pane fell back to a shell), so the mode disarms
+  // WITH a notice — unlike the silent pane reset above, the user is looking
+  // at this pane and must learn the keyboard no longer reaches an agent.
+  // First mount never fires (prev starts unseen); same-name values never
+  // fire, so reconnect flaps stay quiet. Gated on active: a change with the
+  // mode off posts nothing (this also covers pane+agent changing together —
+  // the silent pane reset runs first and there is nothing left to announce).
+  useEffect(() => {
+    const prev = prevAgentKey.current;
+    prevAgentKey.current = agentKey;
+    if (prev === undefined || prev === agentKey) return;
+    if (!activeRef.current) return;
+    lifecycle.current.resetMode();
+    setStatus(t("directTyping.status.agentChanged"), "info");
+  }, [agentKey]);
+
+  useEffect(() => {
+    return () => {
+      cancelPendingBlur();
+      cancelIdleTimer();
+    };
+  }, []);
+
+  // Android virtual Backspace/Enter can arrive as beforeinput without a useful keydown. A native
+  // listener is intentional: React's synthetic beforeinput omits these events on some engines.
+  // Blur rides on the same listener scope: losing focus ends any composition for good, and
+  // `composing` gates Backspace, the arrows, Escape and Tab, so one lost compositionend must not
+  // leave them swallowed. (The idle watchdog and every disarm clear it too.)
+  useEffect(() => {
+    const inputEl = inputRef.current;
+    if (!active || inputEl === null) return;
+    const onBlur = () => {
+      composing.current = false;
+    };
+    const onBeforeInput = (event: InputEvent) => {
+      if (!activeRef.current) return;
+      const key = keyForInputType(event.inputType);
+      if (key === null) return;
+      // Backspace inside an active IME edits the candidate; Enter commits/submits and must still reach
+      // the terminal. Gboard commonly marks that insertParagraph event as composing.
+      if ((event.isComposing || composing.current) && key === "Backspace") return;
+      if (key === "Enter") {
+        event.preventDefault();
+        lifecycle.current.endLine(key);
+        return;
+      }
+      // A Backspace over typed text is the field's own edit, and the change it makes sends the
+      // Backspace. Only an empty field has nothing to delete, so there the key goes to the pane.
+      if (inputEl.value.length > 0) return;
+      event.preventDefault();
+      enqueueKeys([key]);
+      pokeIdleTimer();
+    };
+    inputEl.addEventListener("beforeinput", onBeforeInput);
+    inputEl.addEventListener("blur", onBlur);
+    return () => {
+      inputEl.removeEventListener("beforeinput", onBeforeInput);
+      inputEl.removeEventListener("blur", onBlur);
+    };
+  }, [active, inputRef, enqueueKeys]);
+
+  function onChange(event: ChangeEvent<HTMLTextAreaElement>) {
+    if (!activeRef.current) return;
+    const next = event.target.value;
+    setValue(next);
+    // SAFETY: a React `change` on a <textarea> is backed by the DOM `input` event, whose interface
+    // IS InputEvent — that is where `isComposing` lives. React types `nativeEvent` as the base
+    // `Event` for the synthetic ChangeEvent, which is the only reason this is written down.
+    const inputEvent = event.nativeEvent as InputEvent;
+    if (inputEvent.isComposing || composing.current) return;
+    // Gboard can follow compositionend with one ordinary input carrying the same committed word;
+    // the line already holds it, so only what that input adds (often the space) is sent.
+    settle(next, false);
+  }
+
+  function onCompositionStart() {
+    if (!activeRef.current) return;
+    composing.current = true;
+  }
+
+  function onCompositionEnd(event: ReactCompositionEvent<HTMLTextAreaElement>) {
+    if (!activeRef.current) return;
+    composing.current = false;
+    compositionEndedAt.current = Date.now();
+    const line = event.currentTarget.value;
+    setValue(line);
+    settle(line, true);
+  }
+
+  function onKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (!activeRef.current) return;
+    // Candidate editing/confirmation belongs to the IME, not the terminal. Safari reports the
+    // confirming key AFTER compositionend with isComposing false, but still as keyCode 229; only
+    // that echo is skipped, so a 229 arrow, Escape or Tab outside the window still reaches the pane.
+    if (composing.current || event.nativeEvent.isComposing) return;
+    if (
+      event.nativeEvent.keyCode === 229 &&
+      Date.now() - compositionEndedAt.current < IME_CONFIRM_WINDOW_MS
+    ) {
+      return;
+    }
+    const key = keyForKeyDown(event.key);
+    if (key === undefined) return;
+    if (key === "Backspace" && event.currentTarget.value.length > 0) return;
+    event.preventDefault();
+    // Backspace here only ever meets an empty field, so it changes nothing the field knows. Every
+    // other key moves or ends the pane's line behind the field's back: the line-end rule.
+    if (key === "Backspace") {
+      sender.enqueue([key]);
+      pokeIdleTimer();
+      return;
+    }
+    endLine(key);
+  }
+
+  return {
+    active,
+    value,
+    busy: sender.busy,
+    activate,
+    deactivate,
+    deactivateSilently,
+    onChange,
+    onCompositionStart,
+    onCompositionEnd,
+    onKeyDown,
+    sendPaneKeys,
+  };
+}

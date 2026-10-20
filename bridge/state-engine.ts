@@ -1,0 +1,793 @@
+import type { MuxAdapter, MuxAttention, MuxPane } from "./mux/types.ts";
+import {
+  type AgentStatus,
+  type AgentView,
+  type BridgeStatus,
+  type MuxFault,
+  muxFaultOf,
+  type TabView,
+  type WorkspaceView,
+} from "./types.ts";
+// The one input-frame module (M56 spec 03) and the Claude profile it reads its anchors from. Both are
+// pure and sit under web/src/lib/surface; the bridge imports them by relative path, as
+// prompt-binding.ts does for web/src/lib/styled-region.ts.
+import { findInputFrame, plainRows } from "../web/src/lib/surface/frame.ts";
+import { requireProfile } from "../web/src/lib/surface/profile.ts";
+
+// Polls the multiplexer on an interval, builds the snapshot (agents + shell panes + spaces/tabs),
+// and emits transition events. Polling (vs the per-pane event subscription) keeps this resync-free:
+// a failed poll just retries next tick, and reconnection needs no special handling.
+//
+// It talks the mux port (mux/types.ts) and no multiplexer's own vocabulary: every Hangar-shaped
+// derivation this file used to do inline — the workspace join, the meaningful tab label, the
+// terminal-title strip, the agent-session ownership check, the session.snapshot fallback — moved
+// into the adapter, where the multiplexer that knows those facts lives (bridge/mux/herdr/adapter.ts).
+
+// How many lines to read per claude pane when sniffing its `/rename` session name. Claude's input
+// box (and the named rule above it) sits at the very tail, so a small window is plenty and keeps the
+// extra per-poll reads cheap.
+//
+// The scope MUST stay `viewport`. A `recent` text read asking for more rows than the pane currently
+// shows makes Hangar harvest the pages above the viewport, and on a full-screen agent (Claude runs on
+// the alternate screen, which has no host scrollback) the only way to reach them is to drive the
+// agent's own mouse-scroll interface: Hangar scrolls the pane up page by page, then restores it. The
+// operator watches their terminal jump and snap back — once per poll, per idle claude pane.
+// `viewport` cannot do that whatever this count is: it is the rendered screen, clamped to it. Which
+// is also why this number is free to stay generous — the run below the ❯ prompt is a statusline of
+// unknown height ([ADR 0004](../.adr/0004-the-statusline-run-is-bounded.md)), so headroom is worth
+// more here than a smaller read. See HERDR_API.md → `pane.read`.
+const SESSION_NAME_READ_LINES = 40;
+
+/**
+ * How many polls the engine runs at the fast cadence after an INTENT says something is about to
+ * change: an input written to a pane, or a pane that has just become an agent and has not named its
+ * session yet. Counted in polls, not milliseconds, for the reason the phone's burst is
+ * (web/src/lib/poll-intent.ts): a deadline would end early on a slow multiplexer and late on a fast
+ * one. Eight polls at the default 1.5 s is about one idle interval, so the hot spell never outlasts
+ * the 12 s gap it closes. It is the decay, and so the last resort: the session-wait hold below ends
+ * on the EVENT (the session seen) and spends this only when that event never comes.
+ */
+export const HOT_POLLS = 8;
+
+// Claude renders its input box as a horizontal rule, the ❯ prompt line, then a closing rule. After
+// `/rename <name>` the TOP rule carries the session name inside it: "────────── my-name ──". The box
+// is found by the frame module from the Claude profile's anchors, and the words on the top edge are
+// the anchor's `label` group: a column-0 prompt row between two column-0 rules, so a menu's " ❯"
+// cursor (leading space) or a decorative rule elsewhere in the output never reads as the box.
+const CLAUDE_IDLE = requireProfile("claude").idle;
+const ESC = String.fromCharCode(27);
+// One SGR sequence, colon sub-parameters included so they are stripped like the rest. Built from the
+// escape byte so no raw control character sits in the source.
+const SGR_SEQ = new RegExp(`${ESC}\\[([0-9;:]*)m`, "g");
+
+// A colour as the terminal resolves it, so two spellings of one colour compare equal: `31`, `91`'s
+// slot 9 and `38;5;1` name palette slots exactly as web/src/lib/ansi.ts resolves them. The default
+// foreground and the default background are two different colours, never one empty value.
+const DEFAULT_FG = "default-fg";
+const DEFAULT_BG = "default-bg";
+
+interface Pen {
+  fg: string;
+  bg: string;
+  inverse: boolean;
+  /** False after a sequence this reader does not parse, until a full reset. */
+  known: boolean;
+}
+
+interface StyledCell {
+  readonly ch: string;
+  readonly fg: string;
+  readonly bg: string;
+  readonly known: boolean;
+}
+
+function applySgr(pen: Pen, params: string): void {
+  if (params.includes(":")) {
+    pen.known = false;
+    return;
+  }
+  const codes = params === "" ? [0] : params.split(";").map(Number);
+  for (let i = 0; i < codes.length; i++) {
+    const c = codes[i]!;
+    if (c === 0) {
+      pen.fg = DEFAULT_FG;
+      pen.bg = DEFAULT_BG;
+      pen.inverse = false;
+      pen.known = true;
+    } else if (c === 7) pen.inverse = true;
+    else if (c === 27) pen.inverse = false;
+    else if (c >= 30 && c <= 37) pen.fg = `palette:${c - 30}`;
+    else if (c === 39) pen.fg = DEFAULT_FG;
+    else if (c >= 40 && c <= 47) pen.bg = `palette:${c - 40}`;
+    else if (c === 49) pen.bg = DEFAULT_BG;
+    else if (c >= 90 && c <= 97) pen.fg = `palette:${8 + c - 90}`;
+    else if (c >= 100 && c <= 107) pen.bg = `palette:${8 + c - 100}`;
+    else if (c === 38 || c === 48) {
+      let colour: string;
+      if (codes[i + 1] === 5) {
+        colour = `palette:${codes[i + 2] ?? 0}`;
+        i += 2;
+      } else if (codes[i + 1] === 2) {
+        colour = `rgb:${codes[i + 2] ?? 0},${codes[i + 3] ?? 0},${codes[i + 4] ?? 0}`;
+        i += 4;
+      } else {
+        pen.known = false;
+        return;
+      }
+      if (c === 38) pen.fg = colour;
+      else pen.bg = colour;
+    }
+  }
+}
+
+/**
+ * Row `row` of the grid as characters, each with the colours it is shown in. The pen runs from the
+ * top of the read, because a colour set on one row stays set on the next until something resets it.
+ */
+function styledRow(lines: readonly string[], row: number): StyledCell[] {
+  const pen: Pen = { fg: DEFAULT_FG, bg: DEFAULT_BG, inverse: false, known: true };
+  const cells: StyledCell[] = [];
+  for (let r = 0; r <= row; r++) {
+    const line = lines[r]!;
+    const push = (text: string): void => {
+      if (r !== row) return;
+      const fg = pen.inverse ? pen.bg : pen.fg;
+      const bg = pen.inverse ? pen.fg : pen.bg;
+      for (const ch of text) cells.push({ ch, fg, bg, known: pen.known });
+    };
+    let last = 0;
+    for (const m of line.matchAll(SGR_SEQ)) {
+      push(line.slice(last, m.index));
+      last = m.index + m[0].length;
+      applySgr(pen, m[1] ?? "");
+    }
+    push(line.slice(last));
+  }
+  return cells;
+}
+
+const plainText = (row: string): string => row.replace(SGR_SEQ, "");
+const isRuleGlyph = (ch: string): boolean => ch === "─" || ch === "━";
+
+/**
+ * What the words inside a named-looking rule are: a `/rename` name, a mode badge, or unknown.
+ *
+ * An observed rendering, not a format Claude promises: Claude Code 2.1.290 draws a session name in
+ * the rule's own colour, or, after `/color`, as a chip whose background is that colour, and draws a
+ * mode badge such as `ultracode` (`/effort ultracode`) in a colour of its own. A read with no styling
+ * at all leaves nothing to compare, so the words read as a name and a badge is mistaken for one there.
+ * A rule whose colour cannot be told (an unparsed sequence, rule glyphs in more than one colour) is
+ * unknown.
+ */
+function ruleLabel(lines: readonly string[], row: number): "name" | "badge" | "unknown" {
+  if (!lines.slice(0, row + 1).some((l) => l.includes(ESC))) return "name";
+  const cells = styledRow(lines, row);
+  if (cells.some((c) => !c.known)) return "unknown";
+  const rule = cells.filter((c) => isRuleGlyph(c.ch));
+  const ruleFg = rule[0]?.fg;
+  if (ruleFg === undefined || rule.some((c) => c.fg !== ruleFg)) return "unknown";
+  const named = cells
+    .filter((c) => !isRuleGlyph(c.ch) && c.ch.trim() !== "")
+    .every((c) => c.fg === ruleFg || c.bg === ruleFg);
+  return named ? "name" : "badge";
+}
+
+/**
+ * Pull Claude's own session name (set via `/rename`) out of a pane's visible grid, styled or plain.
+ *
+ * Returns the name; `null` when the input box is in view and carries no name (a plain rule, or a mode
+ * badge, which Claude only shows on an unnamed session); `undefined` when the pane isn't showing its
+ * input box (a dialog, a working spinner) or the rule's colours cannot be read, so nothing can be
+ * said either way. Claude draws the name INTO the top edge of its input box, e.g.
+ * `────────── my-name ──`. The box is the input frame the frame module finds (findInputFrame, M56
+ * spec 03): the lowest whole box at the tail, top edge, ❯ prompt row and bottom edge, so a decorative
+ * rule anywhere else in the output can never be mistaken for it (no false positives), and a
+ * named-rule/❯ pair in scrollback cannot name a session whose live box is unnamed. The same module
+ * finds the box for the phone's chrome reader. Claude-only; other harnesses never call this. Pure +
+ * exported so it's unit-tested against the pane fixtures without standing up the socket client.
+ */
+export function extractClaudeSessionName(text: string): string | null | undefined {
+  if (!text) return undefined;
+  const lines = text.split(/\r?\n/);
+  const frame = findInputFrame(plainRows(lines.map(plainText)), CLAUDE_IDLE);
+  if (frame === null) return undefined;
+  if (frame.label === null) return null;
+  const label = ruleLabel(lines, frame.top);
+  if (label === "unknown") return undefined;
+  return label === "name" ? frame.label : null;
+}
+
+/**
+ * The name the port gives a pane holding no agent. A pane reads as a bare shell exactly when its
+ * adapter says so — never by this file inspecting a process name (see MuxPane.agent).
+ */
+const SHELL = "shell";
+
+/**
+ * The interactive shells whose presence in a pane's foreground means "nothing is running here".
+ *
+ * A closed list of program names, matched on the base name only. It decides ONE thing — whether a
+ * terminal title has outlived the program that printed it — and it may decide nothing else: it is
+ * not an agent check, not a status, and it never reaches `agent` (mux/types.ts § MuxPane.agent,
+ * which is the whole reason this list is allowed to be a guess).
+ */
+const INTERACTIVE_SHELLS: ReadonlySet<string> = new Set(["bash", "zsh", "fish", "sh", "dash", "nu", "pwsh"]);
+
+/**
+ * Is this pane's terminal title left over from a program that has already exited?
+ *
+ * A multiplexer keeps a pane's title after the program that set it is gone — live-observed on tmux, a
+ * bare `bash` still advertising a finished agent's task ("✳ waiting for soak time…"). Two raw facts
+ * the adapter already reports say so together: an interactive SHELL in the foreground, and a title
+ * that is not that shell's own name. Neither alone means anything, and the pair is evidence rather
+ * than proof — which is exactly why the answer is a rendering hint and never a deletion: the title
+ * stays on the wire, and the phone shows it quietly instead of as the pane's name.
+ *
+ * A pane whose adapter reports no foreground command at all (Hangar) is never stale: there is nothing
+ * to read the emptiness as.
+ *
+ * Pure + exported so the rule is unit-tested and lives in ONE place.
+ */
+export function terminalTitleIsStale(pane: MuxPane): boolean {
+  const title = pane.terminalTitle?.trim() ?? "";
+  if (title.length === 0) return false;
+  const argv0 = pane.foregroundCommand?.trim().split(/\s+/)[0] ?? "";
+  const command = (argv0.split("/").pop() ?? "").toLowerCase();
+  if (command.length === 0 || !INTERACTIVE_SHELLS.has(command)) return false;
+  // A shell that titles the pane after itself is describing the present, not the past.
+  return title.toLowerCase() !== command;
+}
+
+/**
+ * A pane's or a tab's place in the multiplexer's own listing.
+ *
+ * An entry the listing does not hold (a poll caught mid-create) sorts LAST rather than first: an
+ * unplaced pane is never allowed to displace a placed one.
+ */
+function rankOf(order: ReadonlyMap<string, number>, key: string): number {
+  return order.get(key) ?? Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * One pane the multiplexer reported, as the view issance's clients read.
+ *
+ * Almost a rename, and that is the point: the port already carries everything a pane IS, so this
+ * only re-labels the fields the wire has always used (`workspaceId`, not `spaceId` — nothing
+ * phone-visible renames) and adds the two things the multiplexer cannot know. `kind` is one
+ * (issance's split of the herd into agents and bare shells); `sessionName` is the other, filled in
+ * afterwards from the pane's own text (see {@link StateEngine.enrichSessionNames}).
+ */
+function toView(pane: MuxPane, kind: "agent" | "shell"): AgentView {
+  const view: AgentView = {
+    paneId: pane.paneId,
+    workspaceId: pane.spaceId,
+    workspaceLabel: pane.spaceLabel,
+    workspaceNumber: pane.spaceNumber,
+    tabId: pane.tabId,
+    agent: pane.agent,
+    status: pane.status,
+    cwd: pane.cwd,
+    focused: pane.focused,
+    kind,
+  };
+  // Optional fields are ASSIGNED, never conditionally spread: absent stays absent, and each
+  // condition below stays readable as the one rule it encodes.
+  if (pane.paneLabel) view.paneLabel = pane.paneLabel;
+  // Denormalised alongside workspaceLabel so no client has to join tabs[].
+  if (pane.tabLabel) view.tabLabel = pane.tabLabel;
+  if (pane.terminalTitle) view.terminalTitle = pane.terminalTitle;
+  // The program's own line under the title and its small mark, from an adapter with no screen. Absent
+  // stays absent, so every other pane is byte-identical.
+  if (pane.subtitle) view.subtitle = pane.subtitle;
+  if (pane.badge) view.badge = pane.badge;
+  if (pane.progress) view.progress = pane.progress;
+  // The title is still on the wire; this only says the phone should read it quietly. Set only when
+  // true, so every pane that was byte-identical before this field existed still is.
+  if (terminalTitleIsStale(pane)) view.terminalTitleStale = true;
+  // How the agent named its session — SERVER-SIDE ONLY (stripped by toPaneWire). Whether a ref is
+  // meaningful is the journal adapter's call; absent simply means "no history for this pane".
+  if (pane.agentSession) view.agentSession = pane.agentSession;
+  // The harness that wrote that ref, when the pane itself no longer names one — a dead agent's pane
+  // reads as a shell, and its transcript is still readable. Server-side only, like the ref itself.
+  if (pane.sessionAgent) view.sessionAgent = pane.sessionAgent;
+  if (pane.readableLines !== undefined) view.readableLines = pane.readableLines;
+  // A finished sentence for the operator, composed server-side and carried through untouched. It is
+  // presentation: nothing in this engine reads it, and it never reaches `agent` or `status` above.
+  if (pane.hint) view.hint = pane.hint;
+  return view;
+}
+
+export interface EngineSnapshot {
+  agents: AgentView[];
+  shellPanes: AgentView[];
+  workspaces: WorkspaceView[];
+  tabs: TabView[];
+  bridge: BridgeStatus;
+  /** Why the last read failed, when it was a cause the phone words (types.ts `MuxFault`). Absent otherwise. */
+  muxFault?: MuxFault;
+}
+
+/**
+ * How long one read keeps this issance "watched".
+ *
+ * Comfortably longer than the frontend's own cold cadence (4 s) so an operator sitting on the
+ * dashboard with a quiet herd never flickers between watched and idle, and short enough that a phone
+ * put in a pocket stops costing a fast census within a couple of polls. It is deliberately NOT the
+ * poll interval: attention is about a human being present, and the poller is only the evidence.
+ */
+export const ATTENTION_WINDOW_MS = 10_000;
+
+type TransitionListener = (agent: AgentView, from: AgentStatus, to: AgentStatus) => void;
+type RemoveListener = (paneId: string) => void;
+type UpdateListener = (snap: EngineSnapshot) => void;
+type TickListener = () => void;
+
+export class StateEngine {
+  private agents: AgentView[] = [];
+  private shellPanes: AgentView[] = [];
+  private workspaces: WorkspaceView[] = [];
+  private tabs: TabView[] = [];
+  private bridge: BridgeStatus = "disconnected";
+  private muxFault: MuxFault | undefined = undefined;
+  private readonly prevStatus = new Map<string, AgentStatus>();
+  // Last-known claude `/rename` session name per pane. Kept sticky so the name doesn't flicker away
+  // when a pane momentarily hides its input box (a dialog / working spinner). A styled read sets it
+  // from a name, deletes it when the input box shows no name (or only a mode badge), and keeps it
+  // when no input box is in view (`undefined`). It is also cleared when the pane itself vanishes
+  // (see the removal loop). Enriched from pane text each poll (see enrichSessionNames).
+  private readonly sessionNames = new Map<string, string>();
+  // Revision at which each pane was last enriched. enrichSessionNames skips the readGrid RPC for
+  // any pane whose revision hasn't moved — O(claude_panes) socket calls per poll → O(changed).
+  private readonly enrichedAt = new Map<string, number>();
+  private readonly transitionListeners = new Set<TransitionListener>();
+  private readonly removeListeners = new Set<RemoveListener>();
+  private readonly updateListeners = new Set<UpdateListener>();
+  private readonly tickListeners = new Set<TickListener>();
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private started = false;
+  private polling = false;
+  // One follow-up poll queued when pokeNow lands mid-poll: an event may describe state the
+  // in-flight poll already read past, so we must re-poll once it settles.
+  private queuedPoll = false;
+  // When a phone last read this issance — see noteAttention. Epoch ms; 0 means "never", which reads
+  // as idle for any clock.
+  private lastReadAt = 0;
+  // One warn per disconnected episode, INCLUDING the episode that starts at boot. The old
+  // connected-gated warn was silent there, so a first poll losing the multiplexer's startup race
+  // left no trace at all — the one thing an operator needs to see when a cold herd reads empty.
+  private pollFailureLogged = false;
+  // Current interval cadence; setCadence swaps it (relaxed while the event stream is healthy).
+  private cadenceMs: number;
+  // A relax ordered before the engine has ever CONNECTED - parked, and applied by the first
+  // successful poll. See setCadence for why relaxing is earned rather than granted on an ack.
+  private pendingCadenceMs: number | null = null;
+  // The cadence the event watch asked for (setCadence), before any intent tightens it. The armed
+  // interval is `cadenceMs`; this is what it returns to when the hot spell ends.
+  private baseCadenceMs: number;
+  // Polls left in the hot spell an input bought (noteInput). Decays one per poll attempt.
+  private inputHotPolls = 0;
+  // Panes that became agents while this engine watched and have not named a session yet, each with
+  // the polls its hold has left. A hold ends on the event (the session seen, the pane gone) or, as
+  // the last resort, when its polls run out. See noteNewAgents.
+  private readonly sessionWaits = new Map<string, number>();
+  // Whether a poll has ever succeeded. The first poll's agents are not "new": they were there before
+  // the bridge came up, and holding the engine hot for each of them would spend a fast spell on every
+  // restart.
+  private sawHerd = false;
+  constructor(
+    private readonly mux: MuxAdapter,
+    private readonly pollMs: number,
+  ) {
+    this.cadenceMs = pollMs;
+    this.baseCadenceMs = pollMs;
+  }
+
+  onTransition(fn: TransitionListener): () => void {
+    this.transitionListeners.add(fn);
+    return () => this.transitionListeners.delete(fn);
+  }
+
+  /** Fires when a previously-seen agent pane vanishes (closed/exited) — used to retract its push. */
+  onRemove(fn: RemoveListener): () => void {
+    this.removeListeners.add(fn);
+    return () => this.removeListeners.delete(fn);
+  }
+
+  /** Fires after every successful poll (post-transition bookkeeping) with the fresh snapshot. */
+  onUpdate(fn: UpdateListener): () => void {
+    this.updateListeners.add(fn);
+    return () => this.updateListeners.delete(fn);
+  }
+
+  /**
+   * Fires after every poll ATTEMPT — success or failure, no snapshot handed over.
+   *
+   * This is the hook the crew's peer sweep rides (CREW_PROTOCOL.md §10.1: "the peer sweep is a part
+   * of the existing poll, not a second timer"), and it is deliberately not `onUpdate`: that one only
+   * fires on success, so a lead whose own Hangar socket is down would freeze every peer's freshness
+   * at the moment its local herd went away. A peer's reachability has nothing to do with the lead's
+   * Hangar, and two machines' outages must not be able to mask each other.
+   *
+   * With no listener — i.e. on every solo instance — this costs one iteration of an empty Set per
+   * poll and arms nothing (§11's "no second timer, no peer sweep").
+   */
+  onTick(fn: TickListener): () => void {
+    this.tickListeners.add(fn);
+    return () => this.tickListeners.delete(fn);
+  }
+
+  /**
+   * A phone just read this issance. Stamped by the two routes that mean somebody is LOOKING —
+   * `/api/snapshot` and `/api/pane/:id` — and by nothing else.
+   *
+   * Deliberately not every request: a push subscription, a config read or a preference write are
+   * things a background page does, and treating them as attention would keep a pocketed phone's
+   * census running fast forever.
+   */
+  noteAttention(now = Date.now()): void {
+    this.lastReadAt = now;
+  }
+
+  /**
+   * Is somebody watching right now? The bridge's answer, handed to the mux watch (mux/types.ts).
+   *
+   * `idle` until the first read, which is the honest starting state: a bridge that has just come up
+   * has nobody looking at it, and starting `watched` would spend a fast census on every restart.
+   */
+  attention(now = Date.now()): MuxAttention {
+    return now - this.lastReadAt <= ATTENTION_WINDOW_MS ? "watched" : "idle";
+  }
+
+  /**
+   * An input was just written to a pane through this bridge: typed text, keys, a quick reply, a
+   * dialog answer. The operator is watching for its effect, and some effects reach the multiplexer
+   * with no event at all (Hangar announces a session report to nobody, measured on 0.9.3), so the
+   * engine polls at the fast cadence for {@link HOT_POLLS} polls and then relaxes.
+   *
+   * An intent, not a timer: it re-arms the ONE interval (applyCadence), adds no second one, and
+   * decays by itself. It never polls by itself either; the next poll comes on the fast interval or
+   * on an event's poke, whichever is first. No-op once stopped.
+   */
+  noteInput(): void {
+    if (!this.started) return;
+    this.inputHotPolls = HOT_POLLS;
+    this.applyCadence(this.effectiveCadence());
+  }
+
+  /** Is an intent holding the engine at the fast cadence right now? For tests and diagnostics. */
+  hot(): boolean {
+    return this.inputHotPolls > 0 || this.sessionWaits.size > 0;
+  }
+
+  current(): EngineSnapshot {
+    const snap: EngineSnapshot = {
+      agents: this.agents,
+      shellPanes: this.shellPanes,
+      workspaces: this.workspaces,
+      tabs: this.tabs,
+      bridge: this.bridge,
+    };
+    if (this.muxFault !== undefined) snap.muxFault = this.muxFault;
+    return snap;
+  }
+
+  start(): void {
+    if (this.started) return;
+    this.started = true;
+    this.cadenceMs = this.pollMs;
+    this.baseCadenceMs = this.pollMs;
+    this.pendingCadenceMs = null;
+    this.inputHotPolls = 0;
+    this.sessionWaits.clear();
+    void this.poll();
+    this.timer = setInterval(() => void this.poll(), this.cadenceMs);
+  }
+
+  stop(): void {
+    this.started = false;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  /**
+   * Poll right now (event-poked). If a poll is already in flight, queue exactly one follow-up to run
+   * when it finishes — the event that poked us may describe state that poll already read past.
+   * No-op once stopped.
+   */
+  pokeNow(): void {
+    if (!this.started) return;
+    if (this.polling) {
+      this.queuedPoll = true;
+      return;
+    }
+    void this.poll();
+  }
+
+  /** Re-arm the interval at a new cadence (relaxed while events are healthy). No-op if unchanged or stopped. */
+  setCadence(ms: number): void {
+    if (!this.started) return;
+    // Relaxing is EARNED by a connected poll, never granted on the watch's ack alone. That ack
+    // proves the multiplexer answered a CENSUS - not that a snapshot succeeded, and `snapshot()`
+    // also runs list-tabs, which on a cold start can lose a race the census won. Relaxing on the
+    // ack alone leaves that miss standing for a whole idle interval; measured at 13.1 s on zellij.
+    //
+    // So a relax ordered while never-yet-connected is PARKED: the fast cadence keeps retrying, and
+    // the first connected poll applies it. A tighten always applies at once, and kills the parked
+    // relax - a watch that flapped down must not have its earlier relax resurrected by a later
+    // connect.
+    if (ms > this.pollMs && this.bridge !== "connected") {
+      this.pendingCadenceMs = ms;
+      return;
+    }
+    this.pendingCadenceMs = null;
+    this.baseCadenceMs = ms;
+    this.applyCadence(this.effectiveCadence());
+  }
+
+  /** The watch's cadence, tightened to the fast one while an intent holds the engine hot. */
+  private effectiveCadence(): number {
+    return this.hot() ? Math.min(this.pollMs, this.baseCadenceMs) : this.baseCadenceMs;
+  }
+
+  /**
+   * Spend one poll of every hot hold, and open a session-wait hold for each pane that has just become
+   * an agent with no session. Runs after every poll attempt; `agents` is null when the poll failed,
+   * which still spends a poll (a hold must decay against a dead multiplexer too) but proves nothing
+   * about any pane, so no hold ends on it.
+   *
+   * A pane joins the wait when it was not an agent on the previous successful poll and names no
+   * session now. It leaves on the EVENT: its session is seen, or it stops being an agent. Only a
+   * session that never comes spends the hold to its end. Hangar sends no event when a session is
+   * reported, so without this a pi or Claude pane sitting idle after its start is seen to have a
+   * session only on the next idle tick, 12 s later.
+   */
+  private noteNewAgents(agents: readonly AgentView[] | null, before: ReadonlySet<string>): void {
+    if (this.inputHotPolls > 0) this.inputHotPolls--;
+    for (const [id, left] of this.sessionWaits) {
+      if (left <= 1) this.sessionWaits.delete(id);
+      else this.sessionWaits.set(id, left - 1);
+    }
+    if (agents !== null) {
+      const live = new Map(agents.map((a) => [a.paneId, a]));
+      for (const id of this.sessionWaits.keys()) {
+        const a = live.get(id);
+        if (a === undefined || a.agentSession !== undefined) this.sessionWaits.delete(id);
+      }
+      if (this.sawHerd) {
+        for (const a of agents) {
+          if (!before.has(a.paneId) && a.agentSession === undefined) this.sessionWaits.set(a.paneId, HOT_POLLS);
+        }
+      }
+      this.sawHerd = true;
+    }
+    if (this.started) this.applyCadence(this.effectiveCadence());
+  }
+
+  /** Swap the interval to `ms` if it differs. The one place the poll timer is re-armed. */
+  private applyCadence(ms: number): void {
+    if (ms === this.cadenceMs) return;
+    this.cadenceMs = ms;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = setInterval(() => void this.poll(), ms);
+  }
+
+  private async poll(): Promise<void> {
+    // Skip the tick if the previous poll is still running — against a slow Hangar, back-to-back
+    // ticks would otherwise stack overlapping in-flight polls.
+    if (this.polling) return;
+    this.polling = true;
+    // The agent panes the previous successful poll saw, for noteNewAgents. Read before the poll
+    // rewrites prevStatus. `fresh` stays null when the poll fails.
+    const before = new Set(this.prevStatus.keys());
+    let fresh: AgentView[] | null = null;
+    try {
+      const { panes, spaces, tabs } = await this.mux.snapshot();
+
+      // ── ONE STABLE ORDER, AND IT IS THE MULTIPLEXER'S ─────────────────────
+      // Space, then tab, then pane, each read off the arrangement the mux reported: the tab's own
+      // index in `tabs`, and the pane's own index in `panes`. Nothing here sorts by pane id any
+      // more. A pane id is opaque (identity rule 1) and alphabetical order over opaque ids is an
+      // order nobody can see — `%10` before `%2`, `pN` before `pC` — so two panes side by side on
+      // the desk arrived at the phone in an order the desk never showed. Position is what the
+      // operator arranged, and position is what the phone now reads back.
+      const tabRank = new Map(tabs.map((t, i) => [t.tabId, i]));
+      const paneRank = new Map(panes.map((p, i) => [p.paneId, i]));
+      const byPlace = (a: AgentView, b: AgentView) =>
+        a.workspaceNumber - b.workspaceNumber ||
+        rankOf(tabRank, a.tabId) - rankOf(tabRank, b.tabId) ||
+        rankOf(paneRank, a.paneId) - rankOf(paneRank, b.paneId);
+
+      // PLACE ONLY, NEVER STATUS (ADR 0063). This list used to lead with STATUS_RANK, so every
+      // status flip re-sorted it and a pane jumped to the top when it blocked and back when it
+      // resumed. Every client surface kept that order (the pane strip, the space view, the
+      // switcher), so the pane the operator was aiming at moved under the thumb on each poll.
+      // Urgency is a mark the client paints; it is never a position.
+      const agents: AgentView[] = panes
+        .filter((p) => p.agent !== SHELL)
+        .map((p) => toView(p, "agent"))
+        .toSorted(byPlace);
+
+      // Bare shell panes (no agent), in the same place order so a space's panes read top-down.
+      const shellPanes: AgentView[] = panes
+        .filter((p) => p.agent === SHELL)
+        .map((p) => toView(p, "shell"))
+        .toSorted(byPlace);
+
+      const workspaceViews: WorkspaceView[] = spaces
+        .map((s) => {
+          const view: WorkspaceView = {
+            workspaceId: s.spaceId,
+            number: s.number,
+            label: s.label,
+            focused: s.focused,
+            activeTabId: s.activeTabId,
+            tabCount: s.tabCount,
+            paneCount: s.paneCount,
+          };
+          // Assigned only when there is one, so a space outside a repo carries no key at all: adding
+          // `repoRoot` to every space would move every snapshot ETag once for nothing (the argument
+          // bridge/types.ts makes about `crew`, applied here).
+          if (s.repoRoot !== undefined) {
+            view.repoRoot = s.repoRoot;
+            view.isWorktree = s.isWorktree === true;
+          }
+          if (s.folder !== undefined) view.folder = s.folder;
+          return view;
+        })
+        .toSorted((a, b) => a.number - b.number);
+
+      const tabViews: TabView[] = tabs.map((t) => ({
+        tabId: t.tabId,
+        workspaceId: t.spaceId,
+        number: t.number,
+        label: t.label,
+        focused: t.focused,
+        paneCount: t.paneCount,
+      }));
+
+      // Each pane learns its position in its tab and, when it is alone in a tab the operator named,
+      // that name (types.ts § soleTabName). Position is the pane's index in the mux listing among the
+      // panes of its tab, the same arrangement `byPlace` reads.
+      const tabPanes = new Map(tabs.map((t) => [t.tabId, t.paneCount]));
+      const source = new Map(panes.map((p) => [p.paneId, p]));
+      const position = new Map<string, number>();
+      const perTab = new Map<string, number>();
+      for (const p of panes) {
+        const i = perTab.get(p.tabId) ?? 0;
+        perTab.set(p.tabId, i + 1);
+        position.set(p.paneId, i);
+      }
+      for (const v of [...agents, ...shellPanes]) {
+        const pos = position.get(v.paneId);
+        if (pos !== undefined) v.tabPosition = pos;
+        const raw = source.get(v.paneId);
+        const label = raw?.tabLabel?.trim();
+        if (tabPanes.get(v.tabId) === 1 && raw?.tabNamed === true && label) v.soleTabName = label;
+      }
+
+      // Detect transitions against the previous poll. First sighting of a pane never fires a
+      // transition (so we don't notify for agents already blocked when the bridge starts).
+      for (const a of agents) {
+        const prev = this.prevStatus.get(a.paneId);
+        if (prev !== undefined && prev !== a.status) {
+          for (const fn of this.transitionListeners) fn(a, prev, a.status);
+        }
+        this.prevStatus.set(a.paneId, a.status);
+      }
+      const live = new Set(agents.map((a) => a.paneId));
+      for (const id of this.prevStatus.keys()) {
+        if (live.has(id)) continue;
+        this.prevStatus.delete(id);
+        this.sessionNames.delete(id); // drop the cached name so a reused pane id starts clean
+        this.enrichedAt.delete(id);
+        for (const fn of this.removeListeners) fn(id);
+      }
+
+      // Enrich claude panes with their own `/rename` session name (read from pane text). Best-effort:
+      // a failed read keeps the last-known name and never fails the poll. The revision map lets
+      // unchanged panes skip the readGrid RPC entirely.
+      const revisions = new Map<string, number>();
+      for (const p of panes) {
+        if (p.revision !== undefined) revisions.set(p.paneId, p.revision);
+      }
+      await this.enrichSessionNames(agents, revisions);
+
+      this.agents = agents;
+      fresh = agents;
+      this.shellPanes = shellPanes;
+      this.workspaces = workspaceViews;
+      this.tabs = tabViews;
+      this.bridge = "connected";
+      this.muxFault = undefined;
+      this.pollFailureLogged = false;
+      // The relax the watch ordered while we had never yet connected - earned now.
+      if (this.pendingCadenceMs !== null) {
+        this.baseCadenceMs = this.pendingCadenceMs;
+        this.pendingCadenceMs = null;
+      }
+
+      // After all transition/removal bookkeeping so listeners see a consistent, current snapshot.
+      const snap = this.current();
+      for (const fn of this.updateListeners) fn(snap);
+    } catch (err) {
+      if (!this.pollFailureLogged) {
+        this.pollFailureLogged = true;
+        console.warn(`[state] poll failed, marking disconnected: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      this.bridge = "disconnected";
+      this.muxFault = muxFaultOf(err instanceof Error ? err.message : String(err));
+    } finally {
+      this.polling = false;
+      // The hot holds, spent and re-judged on every attempt, and the interval re-armed to match. This
+      // is also where a relax the watch parked before the first connect is applied.
+      this.noteNewAgents(fresh, before);
+      // Every poll attempt, however it went (see onTick). Listener throws are contained: a tick
+      // subscriber must never be able to break the poll loop that hosts it.
+      for (const fn of this.tickListeners) {
+        try {
+          fn();
+        } catch (err) {
+          console.warn(`[state] tick listener failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      // Run the single follow-up an event-poke asked for while this poll was in flight.
+      if (this.queuedPoll) {
+        this.queuedPoll = false;
+        if (this.started) void this.poll();
+      }
+    }
+  }
+
+  /**
+   * Read each claude pane's visible text and attach its `/rename` session name (see
+   * {@link extractClaudeSessionName}) to the view, exactly parallel to `paneLabel`. The name lives
+   * only in the pane's rendered text — Hangar's pane metadata doesn't carry it — so this is the one
+   * place all panes can pick it up (the web app only holds text for the open pane). Reads run in
+   * parallel and are individually best-effort: a read that fails or times out, or a screen with no
+   * input box in view, keeps the last-known name (sticky cache) and never fails the poll; an input
+   * box that shows no name drops it. Claude-only; other harnesses never set it. A
+   * multiplexer that cannot hand over a rendered grid declines the read, which reads here as
+   * "keep whatever's cached" — exactly like a read that failed.
+   */
+  private async enrichSessionNames(
+    agents: AgentView[],
+    revisions: Map<string, number>,
+  ): Promise<void> {
+    const claude = agents.filter((a) => a.agent === "claude");
+    if (claude.length === 0) return;
+    await Promise.all(
+      claude.map(async (a) => {
+        const rev = revisions.get(a.paneId);
+        if (rev !== undefined) {
+          const prev = this.enrichedAt.get(a.paneId);
+          if (prev !== undefined && prev === rev) return;
+        }
+        try {
+          // `viewport` — never `recent`; see SESSION_NAME_READ_LINES for what a `recent` read does
+          // to the operator's screen. The viewport is also strictly safer to parse: `recent` hands
+          // back transcript scrollback, where Claude echoes past user messages as `❯ …` lines that
+          // the prompt anchor would have to discriminate against. `preserve` because colour is the
+          // only thing that tells a `/rename` name from a mode badge Claude draws in the same rule.
+          const read = await this.mux.readGrid(a.paneId, {
+            scope: "viewport",
+            lines: SESSION_NAME_READ_LINES,
+            styling: "preserve",
+          });
+          if (!read.ok) return;
+          const name = extractClaudeSessionName(read.value.text);
+          // An input box in view with no name forgets the old one: a name renamed away, or a badge
+          // once mistaken for a name, must not outlive the screen that showed it.
+          if (name) this.sessionNames.set(a.paneId, name);
+          else if (name === null) this.sessionNames.delete(a.paneId);
+          if (rev !== undefined) this.enrichedAt.set(a.paneId, rev);
+        } catch {
+          // Keep whatever's cached (if anything) — a transient read failure must not blank the name.
+        }
+      }),
+    );
+    for (const a of agents) {
+      const name = this.sessionNames.get(a.paneId);
+      if (name) a.sessionName = name;
+    }
+  }
+}

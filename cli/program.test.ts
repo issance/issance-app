@@ -1,0 +1,616 @@
+import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+
+import { CREW_SUBCOMMANDS } from "./crew.ts";
+import { DEVICES_SUBCOMMANDS } from "./pairing.ts";
+import { PUSH_SUBCOMMANDS } from "./push.ts";
+import { STT_SUBCOMMANDS } from "./stt.ts";
+import { CONFIG_SUBCOMMANDS } from "./config.ts";
+import { WALKY_SUBCOMMANDS } from "./walky.ts";
+import { DURABLE_SUBCOMMANDS } from "./durable-attach.ts";
+import {
+  type Command,
+  COMMANDS,
+  EXIT,
+  findCommand,
+  helpText,
+  type Io,
+  normalizeArgv,
+  run,
+  usageLine,
+} from "./program.ts";
+
+// The dispatch surface is a contract with the plugin manifest and with anyone's muscle memory from
+// `issance-ctl.sh`, so the verb table and the 0/1/2 exit codes are pinned here rather than left to
+// whatever the last edit happened to leave behind.
+
+// Every verb the shell dispatched, in its order, before M6/01 reduced `scripts/issance-ctl.sh` to a
+// bootstrap shim that `exec`s this binary. A `issance-ctl.sh <verb>` spelling — a README recipe, a
+// <0.8.0 Hangar install's cached action set (ADR 0006) — still lands on exactly this table.
+const SHELL_VERBS = [
+  "start",
+  "stop",
+  "restart",
+  "uninstall",
+  "update",
+  "_apply-update",
+  // `_mux-probe` has no shell ancestor either. It is declared beside `_apply-update` because it is
+  // the same kind of verb — plumbing another issance spells, never an operator — and `crew add` runs
+  // it on the member it has just installed (cli/mux-probe.ts).
+  "_mux-probe",
+  // `_whistle-transcribe` has no shell ancestor either: the bridge's whistle provider spawns it
+  // (ADR 0096). Dispatched from cli/main.ts's bootstrap.
+  "_whistle-transcribe",
+  "_exec-bridge",
+  // The Windows launcher has no shell ancestor: it is the Task Scheduler half of what the community
+  // Windows script did, and it sits beside the process it launches (M43 spec 05).
+  "_supervise",
+  "build",
+  "serve",
+  "unserve",
+  "status",
+  "url",
+  "qr",
+  "version",
+  // `push-keys` has no shell ancestor on this branch — main implemented it in `issance-ctl.sh`
+  // because it has no `cli/`; here it is a verb like every other, and the shim delegates it. It
+  // sits beside `push-test` because both keep the hyphenated spelling the Hangar action names.
+  "push-keys",
+  "push-test",
+  "logs",
+];
+
+// The crew verbs (M4/07, renamed in M24). They have no shell ancestor — `issance-ctl.sh` never knew
+// about federation — so they are listed separately: the assertion above is "the port kept every verb
+// the shell had", and this one is "the binary grew exactly these". `crew` is the alias of `crew`
+// (ADR 0038); it sits right after it in the table and is internal, so the usage line never names it.
+const CREW_VERBS = ["join", "leave", "crew", "pack", "promote", "reconnect"];
+
+// The diagnostic verbs (M7/02). No shell ancestor either, and they sit between the two groups above
+// because that is where they are declared — the usage line's order is the table's order.
+const DIAGNOSTIC_VERBS = ["doctor"];
+
+// The PATH-name verbs (ADR 0021). No shell ancestor either, and declared right after the
+// diagnostics — they answer "where does the binary live", not "is the service healthy".
+const LINK_VERBS = ["link", "unlink"];
+
+// The agent-beacon verbs (M11/02). Declared right after the PATH-name pair because `hooks install`
+// writes that published name into the agent's own settings.json (ADR 0021), and `beacon` is the
+// internal emitter the entry it writes calls.
+const BEACON_VERBS = ["hooks", "beacon"];
+
+// The device-pairing verbs. Declared between the diagnostics and the crew, because that is where
+// they sit in the table, and grouped separately for the same reason as the two above.
+const PAIRING_VERBS = ["pair", "devices"];
+
+// The push-subscription verb (#104). `push-test` sits in SHELL_VERBS above — it is the shell's, and
+// keeps its spelling — while `push` is the tree that grew around it, declared next to `devices`
+// because it answers the same question about a different register.
+const PUSH_VERBS = ["push"];
+
+// Speech-to-text (ADR 0029). Declared after `push` because it belongs to the same group: things the
+// operator's own terminal is the only right place to configure, because they mint or accept a
+// credential.
+const STT_VERBS = ["stt"];
+/** The config-file tree (ADR 0040). Declared right after `stt`, for the same reasons. */
+const CONFIG_VERBS = ["config"];
+const DURABLE_VERBS = ["durable"];
+// Walky talky (M62). Declared after `durable`. One spelling: the `wt` alias was dropped before
+// release, because Windows Terminal's binary is `wt.exe`.
+const WALKY_VERBS = ["walky"];
+// The manual, printed out of the binary: `issance skill` for an AI agent, `issance docs` for the
+// operator pages. Neither was ever a shell verb — there was nothing to print before it was embedded.
+const MANUAL_VERBS = ["skill", "docs"];
+
+function capture(): Io & { stdout: string[]; stderr: string[] } {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  return { stdout, stderr, out: (l) => stdout.push(l), err: (l) => stderr.push(l) };
+}
+
+describe("the verb table", () => {
+  test("covers every verb the shell dispatches, plus help", () => {
+    expect(COMMANDS.map((c) => c.name)).toEqual([
+      ...SHELL_VERBS,
+      ...DIAGNOSTIC_VERBS,
+      ...LINK_VERBS,
+      ...BEACON_VERBS,
+      ...PAIRING_VERBS,
+      ...PUSH_VERBS,
+      ...STT_VERBS,
+      ...CONFIG_VERBS,
+      ...DURABLE_VERBS,
+      ...WALKY_VERBS,
+      ...CREW_VERBS,
+      ...MANUAL_VERBS,
+      "help",
+    ]);
+  });
+
+  test("hides exactly the shell's internal verbs from the usage line", () => {
+    expect(COMMANDS.filter((c) => c.internal === true).map((c) => c.name)).toEqual([
+      "_apply-update",
+      "_mux-probe",
+      "_whistle-transcribe",
+      "_exec-bridge",
+      "_supervise",
+      // The emitter is spelled by a hook, never typed — see cli/beacon.ts.
+      "beacon",
+      // The `crew` alias. Dispatchable, but never named in the usage line (ADR 0038).
+      "pack",
+    ]);
+  });
+
+  test("the usage line names every public verb", () => {
+    const line = usageLine();
+    for (const c of COMMANDS) {
+      if (c.internal === true) continue;
+      expect(line).toContain(c.name);
+    }
+    expect(line.startsWith("usage: issance {")).toBe(true);
+  });
+
+  test("no verb name is duplicated", () => {
+    const names = COMMANDS.map((c) => c.name);
+    expect(new Set(names).size).toBe(names.length);
+  });
+
+  test("every verb has a summary", () => {
+    for (const c of COMMANDS) expect(c.summary.length).toBeGreaterThan(0);
+  });
+
+  // ADR 0038 removes the `issance pack` alias in 2.0.0. Today this passes because the version is
+  // 1.x and the assertion is not reached; the day the major moves to 2, it fails until the entry
+  // is deleted, so the removal is remembered by the test suite and not by anyone's memory.
+  test("the `crew` alias is gone in 2.0.0", () => {
+    const pkg = readFileSync(new URL("../package.json", import.meta.url), "utf8");
+    const major = Number.parseInt(/"version": *"(\d+)\./.exec(pkg)?.[1] ?? "", 10);
+    expect(Number.isNaN(major)).toBe(false);
+    if (major < 2) return;
+    expect(COMMANDS.map((c) => c.name)).not.toContain("pack");
+  });
+});
+
+// ── The grammar commander now owns ───────────────────────────────────────────
+// These used to be assertions about `parseArgv`, the hand-rolled splitter commander replaced. They
+// are asserted through `run` now — the parser is an implementation detail, "what does typing this
+// do" is the contract. Every verb below is a spy, so nothing here touches the world.
+describe("dispatch", () => {
+  /** A stand-in verb and the argv rows it was dispatched with, newest last. */
+  interface Spy {
+    command: Command;
+    seen: string[][];
+  }
+
+  function spy(name: string, sub?: readonly string[]): Spy {
+    const seen: string[][] = [];
+    const command: Command = {
+      name,
+      summary: `spy on ${name}`,
+      subcommands: sub?.map((s) => ({
+        name: s,
+        summary: `spy on ${name} ${s}`,
+        run: (args) => {
+          seen.push([s, ...args]);
+          return EXIT.OK;
+        },
+      })),
+      run: (args) => {
+        seen.push(["(parent)", ...args]);
+        return EXIT.OK;
+      },
+    };
+    return { command, seen };
+  }
+
+  // Every dispatch below goes through this helper rather than a literal `run([…])`, so the
+  // "no world-touching verb is spelled out in this file" grep further down stays honest: these
+  // argvs name real verbs, but they land on the spy table passed alongside them, never on COMMANDS.
+  const go = (argv: string[], commands: readonly Command[]) => run(argv, capture(), commands);
+
+  test("a known verb carries its remaining args, flags and all, in order", async () => {
+    const { command, seen } = spy("logs");
+    expect(await go(["logs", "200"], [command])).toBe(EXIT.OK);
+    expect(await go(["logs", "--json", "-n", "7"], [command])).toBe(EXIT.OK);
+    expect(seen).toEqual([
+      ["(parent)", "200"],
+      ["(parent)", "--json", "-n", "7"],
+    ]);
+  });
+
+  // #392: `issance update --help` began a real update. The table below is the REAL verb list with
+  // every body swapped for a spy, so a verb that runs on `--help` shows up here by name and nothing
+  // in this file can touch the machine.
+  interface Spied {
+    table: Command[];
+    ran: string[];
+  }
+
+  function spied(): Spied {
+    const ran: string[] = [];
+    const table: Command[] = COMMANDS.map((c) => ({
+      ...c,
+      run: (args) => {
+        ran.push([c.name, ...args].join(" "));
+        return EXIT.OK;
+      },
+      subcommands: c.subcommands?.map((sub) => ({
+        ...sub,
+        run: (args) => {
+          ran.push([c.name, sub.name, ...args].join(" "));
+          return EXIT.OK;
+        },
+      })),
+    }));
+    return { table, ran };
+  }
+
+  test("`--help` and `-h` print the verb's usage and never run the verb", async () => {
+    for (const argv of [
+      ["update", "--help"],
+      ["update", "-h"],
+      ["restart", "--help"],
+      ["uninstall", "--help"],
+      ["crew", "update", "--help"],
+      ["crew", "add", "-h"],
+      ["pack", "update", "--help"],
+      ["build", "--help"],
+      ["update", "--major", "--help"],
+    ]) {
+      const { table, ran } = spied();
+      const io = capture();
+      expect(await run(argv, io, table)).toBe(EXIT.OK);
+      expect(ran).toEqual([]);
+      expect(io.stderr).toEqual([]);
+      expect(io.stdout[0]).toBe(`usage: issance ${argv.filter((a) => !a.startsWith("-")).join(" ")} [options]`);
+    }
+  });
+
+  test("every non-parent verb and every sub-verb answers `--help` without running", async () => {
+    for (const c of COMMANDS) {
+      const argvs = c.subcommands === undefined ? [[c.name]] : c.subcommands.map((sub) => [c.name, sub.name]);
+      for (const argv of argvs) {
+        const { table, ran } = spied();
+        const io = capture();
+        // An internal verb fails loudly instead: only another issance spells it, so `--help` there is
+        // a wrong argv, and exit 0 would let an update report success with nothing swapped.
+        const internal = c.name.startsWith("_");
+        expect(await run([...argv, "--help"], io, table)).toBe(internal ? EXIT.USAGE : EXIT.OK);
+        expect(ran).toEqual([]);
+        expect((internal ? io.stderr : io.stdout).length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  test("`_apply-update --help` runs nothing and exits non-zero", async () => {
+    const { table, ran } = spied();
+    const io = capture();
+    expect(await run(["_apply-update", "--to", "v1.0.0", "--help"], io, table)).toBe(EXIT.USAGE);
+    expect(ran).toEqual([]);
+    expect(io.stdout).toEqual([]);
+    expect(io.stderr.join("\n")).toContain("nothing was run");
+  });
+
+  test("the usage names the summary of the verb asked about", async () => {
+    const { table } = spied();
+    const io = capture();
+    await run(["update", "--help"], io, table);
+    expect(io.stdout.join("\n")).toContain(findCommand("update")!.summary);
+  });
+
+  test("`hooks install --help` names the Claude-only `--hold-permissions` flag", async () => {
+    const { table, ran } = spied();
+    const io = capture();
+    expect(await run(["hooks", "install", "--help"], io, table)).toBe(EXIT.OK);
+    expect(ran).toEqual([]);
+    expect(io.stdout.join("\n")).toContain("--hold-permissions");
+  });
+
+  test("only an argument before `--` is a help request", async () => {
+    const { command, seen } = spy("rename");
+    const io = capture();
+    expect(await run(["rename", "--", "--help"], io, [command])).toBe(EXIT.OK);
+    expect(await run(["rename", "a", "--", "-h"], io, [command])).toBe(EXIT.OK);
+    expect(io.stdout).toEqual([]);
+    // A leading `--` is commander's own, and does not hide a help request that follows the verb.
+    const { table, ran } = spied();
+    expect(await run(["--", "update", "--help"], capture(), table)).toBe(EXIT.OK);
+    expect(ran).toEqual([]);
+    expect(seen.length).toBe(2);
+    expect(seen.every((row) => row[0] === "(parent)")).toBe(true);
+    expect(seen[0]).toContain("--help");
+    expect(seen[1]).toContain("-h");
+  });
+
+  test("a parent verb's own action is untouched: it is already a usage printer", async () => {
+    const { command, seen } = spy("crew", ["status"]);
+    expect(await go(["crew", "--help"], [command])).toBe(EXIT.OK);
+    expect(seen).toEqual([["(parent)", "--help"]]);
+  });
+
+  test("a sub-verb is guarded too, and its siblings still run", async () => {
+    const { command, seen } = spy("crew", ["status", "invite"]);
+    const io = capture();
+    expect(await run(["crew", "status", "--help"], io, [command])).toBe(EXIT.OK);
+    expect(seen).toEqual([]);
+    expect(io.stdout[0]).toBe("usage: issance crew status [options]");
+    expect(await run(["crew", "invite", "--no-probe"], capture(), [command])).toBe(EXIT.OK);
+    expect(seen).toEqual([["invite", "--no-probe"]]);
+  });
+
+  test("a subcommand is matched by name; anything else reaches the parent", async () => {
+    const { command, seen } = spy("crew", ["invite", "status"]);
+    for (const argv of [["crew", "status", "--no-probe"], ["crew"], ["crew", "nonsense"]]) {
+      expect(await go(argv, [command])).toBe(EXIT.OK);
+    }
+    expect(seen).toEqual([
+      ["status", "--no-probe"],
+      ["(parent)"],
+      ["(parent)", "nonsense"],
+    ]);
+  });
+
+  test("an internal verb is dispatchable even though it is not advertised", async () => {
+    const { command, seen } = spy("_exec-bridge");
+    const internal: Command = { ...command, internal: true };
+    expect(await go(["_exec-bridge"], [internal])).toBe(EXIT.OK);
+    expect(seen).toEqual([["(parent)"]]);
+    expect(usageLine([internal])).toBe("usage: issance {}");
+  });
+
+  test("--plain is accepted anywhere and never reaches the verb", async () => {
+    const { command, seen } = spy("crew", ["status"]);
+    expect(await go(["--plain", "crew", "status"], [command])).toBe(EXIT.OK);
+    expect(await go(["crew", "status", "--plain", "--no-probe"], [command])).toBe(EXIT.OK);
+    expect(seen).toEqual([
+      ["status"],
+      ["status", "--no-probe"],
+    ]);
+  });
+
+  test("a verb's exit code is the run's exit code — every family, unaltered", async () => {
+    for (const code of [EXIT.OK, EXIT.FAIL, EXIT.USAGE, EXIT.STATE, EXIT.REFUSED, EXIT.UNREACHABLE]) {
+      const command: Command = { name: "x", summary: "returns a code", run: () => code };
+      expect(await go(["x"], [command])).toBe(code);
+    }
+  });
+});
+
+describe("the subcommand trees", () => {
+  test("`crew` declares exactly `cli/crew.ts`'s sub-verbs, in its order", () => {
+    const crew = findCommand("crew");
+    expect(crew?.subcommands?.map((s) => s.name)).toEqual([...CREW_SUBCOMMANDS]);
+  });
+
+  test("`devices` declares exactly `cli/pairing.ts`'s sub-verbs, in its order", () => {
+    const devices = findCommand("devices");
+    expect(devices?.subcommands?.map((s) => s.name)).toEqual([...DEVICES_SUBCOMMANDS]);
+  });
+
+  test("`push` declares exactly `cli/push.ts`'s sub-verbs, in its order", () => {
+    expect(findCommand("push")?.subcommands?.map((s) => s.name)).toEqual([...PUSH_SUBCOMMANDS]);
+  });
+
+  test("`stt` declares exactly `cli/stt.ts`'s sub-verbs, in its order", () => {
+    expect(findCommand("stt")?.subcommands?.map((s) => s.name)).toEqual([...STT_SUBCOMMANDS]);
+  });
+
+  test("`config` declares exactly `cli/config.ts`'s sub-verbs, in its order", () => {
+    expect(findCommand("config")?.subcommands?.map((s) => s.name)).toEqual([...CONFIG_SUBCOMMANDS]);
+  });
+
+  test("`walky` declares exactly `cli/walky.ts`'s sub-verbs, and there is no `wt` alias", () => {
+    expect(findCommand("walky")?.subcommands?.map((s) => s.name)).toEqual([...WALKY_SUBCOMMANDS]);
+    expect(findCommand("wt")).toBeUndefined();
+  });
+
+  test("`durable` declares exactly `cli/durable-attach.ts`'s sub-verbs, in its order", () => {
+    expect(findCommand("durable")?.subcommands?.map((s) => s.name)).toEqual([...DURABLE_SUBCOMMANDS]);
+  });
+
+  test("no other verb declares a tree — the grammar is one level deep everywhere else", () => {
+    expect(COMMANDS.filter((c) => c.subcommands !== undefined).map((c) => c.name)).toEqual([
+      "hooks",
+      "beacon",
+      "devices",
+      "push",
+      "stt",
+      "config",
+      "durable",
+      "walky",
+      "crew",
+      // The alias carries the SAME array — that is what `cli/crew.test.ts` pins.
+      "pack",
+      // `skill` is a leaf that prints the general brief, and a tree for the walky talky installer.
+      "skill",
+    ]);
+  });
+});
+
+describe("exit codes", () => {
+  test("an unknown verb exits 2 with the usage line on stderr", async () => {
+    const io = capture();
+    expect(await run(["nonsense"], io)).toBe(EXIT.USAGE);
+    expect(io.stdout).toEqual([]);
+    expect(io.stderr.join("\n")).toContain("unknown command `nonsense`");
+    expect(io.stderr.join("\n")).toContain(usageLine());
+  });
+
+  test("no verb exits 2 with usage but does not accuse the user of typing something", async () => {
+    const io = capture();
+    expect(await run([], io)).toBe(EXIT.USAGE);
+    expect(io.stderr.join("\n")).not.toContain("unknown command");
+    expect(io.stderr.join("\n")).toContain(usageLine());
+  });
+
+  test("help exits 0 on stdout — it is output, not a diagnostic", async () => {
+    const io = capture();
+    expect(await run(["--help"], io)).toBe(EXIT.OK);
+    expect(io.stderr).toEqual([]);
+    expect(io.stdout.join("\n")).toContain(usageLine());
+    for (const c of COMMANDS) {
+      if (c.internal === true) continue;
+      expect(io.stdout.join("\n")).toContain(c.summary);
+    }
+  });
+
+  // Three spellings, one text. `help` is a verb in the table, `-h`/`--help` are commander's, and
+  // commander is configured to print this file's `helpText` for both — so they cannot drift apart.
+  test("`help`, `-h` and `--help` print the identical body", async () => {
+    for (const spelling of ["help", "-h", "--help"]) {
+      const io = capture();
+      expect(await run([spelling], io)).toBe(EXIT.OK);
+      expect(io.stderr).toEqual([]);
+      expect(io.stdout).toEqual(helpText());
+    }
+  });
+
+  test("the help body names --plain and hides every internal verb", async () => {
+    const body = helpText().join("\n");
+    expect(body).toContain("--plain");
+    for (const c of COMMANDS) if (c.internal === true) expect(body).not.toContain(c.name);
+    // The Windows launcher by name: Task Scheduler runs it, an operator never types it.
+    expect(findCommand("_supervise")?.internal).toBe(true);
+    expect(body).not.toContain("_supervise");
+  });
+
+  test("an unknown verb with arguments is still reported by its own name", async () => {
+    const io = capture();
+    expect(await run(["nonsense", "--flag", "x"], io)).toBe(EXIT.USAGE);
+    expect(io.stderr.join("\n")).toContain("unknown command `nonsense`");
+  });
+
+  // NOTHING in this file may dispatch a verb that touches the world. Dispatching `start` here would
+  // write a unit into the developer's own ~/.config and `enable --now` it; dispatching `build` did
+  // exactly this once during M3/04 and rebuilt the DEPLOYMENT HOST's live bundle from a dirty tree.
+  // Those verbs are covered in their own suites against fakes, and end to end in
+  // scripts/issance-cli.test.sh against a scratch PATH and a throwaway $HOME.
+  //
+  // `version` and `help` are the only verbs this file may run: they read, they never write.
+  test("every verb is dispatchable, and only the two read-only ones may be run here", () => {
+    const worldTouching = [
+      "start",
+      "stop",
+      "restart",
+      "uninstall",
+      "update",
+      "_apply-update",
+      // It probes THIS machine's multiplexers — `tmux list-sessions` and `zellij list-sessions`
+      // against the developer's own servers. cli/mux.test.ts drives it against fakes.
+      "_mux-probe",
+      // It loads a speech engine and a 17 MB model. cli/whistle-transcribe.test.ts drives it.
+      "_whistle-transcribe",
+      "_exec-bridge",
+      // The Windows launcher writes a record into the config dir and runs a bridge until one exits 0.
+      // cli/task-scheduler.test.ts drives its loop against fakes.
+      "_supervise",
+      "build",
+      "serve",
+      "unserve",
+      "status",
+      "logs",
+      "push-keys",
+      "push-test",
+      "url",
+      // `qr` shells out to `tailscale` to decide which URL is worth encoding.
+      "qr",
+      // Every crew verb writes the trust store, dials another machine, or restarts the service —
+      // and `crew` with no subcommand would still resolve a real context and a real audit path. All
+      // of them are covered in cli/crew.test.ts against fakes.
+      ...CREW_VERBS,
+      // `doctor` writes nothing, but it is not runnable here either: it shells out to `tailscale`
+      // and would dial this host's real crew members. cli/doctor.test.ts drives it against fakes.
+      ...DIAGNOSTIC_VERBS,
+      // `link`/`unlink` write into the developer's own `~/.local/bin` — the one place a test must
+      // not publish a name. cli/link.test.ts drives both against a fake symlink seam.
+      ...LINK_VERBS,
+      // `pair` writes a pending pairing into the developer's own state dir, and `devices` resolves
+      // that same real dir before it decides anything. cli/pairing.test.ts drives both against fakes.
+      ...PAIRING_VERBS,
+      // Every `push` sub-verb resolves the real state dir, and `push test` would send to this host's
+      // own subscribed phones. cli/push.test.ts drives all three against a throwaway dir.
+      ...PUSH_VERBS,
+      // `stt setup` writes a provider credential into the developer's own state dir, and every other
+      // sub-verb resolves that same real dir before it decides anything. cli/stt.test.ts drives all
+      // four against fakes.
+      ...STT_VERBS,
+      // `hooks` edits the developer's own ~/.claude/settings.json, and `hooks status` resolves the
+      // same real paths before it reads them. cli/hooks.test.ts drives all three against fakes.
+      // `beacon` is world-touching in the other direction: it would write a beacon into this host's
+      // real state dir. cli/beacon.test.ts drives it against fakes.
+      ...BEACON_VERBS,
+      // `config init` writes a file into the developer's own `~/.issance`, and `show`/`check` resolve
+      // that same real path before they decide anything. cli/config.test.ts drives all three against
+      // fakes in a temp dir.
+      ...CONFIG_VERBS,
+      ...DURABLE_VERBS,
+      // `walky` talks to this host's running bridges over their local sockets, and a `send`
+      // would type into a real pane. cli/walky.test.ts drives every sub-verb against a temp socket.
+      ...WALKY_VERBS,
+    ];
+    // `skill` and `docs` print text compiled into this binary. They read nothing, resolve no state
+    // dir and touch no machine, so the suite may run them for real.
+    const readOnly = ["version", "help", "skill", "docs"];
+    for (const name of [...worldTouching, ...readOnly]) expect(findCommand(name)).toBeDefined();
+    expect([...worldTouching, ...readOnly].length).toBe(COMMANDS.length);
+    // The grep stops at the verb's closing quote, NOT at the `"]` that used to follow it: a verb
+    // dispatched WITH arguments — a comma where the bracket was — slipped straight through the
+    // narrower form. (Which is also why this comment cannot spell one out; it would match itself.)
+    const source = readFileSync(new URL("./main.test.ts", import.meta.url), "utf8");
+    for (const name of worldTouching) expect(source).not.toContain(`run(["${name}"`);
+  });
+
+  test("a verb that throws becomes an operational failure, not a stack trace", async () => {
+    const io = capture();
+    const boom: Command = {
+      name: "boom",
+      summary: "explodes",
+      run() {
+        throw new Error("kaboom");
+      },
+    };
+    expect(await run(["boom"], io, [boom])).toBe(EXIT.FAIL);
+    expect(io.stderr.join("\n")).toContain("kaboom");
+    expect(io.stderr.join("\n")).not.toContain("at ");
+  });
+
+  test("version prints one undecorated line to stdout and exits 0", async () => {
+    const io = capture();
+    expect(await run(["version"], io)).toBe(EXIT.OK);
+    expect(io.stdout).toHaveLength(1);
+    expect(io.stdout[0]!.trim()).toBe(io.stdout[0]!);
+    expect(io.stdout[0]).not.toBe("");
+  });
+
+  // F20: both of these answered `error: unknown command \`--version\`` — a verb table that knows
+  // `version` refusing the flag spelling of it is a distinction only the implementer can see.
+  for (const spelling of ["--version", "-V"]) {
+    test(`\`issance ${spelling}\` prints the version, exactly as \`issance version\` does`, async () => {
+      const plain = capture();
+      const flagged = capture();
+      expect(await run(["version"], plain)).toBe(EXIT.OK);
+      expect(await run([spelling], flagged)).toBe(EXIT.OK);
+      expect(flagged.stdout).toEqual(plain.stdout);
+      expect(flagged.stderr).toEqual([]);
+    });
+  }
+
+  test("only the FIRST argument is rewritten — a verb keeps its own flags", () => {
+    expect(normalizeArgv(["--version"])).toEqual(["version"]);
+    expect(normalizeArgv(["-V"])).toEqual(["version"]);
+    expect(normalizeArgv(["logs", "--version"])).toEqual(["logs", "--version"]);
+    expect(normalizeArgv(["--skill"])).toEqual(["skill"]);
+    expect(normalizeArgv(["logs", "--skill"])).toEqual(["logs", "--skill"]);
+    // `-v` is left for a future `--verbose`; a flag that changes meaning later is worse than none.
+    expect(normalizeArgv(["-v"])).toEqual(["-v"]);
+    expect(normalizeArgv([])).toEqual([]);
+  });
+});
+
+describe("findCommand", () => {
+  test("resolves by exact name only — no prefixes, no aliases", () => {
+    expect(findCommand("version")?.name).toBe("version");
+    expect(findCommand("vers")).toBeUndefined();
+    expect(findCommand("VERSION")).toBeUndefined();
+  });
+});

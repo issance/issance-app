@@ -1,0 +1,221 @@
+import { describe, expect, it } from "vitest";
+
+import { keysSendable, muxCapability, muxTopologyLatency, scopedMuxConfig, sessionMuxConfig } from "./mux-capability";
+import type { MuxConfig } from "./types";
+
+// The two rules every gated control in the app leans on, asserted where they live rather than
+// through eight rendered components: an unanswered capability is PRESENT, and an explanation's words
+// are the adapter's own. mux-gated-controls.test.tsx then proves each control obeys them.
+
+/** A fabricated declaration. The name is deliberately not a real multiplexer's — nothing reads it. */
+function cfg(over: Partial<MuxConfig> = {}): MuxConfig {
+  return { name: "reference", capabilities: {}, unsupportedKeys: [], notes: {}, ...over };
+}
+
+describe("muxCapability — the default is CAPABLE, and only an explicit no is a no", () => {
+  it("no config at all reads as capable: an older bridge must not hide working controls", () => {
+    expect(muxCapability(null, "createSpace").capable).toBe(true);
+    expect(muxCapability(null, "agentSessionRef").capable).toBe(true);
+  });
+
+  it("a config that does not mention the capability reads as capable", () => {
+    // The mid-upgrade case: a bridge that has never heard of a capability this bundle knows.
+    expect(muxCapability(cfg(), "createSpace").capable).toBe(true);
+  });
+
+  it("`true` is capable and `false` is not — nothing else moves the answer", () => {
+    expect(muxCapability(cfg({ capabilities: { createSpace: true } }), "createSpace").capable).toBe(true);
+    expect(muxCapability(cfg({ capabilities: { createSpace: false } }), "createSpace").capable).toBe(false);
+  });
+
+  it("answers each capability independently — one absence never takes another down", () => {
+    const declaration = cfg({ capabilities: { agentSessionRef: false, gridScrollback: true } });
+    expect(muxCapability(declaration, "agentSessionRef").capable).toBe(false);
+    expect(muxCapability(declaration, "gridScrollback").capable).toBe(true);
+  });
+});
+
+describe("muxCapability — the words come from the adapter", () => {
+  const declaration = cfg({
+    capabilities: { agentSessionRef: false, createSpace: false, paneGrid: true },
+    notes: {
+      agentSessionRef: "this multiplexer keeps no agent session log for issance to read.",
+      paneGrid: "developer prose about a capability it HAS",
+    },
+  });
+
+  it("an absent capability carries its reason", () => {
+    expect(muxCapability(declaration, "agentSessionRef").note).toBe(
+      "this multiplexer keeps no agent session log for issance to read.",
+    );
+  });
+
+  it("a present capability carries none — there is nothing to explain", () => {
+    expect(muxCapability(declaration, "paneGrid").note).toBe("");
+  });
+
+  it("an absent capability with no note carries an empty string, not undefined", () => {
+    // Call sites render an explanation only when this has words; `""` is the "hide it" signal.
+    expect(muxCapability(declaration, "createSpace").note).toBe("");
+  });
+
+  it("the multiplexer's name rides for display, and is empty before the bridge answers", () => {
+    expect(muxCapability(declaration, "paneGrid").mux).toBe("reference");
+    expect(muxCapability(null, "paneGrid").mux).toBe("");
+  });
+});
+
+describe("keysSendable — a key is not a capability", () => {
+  it("nothing refused means everything sends", () => {
+    expect(keysSendable(["Enter", "ctrl+c"], [])).toBe(true);
+  });
+
+  it("a refused bare key blocks its own chord and nothing else", () => {
+    expect(keysSendable(["PageUp"], ["PageUp"])).toBe(false);
+    expect(keysSendable(["Up"], ["PageUp"])).toBe(true);
+  });
+
+  it("the BASE key decides, so a modifier cannot smuggle a refused key through", () => {
+    expect(keysSendable(["ctrl+Home"], ["Home"])).toBe(false);
+    expect(keysSendable(["ctrl+shift+End"], ["End"])).toBe(false);
+  });
+
+  it("spelling case is not a hiding place — both sides use the contract's alphabet", () => {
+    expect(keysSendable(["home"], ["Home"])).toBe(false);
+  });
+
+  it("a batch is refused if ANY of its chords is — the whole sequence goes as one call", () => {
+    expect(keysSendable(["Escape", "Delete", "Enter"], ["Delete"])).toBe(false);
+  });
+
+  it("the `+` key survives its own splitting", () => {
+    expect(keysSendable(["ctrl++"], ["Delete"])).toBe(true);
+    expect(keysSendable(["ctrl++"], ["+"])).toBe(false);
+  });
+});
+
+// TOPOLOGY LATENCY — a declared fact, not a capability, and the one thing that decides whether the
+// home screen talks about freshness at all (ADR 0031). Its fail-open direction is the OPPOSITE
+// shape from a capability's and it is worth saying why: a capability defaults to present because
+// hiding a working control is unfixable; this defaults to `push` because inventing a staleness
+// counter for a bridge that never claimed to be stale is noise the operator cannot act on.
+describe("muxTopologyLatency — absent means push, and only an explicit bound is a bound", () => {
+  it("no config at all reads as push, so an older bridge says nothing about freshness", () => {
+    expect(muxTopologyLatency(null)).toEqual({ kind: "push" });
+  });
+
+  it("a config that does not carry the field reads as push", () => {
+    expect(muxTopologyLatency(cfg())).toEqual({ kind: "push" });
+  });
+
+  it("a declared bound is carried through with its number intact", () => {
+    expect(muxTopologyLatency(cfg({ topologyLatency: { kind: "bounded", ms: 12_000 } }))).toEqual({
+      kind: "bounded",
+      ms: 12_000,
+    });
+  });
+
+  it("an explicit push is push — the same answer as absence, arrived at honestly", () => {
+    expect(muxTopologyLatency(cfg({ topologyLatency: { kind: "push" } }))).toEqual({ kind: "push" });
+  });
+});
+
+// ── PER-HOST: a crew member runs its own multiplexer (M22/03) ────────────────────────────────────
+//
+// The lead answers `/api/config?host=<member>` with that member's own declaration, from what its
+// last `hello` taught it, and the web asks with the scope's host. Two absent rules meet here, one
+// per level, and they point in different directions on purpose:
+//
+//   • an absent capability KEY inside a block that IS present reads as CAPABLE (the top of this
+//     file, unchanged);
+//   • an absent BLOCK for a member reads as THE LEAD'S ANSWER, which is what the phone already does
+//     with every pane on every host.
+//
+// The request behaviour that feeds this — one read per host id, nothing on the wire without a host —
+// is asserted in mux-capability-host.test.tsx, where the hook can be rendered.
+
+describe("scopedMuxConfig — a member answers for itself, and silence means the lead", () => {
+  const lead = cfg({ name: "lead-mux", capabilities: { createWorktree: false, renamePane: true } });
+  const member = cfg({ name: "member-mux", capabilities: { createWorktree: true } });
+
+  it("a member that declared a block answers with it, whatever the lead said", () => {
+    expect(scopedMuxConfig(lead, member)).toBe(member);
+    // The whole point of the feature: a capability the LEAD does not have, on the member's panes.
+    expect(muxCapability(scopedMuxConfig(lead, member), "createWorktree").capable).toBe(true);
+    expect(muxCapability(scopedMuxConfig(lead, null), "createWorktree").capable).toBe(false);
+  });
+
+  it("a member with no block of its own takes the lead's — never `all capable`", () => {
+    // An older peer, a read in flight and a failed read all arrive as `null`, and all three are
+    // panes the phone renders off the lead's answer today. None of them may become "capable".
+    expect(scopedMuxConfig(lead, null)).toBe(lead);
+    expect(muxCapability(scopedMuxConfig(lead, null), "createWorktree").capable).toBe(false);
+  });
+
+  it("a capability the member's block does not mention is still capable", () => {
+    // The fail-open rule survives the per-host lookup, one level down: the block is present, the
+    // key is not, and a mid-upgrade member must not have working controls hidden.
+    expect(muxCapability(scopedMuxConfig(lead, member), "closePane").capable).toBe(true);
+  });
+
+  it("neither side answering is `null`, which is exactly today's pre-answer state", () => {
+    expect(scopedMuxConfig(null, null)).toBeNull();
+    expect(muxCapability(scopedMuxConfig(null, null), "renamePane").capable).toBe(true);
+  });
+
+  it("the note and the name come from whichever block won", () => {
+    const declined = cfg({
+      name: "member-mux",
+      capabilities: { agentSessionRef: false },
+      notes: { agentSessionRef: "this multiplexer keeps no agent session log for issance to read." },
+    });
+    const state = muxCapability(scopedMuxConfig(lead, declined), "agentSessionRef");
+    expect(state.mux).toBe("member-mux");
+    expect(state.note).toBe("this multiplexer keeps no agent session log for issance to read.");
+  });
+});
+
+describe("sessionMuxConfig: capabilities per session card (M55)", () => {
+  const machine = cfg({
+    name: "reference",
+    capabilities: { createSpace: false, paneGrid: true },
+    notes: { createSpace: "This runtime makes no spaces by hand." },
+    unsupportedKeys: ["f13"],
+  });
+
+  it("no card is the machine's block, untouched: a bridge older than the card", () => {
+    expect(sessionMuxConfig(machine, null, null)).toBe(machine);
+  });
+
+  it("the primary session's card keeps the machine's block, notes and all", () => {
+    const card = { isPrimary: true, mux: "reference", caps: { createSpace: true } };
+    expect(sessionMuxConfig(machine, card, null)).toBe(machine);
+  });
+
+  it("a program session's card carries its own capability set and no borrowed notes", () => {
+    const card = { isPrimary: false, mux: "support-desk", caps: { paneGrid: false, createSpace: false } };
+    const out = sessionMuxConfig(machine, card, null);
+    expect(muxCapability(out, "paneGrid").capable).toBe(false);
+    expect(muxCapability(out, "createSpace")).toEqual({ capable: false, note: "", mux: "support-desk" });
+  });
+
+  it("a card of the machine's own runtime keeps that runtime's notes", () => {
+    const card = { isPrimary: false, mux: "reference", caps: { createSpace: false } };
+    expect(muxCapability(sessionMuxConfig(machine, card, null), "createSpace").note).toBe(
+      "This runtime makes no spaces by hand.",
+    );
+  });
+
+  it("a card's capability set wins over a fetched block", () => {
+    const card = { isPrimary: false, mux: "support-desk", caps: { paneGrid: false } };
+    const fetched = cfg({ capabilities: { paneGrid: true } });
+    expect(muxCapability(sessionMuxConfig(machine, card, fetched), "paneGrid").capable).toBe(false);
+  });
+
+  it("a card with no capability set falls back to the fetch, then to the machine", () => {
+    const card = { isPrimary: false, mux: "support-desk" };
+    const fetched = cfg({ name: "fetched", capabilities: { paneGrid: false } });
+    expect(sessionMuxConfig(machine, card, fetched)).toBe(fetched);
+    expect(sessionMuxConfig(machine, card, null)).toBe(machine);
+  });
+});

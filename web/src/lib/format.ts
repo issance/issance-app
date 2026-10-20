@@ -1,0 +1,156 @@
+// Small presentational helpers.
+
+import { getLocaleSnapshot, t } from "./i18n";
+
+/** Collapse $HOME to `~` — handles /home/<user>, /Users/<user> (macOS), /var/home/<user> (Fedora). */
+export function tildeHome(cwd: string): string {
+  return cwd.replace(/^\/(?:var\/)?home\/[^/]+/, "~").replace(/^\/Users\/[^/]+/, "~");
+}
+
+/**
+ * Collapse $HOME and keep the tail of a long path so it fits a phone row.
+ *
+ * Drops WHOLE SEGMENTS, not characters: cutting mid-segment produced `…ropbox/dev/…`, which reads
+ * as a rendering fault rather than an abbreviation. The last segment is always kept even when it
+ * alone exceeds the budget — it's the part that identifies the directory.
+ */
+export function shortCwd(cwd: string, max = 32): string {
+  const p = tildeHome(cwd);
+  if (p.length <= max) return p;
+
+  const segments = p.split("/").filter(Boolean);
+  const last = segments.pop();
+  if (last === undefined) return p;
+
+  const kept = [last];
+  let len = last.length + 1; // + the leading "…/"
+  for (const seg of segments.toReversed()) {
+    if (len + seg.length + 1 > max) break;
+    kept.unshift(seg);
+    len += seg.length + 1;
+  }
+  return `…/${kept.join("/")}`;
+}
+
+/** The last path segment (the directory's own name), with any trailing slash ignored. */
+export function baseName(path: string): string {
+  const parts = path.split("/").filter(Boolean);
+  return parts[parts.length - 1] ?? "";
+}
+
+/** Two-letter avatar fallback from an agent name (e.g. "claude" → "CL"). */
+export function initials(name: string): string {
+  const clean = name.replace(/[^a-zA-Z0-9]/g, "");
+  return (clean.slice(0, 2) || "AI").toUpperCase();
+}
+
+const rtfCache = new Map<string, Intl.RelativeTimeFormat>();
+
+/** A cached `Intl.RelativeTimeFormat` for the active app locale — narrow style, the closest built-in
+ *  match for the terse mobile register ("5m ago" rather than "5 minutes ago"). */
+function relativeTimeFormat(): Intl.RelativeTimeFormat {
+  const locale = getLocaleSnapshot().locale;
+  let rtf = rtfCache.get(locale);
+  if (!rtf) {
+    rtf = new Intl.RelativeTimeFormat(locale, { numeric: "auto", style: "narrow" });
+    rtfCache.set(locale, rtf);
+  }
+  return rtf;
+}
+
+/**
+ * Compact "time ago" for a past epoch-ms timestamp — "just now" under a minute, then a localized
+ * narrow relative time ("5m ago" in English, and whatever the active locale's narrow form is
+ * elsewhere). A future or now timestamp reads "just now". Deliberately coarse: it's a footnote, not
+ * a clock. Keyed on the active app locale via `Intl.RelativeTimeFormat`, not the browser default, so
+ * a language switch changes the wording immediately.
+ */
+export function timeAgo(ts: number, now: number = Date.now()): string {
+  const secs = Math.max(0, Math.round((now - ts) / 1000));
+  if (secs < 60) return t("time.justNow");
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return relativeTimeFormat().format(-mins, "minute");
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return relativeTimeFormat().format(-hrs, "hour");
+  return relativeTimeFormat().format(-Math.floor(hrs / 24), "day");
+}
+
+/**
+ * The same age with the trailing "ago"/suffix dropped — for a right-aligned column of them, where
+ * every entry would repeat it and the column's meaning is already established. `Intl.RelativeTimeFormat`
+ * has no "no suffix" mode, and its `formatToParts` output mixes the suffix wording into `literal`
+ * parts in a shape that varies by engine and locale, so it can't be trimmed reliably. This keeps the
+ * plain number+unit-letter convention common to compact mobile UIs across languages (the same
+ * convention Twitter/X, GitHub's relative timestamps, etc. use even when localized) — only the
+ * "just now" word is translated.
+ */
+export function timeAgoShort(ts: number, now: number = Date.now()): string {
+  const secs = Math.max(0, Math.round((now - ts) / 1000));
+  if (secs < 60) return t("time.compact.now");
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h`;
+  return `${Math.floor(hrs / 24)}d`;
+}
+
+/** How long until a moment, as {@link timeLeft} reads it: the time left in words, or that it passed. */
+export type TimeLeft = { kind: "left"; text: string } | { kind: "expired" };
+
+/**
+ * The time left until an ISO 8601 moment, for a countdown such as an ask's expiry: "40 s" under a minute,
+ * then "4 min", "2 h" and "3 d", each rounded down so the line never promises more time than there is.
+ * `expired` from the moment on. Null when `expiresAt` is not a time. PURE: the clock is `now`, epoch ms,
+ * so a caller ticks it (lib/cache-clock.ts) and a test passes it. The unit letters are the compact,
+ * untranslated convention {@link timeAgoShort} uses; the sentence around them is translated.
+ */
+export function timeLeft(expiresAt: string, now: number): TimeLeft | null {
+  const at = Date.parse(expiresAt);
+  if (!Number.isFinite(at)) return null;
+  const ms = at - now;
+  if (ms <= 0) return { kind: "expired" };
+  const secs = Math.ceil(ms / 1000);
+  if (secs < 60) return { kind: "left", text: `${secs} s` };
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return { kind: "left", text: `${mins} min` };
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return { kind: "left", text: `${hrs} h` };
+  return { kind: "left", text: `${Math.floor(hrs / 24)} d` };
+}
+
+/**
+ * Wall-clock "HH:MM" in the phone's own timezone, formatted in the active APP locale (not the
+ * browser default) — for "last seen 14:32" on a disconnected render. A clock time, not an age,
+ * because that is the question being answered: an age has to be recomputed to stay true, and a
+ * screen showing cached data may sit there for minutes without a re-render. `14:32` is still `14:32`
+ * an hour later.
+ */
+export function clockTime(ts: number): string {
+  const locale = getLocaleSnapshot().locale;
+  return new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" }).format(new Date(ts));
+}
+
+/**
+ * A date and a time, medium and short, in the active APP locale — for a moment that may be weeks
+ * away, like a paired device's expiry. An age ("in 3 days") would have to be recomputed to stay
+ * true; a date stays true however long the screen sits there.
+ */
+export function dateTime(ts: number): string {
+  const locale = getLocaleSnapshot().locale;
+  return new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(ts));
+}
+
+/**
+ * When a saved copy was fetched, the way the offline banners say it (M46 spec 10): the clock time
+ * when it was today, else a date and a time. A clock time alone for a copy from yesterday would read
+ * as this morning. Not an age, for {@link clockTime}'s reason: the screen may sit there for an hour.
+ */
+export function savedAtLabel(ts: number, now: number = Date.now()): string {
+  const then = new Date(ts);
+  const today = new Date(now);
+  const sameDay =
+    then.getFullYear() === today.getFullYear() &&
+    then.getMonth() === today.getMonth() &&
+    then.getDate() === today.getDate();
+  return sameDay ? clockTime(ts) : dateTime(ts);
+}

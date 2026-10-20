@@ -1,0 +1,222 @@
+import {
+  filterSpaces,
+  groupPanesByTab,
+  spaceLastSeenMap,
+  spaceTriageMap,
+} from "./spaces";
+import { spaceKey } from "./hosts";
+import { worstTriage } from "./triage";
+import type { AgentStatus, AgentView, TabView, WorkspaceView } from "./types";
+
+function agent(
+  partial: Partial<AgentView> & { paneId: string; workspaceId: string; tabId: string },
+): AgentView {
+  return {
+    workspaceLabel: "ws",
+    workspaceNumber: 1,
+    agent: "claude",
+    status: "idle",
+    cwd: "/home/you/demo",
+    focused: false,
+    ...partial,
+  };
+}
+
+const tab = (tabId: string, workspaceId: string, number: number): TabView => ({
+  tabId,
+  workspaceId,
+  number,
+  label: String(number),
+  focused: false,
+  paneCount: 1,
+});
+
+describe("groupPanesByTab", () => {
+  const tabs = [tab("w1:t2", "w1", 2), tab("w1:t1", "w1", 1)]; // differs from stable number order
+
+  it("preserves snapshot tab order when grouping panes", () => {
+    const a1 = agent({ paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1" });
+    const a2 = agent({ paneId: "w1:p2", workspaceId: "w1", tabId: "w1:t2" });
+    const groups = groupPanesByTab("w1", tabs, [a1, a2], []);
+    expect(groups.map((g) => g.tabId)).toEqual(["w1:t2", "w1:t1"]);
+    expect(groups[0]!.panes).toEqual([a2]);
+    expect(groups[1]!.panes).toEqual([a1]);
+  });
+
+  it("includes shell panes alongside agents in their tab", () => {
+    const a1 = agent({ paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1" });
+    const shell = agent({ paneId: "w1:p2", workspaceId: "w1", tabId: "w1:t1", kind: "shell" });
+    const group = groupPanesByTab("w1", tabs, [a1], [shell]).find((item) => item.tabId === "w1:t1");
+    expect(group!.panes).toEqual([a1, shell]);
+  });
+
+  it("collects panes whose tab isn't listed yet into a trailing '…' group", () => {
+    const orphan = agent({ paneId: "w1:p9", workspaceId: "w1", tabId: "w1:tX" });
+    const groups = groupPanesByTab("w1", tabs, [orphan], []);
+    const last = groups.at(-1)!;
+    expect(last.tabId).toBe(`${spaceKey(undefined, "w1")}:other`);
+    expect(last.label).toBe("…");
+    expect(last.panes).toEqual([orphan]);
+  });
+
+  it("ignores panes from other workspaces", () => {
+    const other = agent({ paneId: "w2:p1", workspaceId: "w2", tabId: "w2:t1" });
+    const groups = groupPanesByTab("w1", tabs, [other], []);
+    expect(groups.every((g) => g.panes.length === 0)).toBe(true);
+  });
+});
+
+describe("spaceTriageMap — one classifier for rows and chips", () => {
+  const mk = (id: string, ws: string, status: AgentStatus, extra: Partial<AgentView> = {}) =>
+    agent({ paneId: id, workspaceId: ws, tabId: `${ws}:t1`, status, ...extra });
+
+  it("keeps the most urgent bucket per workspace and omits spaces with no agent", () => {
+    const m = spaceTriageMap([
+      mk("w1:p1", "w1", "idle"),
+      mk("w1:p2", "w1", "blocked"),
+      mk("w2:p1", "w2", "working"),
+    ]);
+    expect(m.get(spaceKey(undefined, "w1"))).toBe("needs");
+    expect(m.get(spaceKey(undefined, "w2"))).toBe("working");
+    // Not the same as idle: an empty space has nothing to report.
+    expect(m.get(spaceKey(undefined, "w3"))).toBeUndefined();
+  });
+
+  it("ranks an unseen-done agent ABOVE a working one — the disagreement this replaced", () => {
+    // STATUS_RANK put working (1) ahead of done (4), so the old space row said "working" while the
+    // space chip, which already routed through bucketOf, said "ready". Same input, one answer now.
+    const m = spaceTriageMap([
+      mk("w1:p1", "w1", "working"),
+      mk("w1:p2", "w1", "done", { lastActiveAt: 2000, lastSeenAt: 1000 }),
+    ]);
+    expect(m.get(spaceKey(undefined, "w1"))).toBe("ready");
+  });
+
+  it("agrees with worstTriage, which is the point of sharing bucketOf", () => {
+    const agents = [
+      mk("w1:p1", "w1", "done", { lastActiveAt: 2000, lastSeenAt: 1000 }),
+      mk("w1:p2", "w1", "working"),
+      mk("w1:p3", "w1", "idle"),
+    ];
+    expect(spaceTriageMap(agents).get(spaceKey(undefined, "w1"))).toBe(worstTriage(agents));
+  });
+
+  it("a done agent you have already seen is not 'ready'", () => {
+    const m = spaceTriageMap([mk("w1:p1", "w1", "done", { lastActiveAt: 1000, lastSeenAt: 2000 })]);
+    expect(m.get(spaceKey(undefined, "w1"))).toBe("recent");
+  });
+});
+
+const ws = (workspaceId: string, label: string, number: number): WorkspaceView => ({
+  workspaceId,
+  number,
+  label,
+  focused: false,
+  activeTabId: `${workspaceId}:t1`,
+  tabCount: 1,
+  paneCount: 1,
+});
+
+describe("filterSpaces", () => {
+  const spaces = [ws("w1", "moonward_os", 1), ws("w2", "trader", 2), ws("w3", "MOON_probe", 3)];
+
+  it("matches case-insensitively, anywhere in the label", () => {
+    expect(filterSpaces(spaces, "moon").map((w) => w.workspaceId)).toEqual(["w1", "w3"]);
+    expect(filterSpaces(spaces, "RAD").map((w) => w.workspaceId)).toEqual(["w2"]);
+  });
+
+  it("returns everything for an empty or whitespace query", () => {
+    expect(filterSpaces(spaces, "")).toHaveLength(3);
+    expect(filterSpaces(spaces, "   ")).toHaveLength(3);
+  });
+
+  it("returns nothing when nothing matches", () => {
+    expect(filterSpaces(spaces, "zzz")).toEqual([]);
+  });
+});
+
+describe("spaceLastSeenMap", () => {
+  it("agrees with spaceLastSeen for every space, in one pass", () => {
+    const panes = [
+      agent({ paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", lastSeenAt: 100 }),
+      agent({ paneId: "w1:p2", workspaceId: "w1", tabId: "w1:t1", lastSeenAt: 900 }),
+      agent({ paneId: "w2:p1", workspaceId: "w2", tabId: "w2:t1", lastSeenAt: 400 }),
+    ];
+    const map = spaceLastSeenMap(panes);
+    expect(map.get(spaceKey(undefined, "w1"))).toBe(900);
+    expect(map.get(spaceKey(undefined, "w2"))).toBe(400);
+  });
+
+  it("omits spaces with no panes, which callers read as 0", () => {
+    expect(spaceLastSeenMap([]).get(spaceKey(undefined, "w1"))).toBeUndefined();
+  });
+
+});
+
+// ── Two machines, one workspace id ───────────────────────────────────────────
+// Hangar numbers workspaces per machine, so a crew routinely holds two `w1`s. Before the keys were
+// host-qualified these fixtures produced ONE bucket, ONE last-seen time and ONE tab group — the two
+// projects silently merged, and the only visible symptom was a space row reporting someone else's
+// blocked agent.
+describe("host-qualified space keys", () => {
+  const onA = (partial: Partial<AgentView> & { paneId: string; workspaceId: string; tabId: string }) =>
+    agent({ host: "alpha", ...partial });
+  const onB = (partial: Partial<AgentView> & { paneId: string; workspaceId: string; tabId: string }) =>
+    agent({ host: "beta", ...partial });
+
+  it("keeps two hosts' identically-numbered spaces in separate triage buckets", () => {
+    const m = spaceTriageMap([
+      onA({ paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", status: "idle" }),
+      onB({ paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", status: "blocked" }),
+    ]);
+    expect(m.get(spaceKey("alpha", "w1"))).toBe("recent");
+    expect(m.get(spaceKey("beta", "w1"))).toBe("needs");
+    // And the un-hosted key — the one a solo install uses — is not accidentally populated.
+    expect(m.get(spaceKey(undefined, "w1"))).toBeUndefined();
+  });
+
+  it("keeps two hosts' last-seen times apart", () => {
+    const map = spaceLastSeenMap([
+      onA({ paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", lastSeenAt: 100 }),
+      onB({ paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", lastSeenAt: 900 }),
+    ]);
+    expect(map.get(spaceKey("alpha", "w1"))).toBe(100);
+    expect(map.get(spaceKey("beta", "w1"))).toBe(900);
+  });
+
+  it("groups only the addressed host's panes into a tab, orphans included", () => {
+    const mine = onA({ paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1" });
+    const theirs = onB({ paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1" });
+    const orphan = onA({ paneId: "w1:p9", workspaceId: "w1", tabId: "w1:tX" });
+    const groups = groupPanesByTab("w1", [tab("w1:t1", "w1", 1)], [mine, theirs, orphan], [], "alpha");
+    expect(groups[0]!.panes).toEqual([mine]);
+    const last = groups.at(-1)!;
+    expect(last.panes).toEqual([orphan]);
+    // The orphan group id is host-qualified too — it is a React key in a list that can hold both.
+    expect(last.tabId).toBe(`${spaceKey("alpha", "w1")}:other`);
+  });
+
+  it("keeps a tab tagged for one host out of another host's groups", () => {
+    // A tab carries a host tag exactly as a pane does (the lead's merge tags both), so a `w1:t1`
+    // that belongs to beta must not surface as alpha's tab of the same id — its pane becomes an
+    // orphan instead of silently adopting another machine's tab.
+    const betaTab = { ...tab("w1:t1", "w1", 1), host: "beta" };
+    const mine = onA({ paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1" });
+    const groups = groupPanesByTab("w1", [betaTab], [mine], [], "alpha");
+    expect(groups.some((g) => g.tabId === "w1:t1")).toBe(false);
+    const last = groups.at(-1)!;
+    expect(last.tabId).toBe(`${spaceKey("alpha", "w1")}:other`);
+    expect(last.panes).toEqual([mine]);
+  });
+
+  it("reads a host's last-seen times from that host's panes, not the other's", () => {
+    const panes = [
+      onA({ paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", lastSeenAt: 100 }),
+      // Beta touched its own w1 most recently of all — and it must not land on alpha's row.
+      onB({ paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", lastSeenAt: 9000 }),
+    ];
+    const seen = spaceLastSeenMap(panes);
+    expect(seen.get(spaceKey("alpha", "w1"))).toBe(100);
+    expect(seen.get(spaceKey("beta", "w1"))).toBe(9000);
+  });
+});

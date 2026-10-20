@@ -1,0 +1,796 @@
+import { chmodSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
+
+import {
+  configFilePaths,
+  hostFilePerms,
+  readConfigFiles,
+  tightenPrivateFile,
+  type ConfigFileLayer,
+  type Environment,
+  type FilePerms,
+  type PrivateFileVerdict,
+} from "./config-source.ts";
+import { HOST, type Host, isInside } from "./host.ts";
+import { diskIo } from "./operator-file.ts";
+import { secretFileVerdict } from "./owner-only.ts";
+import type { AuditContent } from "./audit.ts";
+import type { DialMode } from "./dial.ts";
+import type { JournalRoots } from "./journal/registry.ts";
+import { DEFAULT_MUX, muxEndpointVar } from "./mux/registry.ts";
+import { DEFAULT_MAX_UPLOAD_MB } from "./uploads.ts";
+
+// All bridge configuration, resolved once at startup. Env-driven so the systemd unit and the
+// plugin launcher can configure it without code changes. Defaults are safe for a single-user,
+// tailnet-only deployment.
+
+/**
+ * Read an integer env var, falling back to `fallback` (with one warning line) on anything invalid:
+ * an empty/unset value, non-integer garbage (`parseInt("123abc")` used to sneak `123` through — a
+ * strict regex rejects it), or a value outside the optional `[min, max]` bounds. Keeping bad config
+ * from silently becoming a nonsense number (a negative poll interval, port 0) is the whole point.
+ */
+function envInt(
+  name: string,
+  fallback: number,
+  opts: { min?: number; max?: number } = {},
+  env: Environment = process.env,
+): number {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const trimmed = raw.trim();
+  if (!/^[+-]?\d+$/.test(trimmed)) {
+    console.warn(`[config] ${name}="${raw}" is not an integer — using default ${fallback}`);
+    return fallback;
+  }
+  const n = Number(trimmed);
+  const { min, max } = opts;
+  if ((min !== undefined && n < min) || (max !== undefined && n > max)) {
+    console.warn(`[config] ${name}=${n} is out of the allowed range — using default ${fallback}`);
+    return fallback;
+  }
+  return n;
+}
+
+function envList(name: string, env: Environment = process.env): string[] {
+  return (env[name] ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * The operator's extra upload types, made safe to compare against a filename's own extension:
+ * lowercased, a leading dot forgiven (`.rb` and `rb` are the same declaration), and anything that
+ * is not plain alphanumerics dropped with a warning. The result is joined to the shipped text list
+ * in `uploads.ts` and eventually becomes part of a filename on disk, so this is the gate.
+ */
+function normaliseUploadTypes(raw: string[]): string[] {
+  const out: string[] = [];
+  for (const entry of raw) {
+    const ext = entry.replace(/^\./, "").toLowerCase();
+    if (!/^[a-z0-9]+$/.test(ext)) {
+      console.warn(`[config] ISSANCE_UPLOAD_EXTRA_TYPES entry "${entry}" is not a bare extension — ignored`);
+      continue;
+    }
+    if (!out.includes(ext)) out.push(ext);
+  }
+  return out;
+}
+
+/**
+ * A journal root setting: a list of directories, or `fallback` when unset.
+ *
+ * Comma-separated, like every other list issance reads ({@link envList}) — deliberately NOT `PATH`'s
+ * separator, which is `:` on Unix and `;` on Windows and would make the same setting mean different
+ * things on the two platforms this bridge supports. One path stays one path, so an existing value
+ * parses to exactly what it always meant.
+ */
+/**
+ * The Hermes home a `HERMES_HOME` belongs to, the way Hermes itself reads it
+ * (`get_default_hermes_root`, hermes_constants.py): anything inside `~/.hermes`, a named profile
+ * included, belongs to `~/.hermes`; `<root>/profiles/<name>` elsewhere belongs to `<root>`; any other
+ * value is a home of its own. The journal then searches that home and every profile under it, so a
+ * bridge started inside one profile's environment still finds the default profile and the others.
+ */
+export function hermesHome(value: string | undefined, home: string, host: Host = HOST): string {
+  const native = join(home, ".hermes");
+  if (value === undefined || value.trim() === "") return native;
+  const path = resolve(value.trim());
+  if (isInside(host, path, native)) return native;
+  return basename(dirname(path)) === "profiles" ? dirname(dirname(path)) : path;
+}
+
+function envRoots(
+  name: string,
+  fallback: string | string[],
+  env: Environment = process.env,
+): string[] {
+  const list = envList(name, env);
+  const fallbacks = Array.isArray(fallback) ? fallback : [fallback];
+  return list.length > 0 ? list : fallbacks;
+}
+
+/**
+ * Read an env var constrained to a fixed set of string values, falling back (with a warning) on
+ * anything not in `allowed`. Empty/unset → `fallback`. Case-insensitive.
+ */
+function envEnum<T extends string>(
+  name: string,
+  allowed: readonly T[],
+  fallback: T,
+  env: Environment = process.env,
+): T {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  const match = allowed.find((a) => a.toLowerCase() === v);
+  if (match !== undefined) return match;
+  console.warn(`[config] ${name}="${raw}" is not one of ${allowed.join("|")} — using default ${fallback}`);
+  return fallback;
+}
+
+/**
+ * Read a boolean env var. Empty/unset → `fallback`. `off`/`0`/`false`/`no` → false; `on`/`1`/`true`/
+ * `yes` → true (case-insensitive); anything else falls back with a warning.
+ *
+ * Exported so mode-scoped config (`bridge/crew/config.ts`) parses its env in exactly this style
+ * rather than growing a second, subtly different reader. The env source is a parameter so a caller
+ * can drive it purely; it defaults to `process.env`, which is how everything in this file reads.
+ */
+export function envBool(
+  name: string,
+  fallback: boolean,
+  env: Environment = process.env,
+): boolean {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  if (["off", "0", "false", "no"].includes(v)) return false;
+  if (["on", "1", "true", "yes"].includes(v)) return true;
+  console.warn(`[config] ${name}="${raw}" is not a boolean — using default ${fallback}`);
+  return fallback;
+}
+
+export interface Config {
+  /**
+   * Which multiplexer this issance drives — a name in `bridge/mux/registry.ts`. `hangar` by default,
+   * so an existing deployment that sets nothing behaves exactly as it always has. Set via
+   * `ISSANCE_MUX`; an unknown name refuses to start with the valid ones in the message (`createMux`).
+   */
+  mux: string;
+  /**
+   * Where that multiplexer lives, in the ADAPTER's own terms — opaque here, exactly as a
+   * `MuxTarget`'s endpoint is. Hangar reads {@link socketPath}; every other adapter reads its own
+   * `ISSANCE_MUX_ENDPOINT_<NAME>` (`muxEndpointVar`), and an empty value means "the adapter's default":
+   * for tmux, tmux's own default server. Documented per adapter, never guessed here.
+   */
+  muxEndpoint: string;
+  /**
+   * Absolute path to the `tmux` binary, when the operator has one somewhere unusual. Empty (the
+   * default) probes a short list of fixed paths — never `PATH`, which a systemd unit and a Hangar
+   * plugin action do not share with the operator's shell (`bridge/mux/tmux/exec.ts`). Set via
+   * `ISSANCE_TMUX_BIN`. Inert unless {@link mux} is `tmux`.
+   */
+  tmuxBin: string;
+  /**
+   * Absolute path to the `zellij` binary, when the operator has one somewhere unusual. Empty (the
+   * default) probes fixed paths — `~/.local/bin` first, because that is where zellij's own installer
+   * puts it — and never `PATH` (`bridge/mux/zellij/exec.ts`). Set via `ISSANCE_ZELLIJ_BIN`. Inert
+   * unless {@link mux} is `zellij`.
+   */
+  zellijBin: string;
+  /**
+   * Absolute path to the `tern` binary, when the operator has one somewhere unusual. Empty (the
+   * default) probes fixed paths — `~/.local/opt/tern` and `~/.local/bin` first — and never `PATH`
+   * (`bridge/mux/tern/exec.ts`). Set via `ISSANCE_TERN_BIN`. Inert unless {@link mux} is `tern`.
+   */
+  ternBin: string;
+  /** Path to Hangar's control socket. A non-Hangar-launched daemon must discover this itself. */
+  socketPath: string;
+  /**
+   * Which dialer opens that socket. `auto` (the default) is correct everywhere: `node:net` on
+   * Windows, where herdr's socket is a named pipe, and Bun's native transport elsewhere. Forcing
+   * `net` on Linux/macOS exercises the Windows dial path against the real socket — the only way to
+   * run that code without a Windows box. Set via `ISSANCE_HERDR_DIAL`.
+   *
+   * Optional so it stays out of unrelated test fixtures: `loadConfig` always resolves it, and an
+   * absent value means the same thing as `auto` at the one place it's consumed.
+   */
+  dialMode?: DialMode;
+  /** TCP port the bridge listens on (loopback only). `tailscale serve` proxies to it. */
+  port: number;
+  /**
+   * Bind host. Loopback is REQUIRED, not merely the default — `loadConfig` refuses a non-loopback
+   * value unless {@link allowNonLoopbackBind} is set, because binding wide makes the Tailscale
+   * identity check, the device header and the same-origin gate all client-forgeable
+   * (see ARCHITECTURE.md §6).
+   */
+  host: string;
+  /**
+   * Escape hatch for {@link host}: permit a bind that is not loopback (`ISSANCE_ALLOW_NON_LOOPBACK_BIND=1`).
+   * Without it the bridge refuses to start on a wide bind rather than warning and carrying on.
+   * Setting it also disables the peer-address check in server.ts.
+   */
+  allowNonLoopbackBind: boolean;
+  /** Poll cadence for the state engine, ms. Also the fast fallback cadence when the event stream is down. */
+  pollMs: number;
+  /**
+   * Relaxed safety-net poll cadence, ms, used while the events.subscribe stream is healthy. Events
+   * poke immediate re-polls, so this interval only backstops a missed poke — a miss costs at most
+   * one of these, never correctness. Falls back to {@link pollMs} the moment the stream drops.
+   */
+  pollIdleMs: number;
+  /**
+   * Debounce window before a blocked/done transition becomes a push, ms. An agent that resolves
+   * within this window (you handled it at your desk) never notifies; one that fires is retracted
+   * when it later resolves. See NotificationCoordinator. 0 = notify on the next tick (no debounce).
+   */
+  notifyDelayMs: number;
+  /** How many lines of scrollback to pull for the agent detail view. */
+  readLines: number;
+  /**
+   * Largest attachment the upload route accepts, decoded, in bytes. Set in whole megabytes with
+   * `ISSANCE_MAX_UPLOAD_MB` (default {@link DEFAULT_MAX_UPLOAD_MB}); resolved to bytes here so the
+   * two enforcement points in `bridge/uploads.ts` never each do the arithmetic.
+   *
+   * In a crew this is per MEMBER, and the member that will WRITE the file is the one whose number
+   * decides. The lead's pre-check only saves a phone's uplink — see docs/configure.md.
+   */
+  maxUploadBytes: number;
+  /**
+   * Extra text extensions the upload route accepts, beyond the shipped list in
+   * `bridge/uploads.ts` — bare, lowercase, no dot (`ISSANCE_UPLOAD_EXTRA_TYPES=rb,ex,zig`).
+   *
+   * Text only, by construction: an image is identified by its signature bytes and there is no
+   * signature an operator could declare here, so this list cannot teach issance a binary format.
+   */
+  uploadExtraTypes: string[];
+  /**
+   * Serve agent conversation history from the agent's own on-disk session log. This is the only
+   * way to get scrollback for most agent panes at all — they run on the terminal's alternate
+   * screen, which has no scrollback ring, so Hangar retains nothing behind the viewport (see
+   * journal/claude.ts). Off disables the feature and its route wholesale, for every harness.
+   */
+  transcript: boolean;
+  /**
+   * Where each harness keeps its session logs — one directory or several, searched in order. Every
+   * read is confined to the root it was found under, after symlink resolution, so these double as the
+   * security boundary for a feature that touches the filesystem — override only to relocate (or add)
+   * a non-default agent home, never from a request.
+   */
+  journalRoots: JournalRoots;
+  /** Key sequence sent to submit a reply after the text (agent-dependent; see HERDR_API.md). */
+  submitKeys: string[];
+  /**
+   * Where the operator's Agent-commands rows live — `commands.toml` in the same dir as their
+   * `.env`. Read at request time behind an mtime check (bridge/operator-commands.ts), so it is
+   * resolved here but never read here.
+   */
+  commandsFile: string;
+  /**
+   * Where the operator's Keys-tray preset rows live — `keys.toml`, the sibling of `commands.toml`
+   * in the same dir, read the same way (bridge/operator-keys.ts) and likewise never read here.
+   */
+  keysFile: string;
+  /**
+   * Where the operator's Quick-dock groups live — `quick-replies.toml`, the third sibling in the
+   * same dir, read the same way (bridge/operator-quick-replies.ts) and likewise never read here.
+   */
+  quickRepliesFile: string;
+  /**
+   * Where the operator's UI typeface rows live — `theme.toml`, the fourth sibling in the same dir,
+   * read the same way (bridge/operator-fonts.ts) and likewise never read here. Named for a theme
+   * rather than for fonts so a colour block can join it without becoming a fifth operator file.
+   */
+  themeFile: string;
+  /**
+   * The directory `theme.toml`'s `file` names resolve inside — `fonts/`, beside the file that
+   * declares them, in the CONFIG dir. It is the containment ROOT for `GET /api/fonts/<basename>`,
+   * never a search path: a name that resolves outside it after symlinks is not served (ADR 0033).
+   */
+  fontsDir: string;
+  /**
+   * Where the operator's launcher rows live — `launchers.toml`, the sibling of `commands.toml`
+   * and `keys.toml` in the same dir, read the same way (bridge/operator-launchers.ts) and
+   * likewise never read here.
+   */
+  launchersFile: string;
+  /**
+   * Where the operator's prompt-cache overrides live — `cache-rules.toml`, the sixth file on the same
+   * contract, read the same way (bridge/operator-cache-rules.ts) and likewise never read here.
+   */
+  cacheRulesFile: string;
+  /**
+   * How many seconds before a pane's prompt cache expires the watched-pane push goes out
+   * (`bridge/cache/warden.ts`). One window for every watched pane; there is no per-pane threshold.
+   *
+   * NOT the threshold that turns the countdown chip amber, which is a quarter of each rule's own TTL
+   * (`bridge/cache/engine.ts` § warnSecondsFor). Two numbers with two jobs.
+   */
+  cacheWarnSeconds: number;
+  /**
+   * Tailscale identity gate. If set under `tailscale serve`, the request must carry a matching
+   * `Tailscale-User-Login` header. A mismatch is rejected. A missing header is also rejected —
+   * serve injects none for tagged nodes, so tolerating it let any tagged node write. Under
+   * {@link skipServe} or {@link trustedUserOptional}, only a mismatch is rejected. Empty = the
+   * gate is off.
+   */
+  trustedUser: string;
+  /**
+   * Escape hatch for {@link trustedUser}: accept a request with no `Tailscale-User-Login`
+   * (`ISSANCE_TRUSTED_USER_OPTIONAL=1`). Re-opens the tagged-node gap. For host-local development.
+   */
+  trustedUserOptional: boolean;
+  /**
+   * Cloudflare Access team (`ISSANCE_ACCESS_TEAM`): `myteam`, `myteam.cloudflareaccess.com` or the
+   * https issuer. With {@link accessAud}, turns on the Access JWT gate (`bridge/access-jwt.ts`,
+   * ADR 0081). Either one alone fails closed. Empty with an empty {@link accessAud} = the gate is off.
+   */
+  accessTeam: string;
+  /** Cloudflare Access application audience tag(s) (`ISSANCE_ACCESS_AUD`). See {@link accessTeam}. */
+  accessAud: string[];
+  /**
+   * How much of each value's content the audit trail keeps — see {@link AuditContent} in audit.ts
+   * for what `none` does and does not redact.
+   */
+  auditContent: AuditContent;
+  /**
+   * Whether known secret shapes are masked in pane text before it leaves the machine
+   * (`ISSANCE_REDACT`, default on): the mirror, the journal's Chat and History bodies, and every
+   * push payload. High-confidence shapes only, so a mitigation and not a guarantee — see
+   * `bridge/redact.ts` for what it catches and what it misses on purpose.
+   */
+  redact: boolean;
+  /**
+   * Whether this machine keeps Sent, its record of the shell lines a person sent through issance
+   * (`ISSANCE_SENT`, default on). Off: nothing is recorded and a read lists nothing; remove and clear
+   * still work. See `bridge/sent.ts` and ADR 0107.
+   */
+  sent: "on" | "off";
+  /**
+   * Per-device authorisation. Name of a request header carrying an opaque device identifier,
+   * injected by a trusted upstream reverse proxy. Empty = the feature is off (no behaviour change).
+   * When set, devices whose header value isn't in {@link deviceAllowlist} are read-only. See
+   * `deviceAuth()` in server.ts for the full matrix. The header is trusted only because the bridge
+   * binds loopback behind the proxy — a direct client can't set it (same trust basis as trustedUser).
+   */
+  deviceHeader: string;
+  /**
+   * Device identifiers permitted to perform sensitive actions (typing into agent terminals,
+   * structural creates). Everything else carrying the header is read-only. To revoke a device,
+   * drop its value from this list and restart. Ignored when {@link deviceHeader} is empty.
+   */
+  deviceAllowlist: string[];
+  /** Extra allowed request origins beyond localhost (e.g. your MagicDNS https origin). */
+  allowedOrigins: string[];
+  /**
+   * Additional allowed Host headers (`host` or `host:port` values) beyond loopback and the
+   * discovered {@link tailscaleHosts}. Host validation is fail-closed by default: any request whose
+   * `Host` header isn't a loopback form, one of these, a discovered Tailscale host, or a host
+   * parsed from {@link allowedOrigins} is rejected before the Origin check. Required under
+   * `ISSANCE_SKIP_SERVE=1` (where issance discovers no Tailscale hosts) to name your public domain.
+   */
+  publicHosts: string[];
+  /**
+   * Hosts this bridge is actually published on, discovered by `issance-ctl.sh` from
+   * `tailscale status --json` and injected as ISSANCE_TAILSCALE_HOSTS. Operators don't set this.
+   * Matched with or without a port. Empty under ISSANCE_SKIP_SERVE=1.
+   */
+  tailscaleHosts: string[];
+  /**
+   * Escape hatch that turns Host validation OFF entirely (ISSANCE_ALLOW_ANY_HOST=1). That is the
+   * DNS-rebinding hole — a hostile page rebinds to 127.0.0.1 and sends Host==Origin==evil.example.
+   * Warned about at startup.
+   */
+  allowAnyHost: boolean;
+  /** Web Push (VAPID). All three required to enable push; otherwise push is disabled. */
+  vapidPublic: string;
+  vapidPrivate: string;
+  vapidSubject: string;
+  /** Where to persist push subscriptions and other runtime state. */
+  stateDir: string;
+  /**
+   * Multi-session support. When on (default), the bridge fronts every running herdr session it
+   * discovers under the config root, not just {@link socketPath}, and the UI gains a session
+   * switcher. Off (`off`/`0`/`false`) pins the bridge to the primary session only — no discovery,
+   * exactly the pre-feature behaviour. Client-supplied session names only ever select an
+   * already-discovered session; they never build a filesystem path.
+   */
+  multiSession: boolean;
+  /**
+   * Surface shadow mode (`ISSANCE_SURFACE_SHADOW=1`, M56 spec 04): the bridge computes each agent pane's
+   * Surface from the screen on every poll beside the old readers, logs every disagreement and serves
+   * the Surface on the snapshot and on `GET /api/surface`. Off by default; nothing decides a send by it.
+   */
+  surfaceShadow: boolean;
+  /**
+   * The Send Protocol (`ISSANCE_SEND_PROTOCOL`, M56 spec 05): `POST /api/send` runs a send as one
+   * bridge-side request with a lock, a probe, a predicted-state check, the key gate and a receipt, and
+   * the phone's composer uses it on panes the snapshot marks. Turns on the Surface computation too.
+   * On by default since M56 spec 06: it is the only way text reaches a pane from the phone, and a reply
+   * that submits text runs it too. `ISSANCE_SEND_PROTOCOL=0` turns sending text off (the keys still work).
+   */
+  sendProtocol: boolean;
+  /**
+   * Walky talky (`ISSANCE_WALKY`, M62): whether this machine takes messages for its panes. Off refuses
+   * every message with `refused: off`; the CLI on this machine still sends. On by default.
+   */
+  walky: boolean;
+  /**
+   * Whether `tailscale serve` is bypassed (ISSANCE_SKIP_SERVE=1) because an operator-run reverse
+   * proxy (Caddy/Nginx) fronts the loopback bridge instead. The bridge itself handles every request
+   * identically either way — this flag only informs the startup warnings: without `tailscale serve`
+   * in front, the `Tailscale-User-Login` header is never injected, so {@link trustedUser} is inert
+   * and per-device auth ({@link deviceHeader}) becomes the way to gate writes (docs/deployment.md → Variant C).
+   */
+  skipServe: boolean;
+  /**
+   * The path this issance is mounted under when a proxy gives it one (`ISSANCE_BASE_PATH`), always
+   * with a leading and a trailing slash: `/` for the root, `/issance/` for `https://host/issance/`.
+   *
+   * ONE BUILD SERVES ANY MOUNT (ADR 0052). Inside `web/dist` nothing names the root (chunks and
+   * stylesheets reference each other relatively), and the mount is applied at serve time: under a
+   * mount `index.html` goes out with its root-absolute references prefixed with this path and with
+   * the path in `<meta name="issance-base">`, which is where the app reads it. Nothing else on disk
+   * changes, so the release payload's prebuilt bundle mounts anywhere. A proxy normally strips
+   * the mount before it forwards (`tailscale serve` does); one that does not is tolerated, because
+   * the request handler reads an inbound path that still carries the mount as if it had been
+   * stripped. `issance serve` publishes at this path instead of the root when it is set.
+   */
+  basePath: string;
+}
+
+/**
+ * The loopback port the bridge binds. Exported because the CLI writes it into the generated service
+ * unit and into `status` — one source of truth, so a default changed here can't leave the unit and
+ * the process disagreeing about where issance is.
+ */
+export const DEFAULT_PORT = 8787;
+
+/**
+ * The address the bridge actually binds: an absent `ISSANCE_HOST` resolves to loopback, anything set
+ * is used verbatim (empty string included — that's the wildcard-bind case `bindIsWildcard` names).
+ * Pure and exported for the same reason as {@link resolveStateDir}: `cli/doctor.ts`'s bind check and
+ * the `issance start`/`status` banner's readiness probe (`cli/lifecycle.ts`) both need the bridge's
+ * real bind from their own merged `.env`, not a re-derived guess that could drift from this one.
+ */
+export function resolveBridgeHost(env: Environment = process.env): string {
+  return env.ISSANCE_HOST ?? "127.0.0.1";
+}
+
+/**
+ * Whether a bind host keeps the listener on loopback. Loopback is the trust basis for every write
+ * gate in the bridge. Accepts every spelling of loopback, not just `127.0.0.1`/`localhost`: the
+ * whole 127.0.0.0/8 block, and IPv6 `::1` in bare, bracketed and expanded form.
+ *
+ * Pure + exported so the table of accepted/rejected spellings is unit-tested.
+ */
+export function isLoopbackBindHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost") return true;
+  if (h === "::1" || h === "0:0:0:0:0:0:0:1") return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+/**
+ * Why this bind must be refused, or `null` when it may stand. One sentence the operator can act on;
+ * the caller decides what to do with it.
+ *
+ * **The decision is not config's to take alone, which is why this is a predicate and not a throw.**
+ * Loopback is the trust basis for every browser-side write gate — the `Tailscale-User-Login` header,
+ * `ISSANCE_DEVICE_HEADER` and the same-origin check are all client-settable, so on a wide bind they
+ * mean nothing. That is why a solo instance and a lead refuse to start. But a crew **peer** binds off
+ * loopback BY CONSTRUCTION: its lead dials it across a machine boundary, and the surface it exposes
+ * there is gated by pinned mutual TLS plus the crew secret rather than by any of those headers
+ * (CREW_PROTOCOL.md §3, [ADR 0013](../.adr/0013-a-peer-listens-without-becoming-a-front-door.md)).
+ * The mode that decides is not known until the trust store has been read, which happens after this
+ * function runs — so `bridge/index.ts` calls it once the mode is in hand.
+ *
+ * Pure and exported so both the refusal and its exemption are unit-tested without a listener.
+ */
+export function nonLoopbackBindRefusal(
+  cfg: Pick<Config, "host" | "allowNonLoopbackBind">,
+): string | null {
+  if (cfg.allowNonLoopbackBind || isLoopbackBindHost(cfg.host)) return null;
+  const shown = cfg.host.trim() === "" ? "(empty — every interface)" : cfg.host;
+  return (
+    `ISSANCE_HOST=${shown} is not a loopback address. issance binds loopback only: the ` +
+    `Tailscale-User-Login header, ISSANCE_DEVICE_HEADER and the same-origin gate are all ` +
+    `client-settable and mean nothing on a wide bind, so binding here would hand write access ` +
+    `to anything that can reach the port. Use 127.0.0.1 (the default) and put your ingress in ` +
+    `front of it. If you truly mean to bind wide and have another control in front, set ` +
+    `ISSANCE_ALLOW_NON_LOOPBACK_BIND=1.`
+  );
+}
+
+/**
+ * herdr's default socket location: `~/.config/hangar/herdr.sock` on Unix, `%APPDATA%\\hangar\\herdr.sock`
+ * on Windows (herdr for Windows keeps its config root under AppData\Roaming). Pure so both branches
+ * are unit-testable on any platform.
+ */
+export function defaultSocketPath(
+  host: Host = HOST,
+  env: Environment = process.env,
+  home: string = homedir(),
+): string {
+  if (host.platform === "win32") {
+    const appData = env.APPDATA ?? host.path.join(home, "AppData", "Roaming");
+    return host.path.join(appData, "herdr", "herdr.sock");
+  }
+  return host.path.join(home, ".config", "herdr", "herdr.sock");
+}
+
+/**
+ * Where runtime state lives: uploads, `audit.log`, `push-subscriptions.json`, `snooze.json` — and the
+ * crew trust store. The explicit override, then the user state dir.
+ *
+ * `HERDR_PLUGIN_STATE_DIR` is IGNORED, on purpose (#226). Hangar injects it into a plugin ACTION, but
+ * the bridge never runs as one: it runs as a systemd or launchd service, whose environment
+ * (`cli/unit.ts` `bridgeEnvironment`) has never carried it. So honouring it split one install in two:
+ * `hangar plugin action invoke push-test` read `~/.local/state/herdr/plugins/herdr.issance`, found no
+ * subscriptions, and failed, while the service kept them under `~/.local/state/issance`. The same split
+ * reached every verb that reads or writes state through an action: pairing, devices, crew, update
+ * runs. The service's answer is the one that has always held the data, so it is the only answer.
+ *
+ * Pure and exported because the CLI resolves the same directory from its own `.env`-merged
+ * environment (`cli/context.ts`): the crew verbs write the trust store the bridge reads, so the two
+ * must land on the same path or an enrollment would be invisible to the running service. It names no
+ * key `loadConfig` did not already name — the solo baseline's env-key list is unchanged by it.
+ */
+export function resolveStateDir(
+  env: Environment = process.env,
+  home: string = homedir(),
+): string {
+  return env.ISSANCE_STATE_DIR ?? join(home, ".local", "state", "issance");
+}
+
+/**
+ * Where each harness's journal lives, resolved from an environment and a home directory.
+ *
+ * A PARAMETER rather than a read of `process.env` and `homedir()`, so `issance doctor` can ask this
+ * one function the same question the bridge asks it (issue #137) instead of re-deriving seven
+ * fallbacks that would drift. {@link loadConfig} calls it with the defaults, so the running bridge's
+ * roots are unchanged.
+ *
+ * **The home is the resolving PROCESS's home**, which is the whole reason `doctor` reports this: a
+ * bridge running as another user reads that user's `~/.claude/projects`, not the operator's.
+ */
+export function resolveJournalRoots(
+  env: Environment = process.env,
+  home: string = homedir(),
+): JournalRoots {
+  return {
+    // ISSANCE_TRANSCRIPT_ROOT predates the per-harness split and meant Claude's root, so it keeps
+    // meaning exactly that — an existing deployment's env keeps working untouched. It takes SEVERAL
+    // roots (comma-separated) because `CLAUDE_CONFIG_DIR` gives each Claude profile its own
+    // projects tree, and a herd routinely mixes them (issue #92); one value is still one root.
+    claude: envRoots("ISSANCE_TRANSCRIPT_ROOT", join(home, ".claude", "projects"), env),
+    // Each harness's own home var is honoured first, so relocating the agent relocates its journal
+    // without a second issance setting to keep in sync. The issance override takes a list too — the
+    // multi-home case isn't Claude's alone, and one setting shouldn't behave differently per agent.
+    codex: envRoots(
+      "ISSANCE_CODEX_ROOT",
+      join(env.CODEX_HOME ?? join(home, ".codex"), "sessions"),
+      env,
+    ),
+    // TWO defaults, one adapter: Oh My Pi ships as `omp` and writes pi's own format into
+    // `~/.omp/agent/sessions`, so a host that runs it has a second home for the same log format.
+    // `PI_CODING_AGENT_DIR`, when the operator set it, is the one answer and neither is added.
+    pi: envRoots(
+      "ISSANCE_PI_ROOT",
+      env.PI_CODING_AGENT_DIR
+        ? join(env.PI_CODING_AGENT_DIR, "sessions")
+        : [join(home, ".omp", "agent", "sessions"), join(home, ".pi", "agent", "sessions")],
+      env,
+    ),
+    // OpenCode keeps one SQLite database at the top of its XDG data dir, not per-session files.
+    opencode: envRoots(
+      "ISSANCE_OPENCODE_ROOT",
+      join(env.XDG_DATA_HOME ?? join(home, ".local", "share"), "opencode"),
+      env,
+    ),
+    grok: envRoots(
+      "ISSANCE_GROK_ROOT",
+      join(env.GROK_HOME ?? join(home, ".grok"), "sessions"),
+      env,
+    ),
+    // Hermes's own home var first, as for the others, read as Hermes reads it (`hermesHome`). A
+    // root's named profiles are found under it (bridge/journal/hermes.ts), so one root serves the
+    // default profile and every named one.
+    hermes: envRoots("ISSANCE_HERMES_ROOT", hermesHome(env.HERMES_HOME, home), env),
+    // Muse keeps date-partitioned session logs under the XDG data dir, one session.jsonl per
+    // session uuid. Muse publishes no home var of its own, so the issance override is the only
+    // relocation.
+    muse: envRoots(
+      "ISSANCE_MUSE_ROOT",
+      join(env.XDG_DATA_HOME ?? join(home, ".local", "share"), "muse", "sessions"),
+      env,
+    ),
+    // OpenClaw keeps one SQLite per agent under its state folder, which `OPENCLAW_STATE_DIR` moves.
+    openclaw: envRoots("ISSANCE_OPENCLAW_ROOT", env.OPENCLAW_STATE_DIR ?? join(home, ".openclaw"), env),
+  };
+}
+
+/**
+ * The operator's config dir — where their `.env` lives, their `commands.toml` beside it, and the
+ * `tailscale serve` ownership record beside that.
+ *
+ * Resolved exactly the way scripts/issance-ctl.sh resolves it MINUS the `hangar` shell-out: the
+ * launcher passes HERDR_PLUGIN_CONFIG_DIR into the unit (and the launchd plist) precisely so this
+ * process never has to ask the CLI, and the two entry points must not disagree about which dir that
+ * is. ~/.config/issance is the same last-resort default the shim ends on.
+ *
+ * Exported for the front-door teardown (`bridge/front-door.ts`), which must find the record file the
+ * CLI wrote. It names no key `loadConfig` did not already name.
+ */
+export function resolveConfigDir(
+  env: Environment = process.env,
+  home: string = homedir(),
+): string {
+  return env.HERDR_PLUGIN_CONFIG_DIR ?? join(home, ".config", "issance");
+}
+
+/**
+ * Every bridge setting, resolved from one environment.
+ *
+ * The environment is a PARAMETER, defaulting to `process.env`, so the config file's layer can be
+ * spread underneath it before anything is read (ADR 0040): `loadConfig(overlayConfig(process.env,
+ * layer))` is the whole of how a `config.toml` reaches the bridge. Called with nothing it behaves
+ * exactly as it always has, which is why no existing call site moved.
+ */
+/**
+ * {@link FilePerms} against the real filesystem, for the secret-permission rule on `config.toml`. On
+ * Windows the access list decides ({@link hostFilePerms}, `bridge/owner-only.ts`).
+ */
+const diskFilePerms: FilePerms = hostFilePerms(HOST, {
+  mode(path) {
+    try {
+      return statSync(path).mode & 0o777;
+    } catch {
+      return null;
+    }
+  },
+  tighten(path) {
+    try {
+      chmodSync(path, 0o600);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+}, (path, repair) => secretFileVerdict(path, { repair }));
+
+/**
+ * Hold another private file the bridge reads at owner-only, by the rule `.env` and `config.toml` follow:
+ * tighten in place and say so, never refuse. `sources.json` (M55) is the one caller, because a `url`
+ * entry there carries a bearer token.
+ */
+export function holdPrivateFile(path: string, repairAcl = false): PrivateFileVerdict {
+  return tightenPrivateFile(path, diskFilePerms, repairAcl);
+}
+
+export function loadConfig(env: Environment = process.env): Config {
+  const stateDir = resolveStateDir(env);
+
+  const submitKeys = envList("ISSANCE_SUBMIT_KEYS", env);
+
+  const host = resolveBridgeHost(env);
+  const allowNonLoopbackBind = envBool("ISSANCE_ALLOW_NON_LOOPBACK_BIND", false, env);
+
+  // The operator's config dir — where their `.env` lives, and now their `commands.toml` beside it.
+  // Resolved exactly the way scripts/issance-ctl.sh resolves it MINUS the `hangar` shell-out: the
+  // launcher passes HERDR_PLUGIN_CONFIG_DIR into the unit (and the launchd plist) precisely so this
+  // process never has to ask the CLI, and the two entry points must not disagree about which dir
+  // that is. ~/.config/issance is the same last-resort default the shim ends on.
+  const configDir = resolveConfigDir(env);
+
+  const mux = (env.ISSANCE_MUX ?? "").trim() || DEFAULT_MUX;
+  const socketPath = env.HERDR_SOCKET_PATH ?? defaultSocketPath(HOST, env);
+
+  return {
+    mux,
+    // Hangar's endpoint IS its socket path, so the default adapter keeps reading exactly the setting
+    // it always read and nothing about an existing deployment moves.
+    muxEndpoint: mux === DEFAULT_MUX ? socketPath : (env[muxEndpointVar(mux)] ?? "").trim(),
+    tmuxBin: (env.ISSANCE_TMUX_BIN ?? "").trim(),
+    zellijBin: (env.ISSANCE_ZELLIJ_BIN ?? "").trim(),
+    ternBin: (env.ISSANCE_TERN_BIN ?? "").trim(),
+    socketPath,
+    dialMode: envEnum("ISSANCE_HERDR_DIAL", ["auto", "net", "bun"] as const, "auto", env),
+    port: envInt("ISSANCE_PORT", DEFAULT_PORT, { min: 1, max: 65535 }, env),
+    host,
+    allowNonLoopbackBind,
+    pollMs: envInt("ISSANCE_POLL_MS", 1500, { min: 250 }, env),
+    pollIdleMs: envInt("ISSANCE_POLL_IDLE_MS", 12_000, { min: 1000 }, env),
+    notifyDelayMs: envInt("ISSANCE_NOTIFY_DELAY_MS", 30_000, { min: 0 }, env),
+    // How early a watched pane's prompt-cache warning goes out. The floor is 30 s (a window shorter
+    // than one poll's idle resolution is noise, not a warning) and the ceiling an hour, which is past
+    // the longest TTL any shipped rule claims.
+    cacheWarnSeconds: envInt("ISSANCE_CACHE_WARN_SECONDS", 300, { min: 30, max: 3600 }, env),
+    readLines: envInt("ISSANCE_READ_LINES", 200, { min: 1 }, env),
+    // Whole megabytes in, bytes out. The floor is 1 MB (a cap below one screenshot is a broken
+    // install, not a tight one) and the ceiling 512 MB, which is well past useful and still short
+    // of the point where a single buffered body is the thing that ends the process.
+    maxUploadBytes:
+      envInt("ISSANCE_MAX_UPLOAD_MB", DEFAULT_MAX_UPLOAD_MB, { min: 1, max: 512 }, env) * 1024 * 1024,
+    uploadExtraTypes: normaliseUploadTypes(envList("ISSANCE_UPLOAD_EXTRA_TYPES", env)),
+    transcript: envBool("ISSANCE_TRANSCRIPT", true, env),
+    journalRoots: resolveJournalRoots(env),
+    submitKeys: submitKeys.length ? submitKeys : ["Enter"],
+    commandsFile: join(configDir, "commands.toml"),
+    keysFile: join(configDir, "keys.toml"),
+    quickRepliesFile: join(configDir, "quick-replies.toml"),
+    themeFile: join(configDir, "theme.toml"),
+    fontsDir: join(configDir, "fonts"),
+    launchersFile: join(configDir, "launchers.toml"),
+    cacheRulesFile: join(configDir, "cache-rules.toml"),
+    trustedUser: env.ISSANCE_TRUSTED_USER ?? "",
+    trustedUserOptional: envBool("ISSANCE_TRUSTED_USER_OPTIONAL", false, env),
+    accessTeam: (env.ISSANCE_ACCESS_TEAM ?? "").trim(),
+    accessAud: envList("ISSANCE_ACCESS_AUD", env),
+    auditContent: envEnum("ISSANCE_AUDIT_CONTENT", ["preview", "none"] as const, "preview", env),
+    redact: envBool("ISSANCE_REDACT", true, env),
+    sent: envEnum("ISSANCE_SENT", ["on", "off"] as const, "on", env),
+    deviceHeader: (env.ISSANCE_DEVICE_HEADER ?? "").trim(),
+    deviceAllowlist: envList("ISSANCE_DEVICE_ALLOWLIST", env),
+    allowedOrigins: envList("ISSANCE_ALLOWED_ORIGINS", env),
+    publicHosts: envList("ISSANCE_PUBLIC_HOSTS", env),
+    tailscaleHosts: envList("ISSANCE_TAILSCALE_HOSTS", env),
+    allowAnyHost: envBool("ISSANCE_ALLOW_ANY_HOST", false, env),
+    vapidPublic: env.ISSANCE_VAPID_PUBLIC ?? "",
+    vapidPrivate: env.ISSANCE_VAPID_PRIVATE ?? "",
+    vapidSubject: env.ISSANCE_VAPID_SUBJECT ?? "mailto:admin@example.com",
+    stateDir,
+    multiSession: envBool("ISSANCE_MULTI_SESSION", true, env),
+    surfaceShadow: envBool("ISSANCE_SURFACE_SHADOW", false, env),
+    sendProtocol: envBool("ISSANCE_SEND_PROTOCOL", true, env),
+    walky: envBool("ISSANCE_WALKY", true, env),
+    skipServe: envBool("ISSANCE_SKIP_SERVE", false, env),
+    basePath: normaliseBasePath(env.ISSANCE_BASE_PATH),
+  };
+}
+
+/**
+ * `ISSANCE_BASE_PATH` as the bridge uses it: `/` for unset, empty or `/`; otherwise one leading and
+ * one trailing slash around the given segments (`issance`, `/issance`, `issance/`, `//issance//` all
+ * read as `/issance/`). A value a URL path cannot carry — a `.`/`..` segment, whitespace, `?` or `#` —
+ * is refused with one warning and the root is used, because a mount that is half a path would
+ * quietly move every asset somewhere the app cannot follow.
+ */
+export function normaliseBasePath(raw: string | undefined): string {
+  const trimmed = (raw ?? "").trim();
+  if (trimmed === "" || trimmed === "/") return "/";
+  const segments = trimmed.split("/").filter((s) => s !== "");
+  const bad = segments.some((s) => s === "." || s === ".." || /[\s?#\\]/.test(s));
+  if (segments.length === 0 || bad) {
+    console.warn(`[config] ISSANCE_BASE_PATH="${raw ?? ""}" is not a path issance can be mounted at — using /`);
+    return "/";
+  }
+  return `/${segments.join("/")}/`;
+}
+
+/**
+ * The config-file layer this process will read, resolved from its own environment and home.
+ *
+ * The bridge's entry point awaits this ONCE and hands the overlaid environment to {@link loadConfig};
+ * it is not resolved at module scope, because importing `bridge/config.ts` must not open a file (the
+ * CLI imports it for `resolveStateDir` alone, in every verb). `cli/context.ts` resolves the same two
+ * paths from its own config-dir ladder, so both sides land on one answer.
+ *
+ * `repairAcl`: whether a loose secret file's access list may be changed (Windows only). The
+ * bridge's entry point passes `true`; anything else that calls this only verifies.
+ */
+export async function loadConfigLayer(
+  env: Environment = process.env,
+  home: string = homedir(),
+  warn: (line: string) => void = (l) => console.warn(l),
+  repairAcl = false,
+): Promise<ConfigFileLayer> {
+  return readConfigFiles(diskIo, configFilePaths(env, home, resolveConfigDir(env, home)), warn, {
+    home,
+    perms: diskFilePerms,
+    repairAcl,
+  });
+}

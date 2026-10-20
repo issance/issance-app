@@ -1,0 +1,221 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+import { describe, expect, it } from "vitest";
+
+import {
+  NAVIGATION_NETWORK_ONLY,
+  PROXY_AUTH_PATH,
+  navigationNetworkOnlyUnder,
+  isNetworkOnlyNavigation,
+} from "./sw-routes";
+
+// These rules are the difference between an installed PWA that can reach its front door and one that
+// is bricked behind a refused session, and the failure is silent in both directions: too narrow and
+// the sign-in page is invisible, too wide and issance's own deep links stop resolving offline. The
+// regexes are what the service worker actually installs, so pin the contract here.
+describe("service-worker navigation passthrough", () => {
+  it("never answers the API from the precache", () => {
+    expect(isNetworkOnlyNavigation("/api/snapshot")).toBe(true);
+    expect(isNetworkOnlyNavigation("/api/pane/w1:p1/keys")).toBe(true);
+  });
+
+  // The Files reads (ADR 0083) and the Machines routes (ADR 0084) are API calls like their neighbours:
+  // the worker answers none of them from the precache, with or without a query, and the app pages that
+  // show them are issance's own routes, answered offline from the shell.
+  it("never answers the Files and Machines routes from the precache", () => {
+    for (const path of [
+      "/api/pane/w1%3Ap1/files",
+      "/api/pane/w1%3Ap1/files?dir=docs&host=laptop",
+      "/api/workspace/w1/files?path=README.md",
+      "/api/machines",
+      "/api/machines/local/history",
+      "/api/machines/laptop/alerts",
+    ]) {
+      expect(isNetworkOnlyNavigation(path)).toBe(true);
+    }
+    for (const page of ["/machines", "/machines/local", "/pane/w1%3Ap1/changes/files?dir=docs", "/space/w1/changes/files"]) {
+      expect(isNetworkOnlyNavigation(page)).toBe(false);
+    }
+  });
+
+  it("passes the reserved proxy namespace to the network, with or without the slash", () => {
+    expect(isNetworkOnlyNavigation("/auth")).toBe(true);
+    expect(isNetworkOnlyNavigation("/auth/")).toBe(true);
+    expect(isNetworkOnlyNavigation("/auth/sign-in")).toBe(true);
+    expect(isNetworkOnlyNavigation("/auth/oidc/callback")).toBe(true);
+  });
+
+  // Workbox tests the denylist against `url.pathname + url.search` (verified in the vendored
+  // workbox-routing/NavigationRoute.js `_match`), so these inputs carry their query string — a rule
+  // anchored on a trailing slash passes every pathname-only test above and still bricks the app the
+  // moment a proxy bounces you to `/auth?rd=…`, which is what Authelia and oauth2-proxy do.
+  it("still passes through when the proxy appends a return-to query string", () => {
+    expect(isNetworkOnlyNavigation("/auth?rd=%2F")).toBe(true);
+    expect(isNetworkOnlyNavigation("/auth?rd=%2Fpane%2Fw1%3Ap1")).toBe(true);
+    expect(isNetworkOnlyNavigation("/auth/?next=/settings")).toBe(true);
+    expect(isNetworkOnlyNavigation("/api/snapshot?s=demo")).toBe(true);
+  });
+
+  it("passes Authentik's fixed outpost start and callback namespace to the network", () => {
+    expect(isNetworkOnlyNavigation("/outpost.goauthentik.io/start?rd=%2F")).toBe(true);
+    expect(isNetworkOnlyNavigation("/outpost.goauthentik.io/callback?code=abc")).toBe(true);
+    expect(isNetworkOnlyNavigation("/outpost.goauthentik.io")).toBe(true);
+    expect(isNetworkOnlyNavigation("/outpost.goauthentik.io-ish/start")).toBe(false);
+  });
+
+  // Cloudflare Access can't move off /cdn-cgi/access/, so the reservation has to come to it.
+  it("passes Cloudflare Access's non-relocatable prefix to the network", () => {
+    expect(isNetworkOnlyNavigation("/cdn-cgi/access/login")).toBe(true);
+    expect(isNetworkOnlyNavigation("/cdn-cgi/access/callback?code=abc")).toBe(true);
+  });
+
+  it("does not leak a issance route that merely carries a query string", () => {
+    expect(isNetworkOnlyNavigation("/authors?x=1")).toBe(false);
+    expect(isNetworkOnlyNavigation("/?s=issance-demo")).toBe(false);
+    expect(isNetworkOnlyNavigation("/pane/w1:p1?s=demo")).toBe(false);
+  });
+
+  // The host param travels inside a proxy's return-to payload the moment a peer's deep link is the
+  // thing you were bounced away from — same anchoring argument as above, one dimension out.
+  it("still passes through when the return-to payload encodes a host param", () => {
+    expect(isNetworkOnlyNavigation("/auth?rd=%2Fpane%2Fw1%3Fh%3Dbox2")).toBe(true);
+    expect(isNetworkOnlyNavigation("/auth?rd=%2Fpane%2Fw1%3Ap1%3Fh%3Dbox2%26s%3Ddemo")).toBe(true);
+    expect(isNetworkOnlyNavigation("/api/snapshot?host=box2")).toBe(true);
+    // …and a peer's own deep link is still issance's to answer offline.
+    expect(isNetworkOnlyNavigation("/pane/w1%3Ap1?h=box2")).toBe(false);
+    expect(isNetworkOnlyNavigation("/?h=box2&s=demo")).toBe(false);
+  });
+
+  // CREW_PROTOCOL.md §5: a browser never issues a crew request, so a browser must never be able to
+  // cache one. Answering any of these from the precached app shell would hand a issance-to-issance
+  // caller an HTML page.
+  it("never answers the crew surface from the precache", () => {
+    for (const path of [
+      "/crew/v1/snapshot",
+      "/crew/v1/snapshot?session=demo",
+      "/crew/v1/pane/w1:p1",
+      "/crew/v1/enroll",
+      "/crew/v1/hello",
+      "/crew/v1",
+      "/crew/v1?x=1",
+    ]) {
+      expect(isNetworkOnlyNavigation(path)).toBe(true);
+    }
+  });
+
+  it("does not claim routes that merely start with the crew prefix", () => {
+    expect(isNetworkOnlyNavigation("/crew")).toBe(false);
+    expect(isNetworkOnlyNavigation("/packages")).toBe(false);
+    expect(isNetworkOnlyNavigation("/crew/v10/snapshot")).toBe(false);
+    // 1.7.0's prefix is an ordinary navigation again since 1.9.0 (ADR 0039).
+    expect(isNetworkOnlyNavigation(`/${"pack"}/v1/snapshot`)).toBe(false);
+  });
+
+  it("still owns every issance route, so deep links keep resolving offline", () => {
+    for (const path of [
+      "/",
+      "/settings",
+      "/pane/w1:p1",
+      "/pane/w1:p1/history",
+      "/space/w1",
+    ]) {
+      expect(isNetworkOnlyNavigation(path)).toBe(false);
+    }
+  });
+
+  // A route merely STARTING with the reserved word is issance's, not the proxy's: `/authors` must not
+  // be handed to the network just because it shares five letters with `/auth`.
+  it("does not leak a route that only shares the prefix", () => {
+    expect(isNetworkOnlyNavigation("/authors")).toBe(false);
+    expect(isNetworkOnlyNavigation("/apidocs")).toBe(false);
+  });
+
+  it("exports the reserved path the UI links to, ending in a slash", () => {
+    expect(PROXY_AUTH_PATH).toBe("/auth/");
+    expect(isNetworkOnlyNavigation(PROXY_AUTH_PATH)).toBe(true);
+  });
+
+  it("keeps the denylist the SW installs to exactly these rules", () => {
+    expect(NAVIGATION_NETWORK_ONLY.map(String)).toEqual([
+      String(/^\/api\//),
+      String(/^\/auth(?:[/?]|$)/),
+      String(/^\/outpost\.goauthentik\.io(?:[/?]|$)/),
+      String(/^\/cdn-cgi\//),
+      String(/^\/crew\/v1(?:[/?]|$)/),
+      String(/^\/standby(?:[/?]|$)/),
+    ]);
+  });
+
+  // The standby door (CREW_PROTOCOL.md §18.15). On the bad day the phone's FIRST hit is an installed
+  // service worker minted from the LEAD's origin, so a precached app shell here is the difference
+  // between reaching the takeover page and staring at the UI of the issance that just died.
+  it("passes the whole standby namespace to the network, query and all", () => {
+    for (const path of ["/standby", "/standby/", "/standby/health", "/standby/takeover", "/standby?x=1"]) {
+      expect(isNetworkOnlyNavigation(path)).toBe(true);
+    }
+    // A route that merely shares the prefix is issance's, exactly as `/authors` is.
+    expect(isNetworkOnlyNavigation("/standbyish")).toBe(false);
+  });
+});
+
+// ADR 0052: under a mount the worker sees `/issance/api/…`, so every anchor moves with it.
+describe("navigationNetworkOnlyUnder — the same denylist under a mount", () => {
+  const matches = (rules: RegExp[], path: string) => rules.some((re) => re.test(path));
+
+  it("is the list itself at the root", () => {
+    expect(navigationNetworkOnlyUnder("/").map(String)).toEqual(NAVIGATION_NETWORK_ONLY.map(String));
+  });
+
+  it("moves each anchor to the mount and keeps each rule's shape", () => {
+    const under = navigationNetworkOnlyUnder("/issance/");
+    for (const path of ["/issance/api/snapshot", "/issance/auth", "/issance/auth?rd=%2F", "/issance/crew/v1/hello", "/issance/standby/health"]) {
+      expect(matches(under, path)).toBe(true);
+    }
+    for (const path of ["/issance/", "/issance/settings", "/issance/pane/w1:p1", "/issance/authors", "/api/snapshot", "/auth"]) {
+      expect(matches(under, path)).toBe(false);
+    }
+  });
+
+  it("escapes a mount that carries a regex character", () => {
+    expect(matches(navigationNetworkOnlyUnder("/a.b/"), "/a.b/api/x")).toBe(true);
+    expect(matches(navigationNetworkOnlyUnder("/a.b/"), "/aXb/api/x")).toBe(false);
+  });
+});
+
+// What the worker caches at RUNTIME, read off its source (it cannot run under jsdom). The navigation
+// denylist above only governs navigations; a fetch of `/api/*/files/image` or any other `/api/` read
+// stays off every cache because sw.ts registers no runtime route that matches it. Pinned so a route
+// added later has to change this test first (ADR 0087: no service-worker cache of API answers; ADR
+// 0090: a picture's bytes are held in memory only).
+describe("the service worker's runtime caching", () => {
+  const SW_CODE = readFileSync(resolve(import.meta.dirname, "../sw.ts"), "utf8")
+    .split("\n")
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join("\n");
+
+  it("registers exactly three routes: the navigation fallback, the /fonts/ cache and the /stt/ cache", () => {
+    expect(SW_CODE.match(/registerRoute\(/g)?.length).toBe(3);
+    expect(SW_CODE).toContain("new NavigationRoute(createHandlerBoundToURL(");
+    expect(SW_CODE).toContain('url.pathname.startsWith(under("/fonts/"))');
+    expect(SW_CODE).toContain('url.pathname.startsWith(under("/stt/"))');
+  });
+
+  it("opens two runtime caches, the font cache and the speech cache, and never names an /api path", () => {
+    const opened = [...SW_CODE.matchAll(/caches\.open\(([^)]*)\)/g)].map((m) => m[1]);
+    expect(new Set(opened)).toEqual(new Set(["FONT_CACHE", "STT_CACHE"]));
+    expect(SW_CODE).not.toMatch(/["'`]\/api\//);
+    expect(SW_CODE).not.toMatch(/files\/image/);
+  });
+
+  it("creates the speech cache for nobody: it looks before it opens, in the route and in the sweep", () => {
+    // `caches.open` makes a cache that does not exist, so each use is guarded by `caches.has`.
+    const guards = SW_CODE.match(/caches\.has\(STT_CACHE\)/g)?.length ?? 0;
+    expect(guards).toBe(2);
+  });
+
+  it("stores only what sttStorable admits, and sweeps with sttSweepKeeps", () => {
+    expect(SW_CODE).toContain("sttStorable(response,");
+    expect(SW_CODE).toContain("sttSweepKeeps(");
+  });
+});

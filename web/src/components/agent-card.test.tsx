@@ -1,0 +1,475 @@
+import { act, createEvent, fireEvent, render, within } from "@testing-library/react";
+
+import { AgentCard } from "./agent-card";
+import { fixtureAgents } from "@/test/handlers";
+import type { JsonValue } from "@/lib/json";
+import type { AgentView } from "@/lib/types";
+
+// The row's ANATOMY, which is the thing that keeps getting re-argued: line 1 is the pane's NAME
+// beside a small agent tile, line 2 is its PLACE, `space › tab`. One name, one place, the same way
+// round on every surface (lib/pane-name.ts). Addressed through `data-slot` rather than class names:
+// the classes are a layout decision and are meant to move; which line a fact lands on is the
+// contract.
+
+const agent = (over: Partial<AgentView> = {}): AgentView => ({ ...fixtureAgents[0]!, ...over });
+
+const line1 = (container: HTMLElement) =>
+  container.querySelector<HTMLElement>('[data-slot="agent-row-title"]');
+const line2 = (container: HTMLElement) =>
+  container.querySelector<HTMLElement>('[data-slot="agent-row-detail"]');
+
+describe("AgentCard's two lines", () => {
+  it("leads with the pane title and the agent tile, and puts space then tab beneath", () => {
+    const { container } = render(
+      <AgentCard agent={agent({ tabLabel: "review", sessionName: "rewrite the loader" })} onClick={() => {}} />,
+    );
+
+    const top = line1(container)!;
+    expect(top).toHaveTextContent("rewrite the loader");
+    // The tile is the agent's own mark, inline on line 1 — not a 36px column ahead of the text.
+    expect(within(top).getByRole("img", { name: "claude logo" })).toBeInTheDocument();
+    // The space and the tab are NOT on line 1; that is the whole change.
+    expect(top).not.toHaveTextContent("webapp");
+    expect(top).not.toHaveTextContent("review");
+
+    // Space first, then the crumb, then the tab — in that order, in one line.
+    expect(line2(container)).toHaveTextContent(/^webapp\s*›\s*review$/);
+  });
+
+  it("shows the space alone, with no separator, when there is no tab", () => {
+    const { container } = render(
+      <AgentCard agent={agent({ tabLabel: undefined, sessionName: "rewrite the loader" })} onClick={() => {}} />,
+    );
+
+    expect(line1(container)).toHaveTextContent("rewrite the loader");
+    expect(line2(container)).toHaveTextContent("webapp");
+    expect(line2(container)).not.toHaveTextContent("›");
+  });
+
+  it("NEVER leads with the place: a pane with no name of its own reads as its agent", () => {
+    const { container } = render(<AgentCard agent={agent({ tabLabel: "review" })} onClick={() => {}} />);
+
+    // The old rule promoted the tab to line 1 here, so one pane was called "review" on this screen
+    // and something else on the next. The agent word is the floor, and the place stays on line 2.
+    expect(line1(container)).toHaveTextContent("claude");
+    expect(line2(container)).toHaveTextContent(/^webapp\s*›\s*review$/);
+  });
+
+  it("still shows the place beneath a pane that has neither a tab nor a name", () => {
+    const { container } = render(<AgentCard agent={agent()} onClick={() => {}} />);
+
+    expect(line1(container)).toHaveTextContent("claude");
+    expect(line2(container)).toHaveTextContent("webapp");
+  });
+
+  // In a list already grouped under its space and tab, repeating them says nothing — so the pane's
+  // own name takes line 1 and the path is all that is left for line 2. Same two shapes.
+  it("leads with the pane's own name in a tab-scoped list", () => {
+    const { container } = render(
+      <AgentCard
+        agent={agent({ tabLabel: "review", paneLabel: "logs", cwd: "/home/you/webapp/api" })}
+        onClick={() => {}}
+        scope="tab"
+      />,
+    );
+
+    const top = line1(container)!;
+    expect(top).toHaveTextContent("logs");
+    expect(top).not.toHaveTextContent("webapp");
+    expect(within(top).getByRole("img", { name: "claude logo" })).toBeInTheDocument();
+
+    expect(line2(container)).toHaveTextContent("webapp/api");
+    expect(line2(container)).not.toHaveTextContent("review");
+  });
+});
+
+// A list already grouped by WORKSPACE (lib/pane-groups.ts) has said the workspace in its heading, so
+// the row's line 2 carries the TAB and nothing else — blank when that tab has no name of its own.
+// The row states its own height, and its address and cache reading ride at the end of line 1
+// instead of in the trailing column.
+describe("AgentCard in a workspace group", () => {
+  const row = (over: Partial<AgentView> = {}) =>
+    render(
+      <AgentCard
+        agent={agent({ tabLabel: "review", paneLabel: "logs", cwd: "/home/you/webapp/api", ...over })}
+        onClick={() => {}}
+        scope="place"
+        statusStyle="dot"
+        density="row"
+      />,
+    );
+
+  it("keeps line 1 and puts the tab, alone, on line 2", () => {
+    const { container } = row();
+    expect(line1(container)).toHaveTextContent("logs");
+    expect(line2(container)).toHaveTextContent("review");
+    // Not the workspace: the heading above said it. Not the cwd either — that is `tab`'s answer.
+    expect(line2(container)).not.toHaveTextContent("webapp");
+    expect(container.textContent).not.toContain("webapp/api");
+  });
+
+  it("shows the tab's position when it carries no name of its own", () => {
+    const { container } = row({ tabLabel: "3" });
+    const detail = line2(container)!;
+    expect(detail).not.toBeNull();
+    expect(detail.textContent).toBe("tab 3");
+    expect(detail.className).toMatch(/(?:^|\s)h-4(?=\s|$)/);
+  });
+
+  it("centres the name when the raw tab label carries no digit at all", () => {
+    const { container } = row({ tabLabel: "" });
+    // No slot at all: the row's own `items-center` puts the name in the middle instead.
+    expect(line2(container)).toBeNull();
+    expect(line1(container)).toHaveTextContent("logs");
+  });
+
+  it("states the row's height rather than letting its contents set it", () => {
+    for (const over of [{}, { tabLabel: "3" }]) {
+      const { container } = row(over);
+      expect(container.querySelector("button")!.firstElementChild!.className).toMatch(
+        /(?:^|\s)h-11(?=\s|$)/,
+      );
+    }
+  });
+
+  it("withholds the bridge's hint, which is the one fact that would change a row's height", () => {
+    const { container } = row({ hint: "waiting on a build" });
+    expect(container.textContent).not.toContain("waiting on a build");
+  });
+
+  it("puts the meta at the end of line 1, not in a slot of its own", () => {
+    const { container } = row();
+    const title = container.querySelector('[data-slot="agent-row-title"]')!;
+    expect(title.querySelector('[data-slot="pane-meta"]')).not.toBeNull();
+    const detail = line2(container);
+    expect(detail?.querySelector('[data-slot="pane-meta"]')).toBeNull();
+  });
+});
+
+describe("AgentCard's unseen marker", () => {
+  it("renders a labelled dot right after the name when unseen, and nothing when it isn't", () => {
+    const { container, rerender } = render(<AgentCard agent={agent()} onClick={() => {}} unseen />);
+    const title = container.querySelector<HTMLElement>('[data-slot="agent-row-title"]')!;
+    expect(within(title).getByRole("img", { name: "unseen" })).toBeInTheDocument();
+
+    rerender(<AgentCard agent={agent()} onClick={() => {}} />);
+    expect(within(title).queryByRole("img", { name: "unseen" })).not.toBeInTheDocument();
+  });
+
+  // Regression: the dot used to land at the FAR end of the row, next to the host chip, because the
+  // name span was `flex-1` and grew to fill the line before the dot ever got a turn. It has to sit
+  // right beside the name it marks, "billing webhooks •" reading as one unit — never off beside the
+  // meta at the other edge.
+  it("sits directly after the name, not after the trailing meta", () => {
+    const { container } = render(
+      <AgentCard
+        agent={agent({ sessionName: "billing webhooks", host: "lodge" })}
+        onClick={() => {}}
+        unseen
+      />,
+    );
+    const title = container.querySelector<HTMLElement>('[data-slot="agent-row-title"]')!;
+    const name = within(title).getByText("billing webhooks");
+    const dot = within(title).getByRole("img", { name: "unseen" });
+    const meta = title.querySelector('[data-slot="pane-meta"]')!;
+    // The dot is the name's very next element sibling…
+    expect(name.nextElementSibling).toBe(dot);
+    // …and the meta comes after the dot, never before it.
+    expect(dot.compareDocumentPosition(meta) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // The name no longer claims the row's spare width itself — it truncates on its own content,
+    // and `PaneMeta`'s `ml-auto` is what pins the meta to the end instead.
+    expect(name.className).not.toMatch(/flex-1/);
+    expect(meta.className).toMatch(/(?:^|\s)ml-auto(?=\s|$)/);
+  });
+});
+
+// A flat row states its own height whatever scope it's in — the urgent sections of the dashboard
+// (agent-list.tsx) render at `scope="herd"`, `density="row"`, and must match the 44px of a
+// workspace-grouped row (`scope="place"`) exactly, or the two kinds of row stop reading as one list.
+describe("AgentCard — a flat row states its height on every scope, not just \"place\"", () => {
+  it("states h-11 for scope=\"herd\" once density is \"row\"", () => {
+    const { container } = render(
+      <AgentCard agent={agent()} onClick={() => {}} scope="herd" density="row" />,
+    );
+    expect(container.querySelector("button")!.firstElementChild!.className).toMatch(
+      /(?:^|\s)h-11(?=\s|$)/,
+    );
+  });
+
+  it("withholds the bridge's hint on that same flat row", () => {
+    const { container } = render(
+      <AgentCard
+        agent={agent({ hint: "waiting on a build" })}
+        onClick={() => {}}
+        scope="herd"
+        density="row"
+      />,
+    );
+    expect(container.textContent).not.toContain("waiting on a build");
+  });
+});
+
+// EVERY SCOPE NOW SHARES ONE SHAPE: the meta rides the end of line 1, baseline-aligned with the
+// name, and line 2 is whatever that scope's own text is — never the meta. The corner column that
+// used to set herd/tab rows apart from a place row is gone (2026-09-14); a herd card and a
+// workspace-grouped row differ only in what line 2 says.
+describe("AgentCard — the meta rides line 1 on every scope", () => {
+  for (const scope of ["herd", "tab", "place"] as const) {
+    it(`scope="${scope}" puts the pane's address and cache reading at the end of line 1`, () => {
+      const { container } = render(<AgentCard agent={agent()} onClick={() => {}} scope={scope} />);
+      const title = container.querySelector('[data-slot="agent-row-title"]')!;
+      const meta = title.querySelector('[data-slot="pane-meta"]');
+      expect(meta).not.toBeNull();
+      // Baseline-aligned with the name, not centred with the dot and the tile.
+      expect(meta?.className).toMatch(/(?:^|\s)self-baseline(?=\s|$)/);
+      const name = title.querySelector("span.font-medium")!;
+      expect(name.className).toMatch(/(?:^|\s)self-baseline(?=\s|$)/);
+    });
+  }
+});
+
+// THE ROW HOLD (ADR 0070): a hold on a dashboard row opens the pane's actions sheet. The click that
+// ends the hold is swallowed, so a hold never also opens the pane.
+describe("AgentCard's hold", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("opens the sheet on a 450ms hold and does not open the pane", () => {
+    vi.useFakeTimers();
+    const onClick = vi.fn();
+    const onHold = vi.fn();
+    const onPress = vi.fn();
+    const { getByRole } = render(
+      <AgentCard agent={agent()} onClick={onClick} onHold={onHold} onPress={onPress} density="row" statusStyle="dot" />,
+    );
+    const row = getByRole("button");
+    fireEvent.pointerDown(row, { button: 0, clientX: 10, clientY: 10 });
+    // The press still starts the pane's read, as a tap does.
+    expect(onPress).toHaveBeenCalledOnce();
+    act(() => vi.advanceTimersByTime(449));
+    expect(onHold).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(1));
+    expect(onHold).toHaveBeenCalledOnce();
+    fireEvent.pointerUp(row);
+    fireEvent.click(row);
+    expect(onClick).not.toHaveBeenCalled();
+  });
+
+  it("opens the sheet on contextmenu (right-click, the Menu key, Android's long press) and not the pane", () => {
+    const onClick = vi.fn();
+    const onHold = vi.fn();
+    const { getByRole } = render(<AgentCard agent={agent()} onClick={onClick} onHold={onHold} />);
+    const row = getByRole("button");
+    const menu = createEvent.contextMenu(row);
+    fireEvent(row, menu);
+    expect(menu.defaultPrevented).toBe(true);
+    expect(onHold).toHaveBeenCalledOnce();
+    expect(onClick).not.toHaveBeenCalled();
+  });
+
+  it("still opens the pane on a plain tap", () => {
+    const onClick = vi.fn();
+    const onHold = vi.fn();
+    const { getByRole } = render(<AgentCard agent={agent()} onClick={onClick} onHold={onHold} />);
+    fireEvent.click(getByRole("button"));
+    expect(onClick).toHaveBeenCalledOnce();
+    expect(onHold).not.toHaveBeenCalled();
+  });
+
+  it("cancels the hold when the finger moves, so a scroll never opens the sheet", () => {
+    vi.useFakeTimers();
+    const onHold = vi.fn();
+    const { getByRole } = render(<AgentCard agent={agent()} onClick={vi.fn()} onHold={onHold} />);
+    const row = getByRole("button");
+    fireEvent.pointerDown(row, { button: 0, clientX: 10, clientY: 10 });
+    fireEvent.pointerMove(row, { clientX: 10, clientY: 40 });
+    act(() => vi.advanceTimersByTime(600));
+    expect(onHold).not.toHaveBeenCalled();
+  });
+
+  it("keeps its button role and name, and adds no second tab stop", () => {
+    const { container, getByRole } = render(<AgentCard agent={agent()} onClick={vi.fn()} onHold={vi.fn()} />);
+    expect(getByRole("button")).toBeInTheDocument();
+    expect(container.querySelectorAll("button, [tabindex]")).toHaveLength(1);
+  });
+
+  it("has no hold without `onHold`: the native menu stays and the row reads as before", () => {
+    const onClick = vi.fn();
+    const { getByRole } = render(<AgentCard agent={agent()} onClick={onClick} />);
+    const row = getByRole("button");
+    const menu = createEvent.contextMenu(row);
+    fireEvent(row, menu);
+    expect(menu.defaultPrevented).toBe(false);
+    expect(row.className).not.toMatch(/select-none/);
+  });
+});
+
+// M46 spec 10: a row drawn from the saved copy dims and says its status in the past tense, so a
+// cached herd never reads as live.
+describe("AgentCard — the saved copy", () => {
+  const working: AgentView = { ...fixtureAgents[0]!, status: "working" };
+
+  it("says the status in the past tense and dims the row when stale", () => {
+    const { container } = render(
+      <AgentCard agent={working} onClick={() => {}} density="row" statusStyle="dot" stale />,
+    );
+    expect(within(container).getByText("was working")).toBeInTheDocument();
+    expect(within(container).queryByText("working")).toBeNull();
+    expect(container.querySelector(".opacity-50")).not.toBeNull();
+  });
+
+  it("speaks the badge in the past tense too", () => {
+    const { container } = render(<AgentCard agent={working} onClick={() => {}} stale />);
+    expect(within(container).getByText("was working")).toBeInTheDocument();
+  });
+
+  it("stays in the present and undimmed when live", () => {
+    const { container } = render(<AgentCard agent={working} onClick={() => {}} density="row" statusStyle="dot" />);
+    expect(within(container).getByText("working")).toBeInTheDocument();
+    expect(container.querySelector(".opacity-50")).toBeNull();
+  });
+});
+
+// The branch the pane's folder is on leads line 2, in the 16px slot the line already has, and a row
+// without one is the row drawn before the field existed.
+describe("AgentCard — the branch on line 2", () => {
+  const branchLabel = (container: HTMLElement) => container.querySelector<HTMLElement>('[data-slot="branch-label"]');
+
+  it("leads line 2 with the branch, then the tab, in a workspace-grouped row", () => {
+    const { container } = render(
+      <AgentCard
+        agent={agent({ tabLabel: "review", gitHead: { kind: "branch", name: "fix-login" } })}
+        onClick={() => {}}
+        scope="place"
+        density="row"
+        statusStyle="dot"
+      />,
+    );
+    const detail = line2(container)!;
+    expect(within(detail).getByText("Branch fix-login")).toBeInTheDocument();
+    expect(detail.firstElementChild).toBe(branchLabel(container));
+    expect(detail).toHaveTextContent("review");
+  });
+
+  it("fills a slot an unnamed tab would leave empty, at the same stated row height", () => {
+    const plain = render(
+      <AgentCard agent={agent({ tabLabel: undefined })} onClick={() => {}} scope="place" density="row" statusStyle="dot" />,
+    );
+    const branched = render(
+      <AgentCard
+        agent={agent({ tabLabel: undefined, gitHead: { kind: "branch", name: "main" } })}
+        onClick={() => {}}
+        scope="place"
+        density="row"
+        statusStyle="dot"
+      />,
+    );
+    const row = (c: HTMLElement) => c.querySelector<HTMLElement>(".h-11");
+    expect(row(plain.container)).not.toBeNull();
+    expect(row(branched.container)).not.toBeNull();
+    expect(line2(branched.container)).toHaveClass("h-4");
+    expect(within(line2(branched.container)!).getByText("Branch main")).toBeInTheDocument();
+  });
+
+  it("reads a detached head as its short object name", () => {
+    const { container } = render(
+      <AgentCard
+        agent={agent({ tabLabel: "review", gitHead: { kind: "detached", sha: "abc1234def5678abc1234def5678abc1234def56" } })}
+        onClick={() => {}}
+      />,
+    );
+    expect(within(line2(container)!).getByText("detached @abc1234")).toBeInTheDocument();
+    expect(within(line2(container)!).getByText("Detached at abc1234")).toBeInTheDocument();
+  });
+
+  it("draws exactly today's line when the bridge sends no branch", () => {
+    const { container } = render(<AgentCard agent={agent({ tabLabel: "review" })} onClick={() => {}} />);
+    expect(branchLabel(container)).toBeNull();
+    expect(line2(container)).toHaveTextContent(/^webapp\s*›\s*review$/);
+  });
+
+  it("ignores a head this build does not know, from a newer member", () => {
+    // A foreign shape, the one a newer crew member could send, arriving the way the wire delivers it.
+    const odd: AgentView["gitHead"] = JSON.parse('{"kind":"tag","name":"v1"}');
+    const { container } = render(<AgentCard agent={agent({ tabLabel: "review", gitHead: odd })} onClick={() => {}} />);
+    expect(branchLabel(container)).toBeNull();
+  });
+});
+
+// A durable program's subtitle and badge (WIRE.md 7.11).
+// A crew peer's pane arrives unchecked, so these cases hand the card the wrong shapes a peer could send.
+// SAFETY: the card reads both fields through the JSON guards (lib/pane-marks.ts), which is what the cases test.
+const wrongBadge = (value: JsonValue): AgentView["badge"] => value as AgentView["badge"];
+// SAFETY: as above, for the subtitle.
+const wrongSubtitle = (value: JsonValue): AgentView["subtitle"] => value as AgentView["subtitle"];
+
+describe("AgentCard: subtitle and badge", () => {
+  const badgeOf = (c: HTMLElement) => c.querySelector<HTMLElement>('[data-slot="pane-badge"]');
+
+  it("draws a count badge on line 1, next to the name, and a subtitle on a line of its own on a card", () => {
+    const { container } = render(
+      <AgentCard agent={agent({ sessionName: "Ticket #3", subtitle: "a customer cannot log in", badge: { count: 2 } })} onClick={() => {}} />,
+    );
+    expect(line1(container)).toContainElement(badgeOf(container));
+    expect(badgeOf(container)).toHaveTextContent("2");
+    expect(container.querySelector('[data-slot="agent-row-subtitle"]')).toHaveTextContent("a customer cannot log in");
+    // The place line is still there: a card has room for both.
+    expect(line2(container)).toHaveTextContent("webapp");
+  });
+
+  it("draws a text badge, and nothing for a zero count or a badge of the wrong shape", () => {
+    const text = render(<AgentCard agent={agent({ badge: { text: "new" } })} onClick={() => {}} />);
+    expect(badgeOf(text.container)).toHaveTextContent("new");
+    for (const badge of [{ count: 0 }, { count: 1.5 }, { text: " " }, { count: 2, text: "x" }, 5, "3"]) {
+      const { container } = render(<AgentCard agent={agent({ badge: wrongBadge(badge) })} onClick={() => {}} />);
+      expect(badgeOf(container)).toBeNull();
+    }
+  });
+
+  it("takes the detail slot for the subtitle on a flat row, so the row keeps its stated height", () => {
+    const { container } = render(
+      <AgentCard agent={agent({ subtitle: "helping ticket 4" })} density="row" scope="place" onClick={() => {}} />,
+    );
+    expect(line2(container)).toHaveTextContent("helping ticket 4");
+    expect(line2(container)).toHaveClass("h-4");
+    expect(container.querySelector('[data-slot="agent-row-subtitle"]')).toBeNull();
+  });
+
+  it("draws neither for a pane that has none, and ignores a subtitle that is not text", () => {
+    const { container } = render(<AgentCard agent={agent()} onClick={() => {}} />);
+    expect(badgeOf(container)).toBeNull();
+    expect(container.querySelector('[data-slot="agent-row-subtitle"]')).toBeNull();
+    const odd = render(<AgentCard agent={agent({ subtitle: wrongSubtitle(5) })} onClick={() => {}} />);
+    expect(odd.container.querySelector('[data-slot="agent-row-subtitle"]')).toBeNull();
+  });
+});
+
+describe("AgentCard: progress", () => {
+  const bar = (c: HTMLElement) => c.querySelector<HTMLElement>('[data-slot="progress"]');
+
+  it("draws a hairline bar on a working card, filled by the share of steps done", () => {
+    const steps = [
+      { label: "read the ticket", state: "done" as const },
+      { label: "write a note", state: "running" as const },
+      { label: "reply", state: "todo" as const },
+      { label: "close", state: "todo" as const },
+    ];
+    const { container } = render(<AgentCard agent={agent({ status: "working", progress: { kind: "steps", steps } })} onClick={() => {}} />);
+    expect(bar(container)).toHaveAttribute("data-size", "hairline");
+    expect(bar(container)).toHaveAttribute("aria-valuenow", "25");
+  });
+
+  it("draws a percent, also on a flat row, and adds no line to the row", () => {
+    const { container } = render(
+      <AgentCard agent={agent({ status: "working", progress: { kind: "percent", value: 60 } })} density="row" scope="place" onClick={() => {}} />,
+    );
+    expect(bar(container)).toHaveAttribute("aria-valuenow", "60");
+    expect(container.querySelector('[data-slot="agent-row-subtitle"]')).toBeNull();
+  });
+
+  it("draws no bar on an idle pane that still carries one, nor on a pane without one", () => {
+    const idle = render(<AgentCard agent={agent({ status: "idle", progress: { kind: "percent", value: 60 } })} onClick={() => {}} />);
+    expect(bar(idle.container)).toBeNull();
+    const none = render(<AgentCard agent={agent({ status: "working" })} onClick={() => {}} />);
+    expect(bar(none.container)).toBeNull();
+  });
+});

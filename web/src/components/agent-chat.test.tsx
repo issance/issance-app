@@ -1,0 +1,4863 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { useState, type ComponentProps } from "react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { http, HttpResponse } from "msw";
+import { createMemoryRouter, RouterProvider, useParams, useRevalidator } from "react-router";
+
+import { __resetConnectionHealth } from "@/lib/connection-health";
+import type { JsonValue } from "@/lib/json";
+
+// Mock the race guard at AgentChat's seam so the frozen-revision tests can observe exactly what
+// `detectedRevision` the tap handler passes (the guard's own behaviour is covered in
+// prompt-select-block.test.tsx). The other tests in this file never reach it.
+vi.mock("@/lib/prompt-action", () => ({
+  submitPromptOption: vi.fn(),
+}));
+vi.mock("@/lib/wizard-action", () => ({
+  submitWizardKeys: vi.fn(),
+}));
+// The Chat gate's one clock, the last resort, pushed past every horizon in this file (still under
+// 2^31, the most a timer takes). Each fallback the timelines below record is therefore an EVENT's:
+// none of them can be the clock's (lib/chat-gate.ts § LAST_RESORT_NO_JOURNAL_MS).
+vi.mock("@/lib/chat-gate", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/chat-gate")>()),
+  LAST_RESORT_NO_JOURNAL_MS: 2_000_000_000,
+}));
+
+import { server } from "@/test/setup";
+import { clearStatus, setStatus, useStatus } from "@/lib/status";
+import { setAutoZenEnabled, setZenEnabled, __resetZen } from "@/lib/zen";
+import { HarnessPrefsControl } from "@/components/harness-prefs-control";
+import { __resetHarnessPrefs, setHarnessStatusLineShown } from "@/lib/harness-prefs";
+import { noPromptsConfirmed, rememberNoPromptsConfirm } from "@/lib/no-prompts";
+import { setStripsCollapsed, __resetStripsCollapsed } from "@/lib/strips-collapsed";
+import { __resetOperatorCommands } from "@/lib/operator-config";
+import { paneMirrorOverride, setPaneMirrorOverride } from "@/lib/mirror-invert";
+import { submitPromptOption } from "@/lib/prompt-action";
+import { submitWizardKeys } from "@/lib/wizard-action";
+import { fixtureAgents, fixtureShellPanes, fixtureTabs, fixtureTranscriptWithImage, paneTextWithDraft, sendAnswer, sendHandler } from "@/test/handlers";
+import type { Ask, Surface } from "@/lib/surface/surface";
+import { parseAnsi } from "@/lib/ansi";
+import { splitLines } from "@/lib/blocks";
+import { liftDialog, readerBlocks } from "@/lib/surface/lift";
+import { CrewProvider } from "./crew-provider";
+import type { AgentStatus, AgentView, ChatWindowBody, ServerSummary, TabView } from "@/lib/types";
+import { withHeaderHost } from "@/test/header-host";
+import { COLLAPSE_MS } from "./ui/collapse";
+import { AgentChat } from "./agent-chat";
+import { saveChatTail } from "@/lib/chat-tail";
+import { __resetMaskedHint, maskedHintRetired } from "@/lib/masked-hint";
+
+// M46 spec 11 turns every send off for a pane the bridge has not answered lately (lib/liveness.ts).
+// These suites drive sends against a mocked network and never poll first, so they pin the pane live;
+// the gating itself is covered by liveness.test.ts and the *-offline suites.
+const liveness = vi.hoisted(() => ({ live: true }));
+vi.mock("@/lib/liveness", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/liveness")>()),
+  isLive: () => liveness.live,
+  useLive: () => liveness.live,
+}));
+
+// The detail view's core job: type a reply and submit it to the bridge. This drives the whole wired
+// path (composer → api.sendReply → MSW → optimistic clear / error surfacing) end-to-end, which no
+// other test covers. AgentChat uses useRevalidator, so it needs a data router (createMemoryRouter).
+
+beforeAll(() => {
+  // jsdom doesn't implement scrollTo; the terminal mirror's auto-scroll calls it.
+  if (!Element.prototype.scrollTo) Element.prototype.scrollTo = () => {};
+});
+beforeEach(() => {
+  clearStatus();
+  // Zen's availability is a module-scoped, localStorage-backed store — one case turning it on would
+  // otherwise leave every later case rendering a menu row it never asked for.
+  __resetZen();
+  // Same shape, same reason: a case that folds the strips would otherwise leave every later case
+  // rendering a bead bar it never asked for.
+  __resetStripsCollapsed();
+  // And the per-harness status line switch: a case that turns a strip off must not blank the next.
+  __resetHarnessPrefs();
+  // Same shape once more: launchers.toml's rows are cached for the life of the page (one successful
+  // /api/config read), so a case that declares launchers would otherwise leak them into every case
+  // that comes after it.
+  __resetOperatorCommands();
+});
+
+function renderChat(overrides: Partial<ComponentProps<typeof AgentChat>> = {}) {
+  const agent = fixtureAgents[0]!; // a blocked claude agent
+  const props: ComponentProps<typeof AgentChat> = {
+    paneId: agent.paneId,
+    agent,
+    agents: fixtureAgents,
+    shellPanes: [],
+    tabs: [],
+    // A REAL claude pane: the transcript row plus the input box under it. Since M34 a pane with no
+    // composer on screen is the unread-dialog card's territory (.adr/0053) — the card owns the
+    // keyboard, so the composer would refuse every send in this file. Cases that want the card build
+    // their own text.
+    text: paneTextWithDraft("recent pane output"),
+    onBack: vi.fn(),
+    onSelect: vi.fn(),
+    ...overrides,
+  };
+  const router = createMemoryRouter([{ path: "/", element: withHeaderHost(<AgentChat {...props} />) }]);
+  const { container } = render(<RouterProvider router={router} />);
+  return { props, container };
+}
+
+// Find and History are ROWS in the pane's actions sheet now — the header spends ONE ⋮ on the whole
+// menu instead of two icons on two actions. Every test that used to click a header icon goes through
+// this door, which is also the point: there is exactly one door.
+type User = ReturnType<typeof userEvent.setup>;
+async function openPaneMenu(user: User) {
+  await user.click(screen.getByRole("button", { name: "Pane actions" }));
+}
+async function openFind(user: User) {
+  await openPaneMenu(user);
+  await user.click(screen.getByRole("button", { name: "Find in output" }));
+}
+
+describe("AgentChat — reply flow", () => {
+  it("sends a typed reply and clears the composer on success", async () => {
+    const user = userEvent.setup();
+    renderChat();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+
+    await user.type(box, "looks good");
+    expect(box).toHaveValue("looks good");
+
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(box).toHaveValue(""));
+  });
+
+  it("keeps the draft and surfaces the bridge's words when it refuses the send", async () => {
+    server.use(...sendHandler((request) => sendAnswer(request.id, "refused", "not_free", { detail: "agent busy" })));
+    const user = userEvent.setup();
+    renderChat();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+
+    await user.type(box, "retry this");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("agent busy")).toBeInTheDocument();
+    expect(box).toHaveValue("retry this"); // not cleared on failure
+  });
+});
+
+// M56 spec 06: the composer reads the pane's Surface, not the mirror. A dialog the mirror draws as a
+// card does not change the Send slot by itself; the bridge's read does.
+describe("AgentChat: the composer reads the pane's Surface", () => {
+  it("an ask on the pane's Surface leaves the placeholder at the plain reply line", () => {
+    renderChat({ text: MENU_TEXT, agent: MENU_AGENT });
+    expect(screen.getByPlaceholderText("Type a reply…")).toBeInTheDocument();
+  });
+
+  it("a marked pane the bridge has not read yet keeps Send open", async () => {
+    const user = userEvent.setup();
+    renderChat();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    await user.type(box, "hello");
+    expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
+  });
+
+  it("a pane the bridge does not mark for the Send Protocol says sending is off, and locks the field", () => {
+    const { sendProtocol: _off, ...unmarked } = fixtureAgents[0]!;
+    renderChat({ agent: unmarked });
+    expect(screen.getByPlaceholderText(/cannot take text from the phone/i)).toBeDisabled();
+  });
+});
+
+// Echoes the space passed via navigation state, so a test can assert the header lands on the space
+// overview ("/") for the right workspace.
+function SpaceOverviewSentinel() {
+  const { spaceId } = useParams();
+  return <div>overview:{spaceId ?? "none"}</div>;
+}
+
+describe("AgentChat — header title block", () => {
+  it("leads with the space, and drops the redundant agent name and the directory that repeats it", () => {
+    renderChat(); // claude @ /home/you/webapp → ~/webapp, under the name "webapp"
+    expect(screen.getByText("webapp")).toBeInTheDocument(); // space leads
+    // The cwd subline is gated on saying something the name does not: `~/webapp` under `webapp` is
+    // the same word twice, so line 3 does not render. See the cwd-gate describe block below.
+    expect(screen.queryByText("~/webapp")).toBeNull();
+    // The agent is conveyed by its icon (aria-label only), so its name isn't repeated as text.
+    // Scoped to the title block itself: the mirror below it may legitimately NAME the agent — the
+    // no-session note (#137) does — and that is not the redundancy this asserts against.
+    const title = screen.getByRole("button", { name: /open webapp overview/i });
+    expect(within(title).queryByText(/claude/i)).toBeNull();
+  });
+
+  it("opens the space overview (all tabs + panes) when the title block is tapped", async () => {
+    const user = userEvent.setup();
+    const agent = fixtureAgents[0]!; // workspaceId w1
+    const router = createMemoryRouter(
+      [
+        { path: "/space/:spaceId", element: <SpaceOverviewSentinel /> },
+        {
+          path: "/pane/:paneId",
+          element: withHeaderHost(
+            <AgentChat
+              paneId={agent.paneId}
+              agent={agent}
+              agents={fixtureAgents}
+              shellPanes={[]}
+              tabs={[]}
+              text="out"
+              onBack={vi.fn()}
+              onSelect={vi.fn()}
+            />,
+          ),
+        },
+      ],
+      { initialEntries: ["/pane/w1:p1"] },
+    );
+    render(<RouterProvider router={router} />);
+
+    await user.click(screen.getByRole("button", { name: /open webapp overview/i }));
+    expect(await screen.findByText("overview:w1")).toBeInTheDocument();
+  });
+
+  it("opens Pane settings when the name line is tapped, and not the space", async () => {
+    const user = userEvent.setup();
+    renderChat();
+    await user.click(screen.getByRole("button", { name: /^Pane settings for / }));
+    expect(await screen.findByRole("dialog", { name: "Pane settings" })).toBeInTheDocument();
+    expect(screen.queryByText("overview:w1")).toBeNull();
+  });
+
+  it("names the pane in the name button's label", () => {
+    renderChat();
+    const name = document.querySelector('[data-slot="pane-name"]')?.textContent ?? "";
+    expect(name).not.toBe("");
+    expect(screen.getByRole("button", { name: `Pane settings for ${name}` })).toBeInTheDocument();
+  });
+
+  it("carries a Rename row in Pane settings that opens the rename view of the ⋮ sheet", async () => {
+    const user = userEvent.setup();
+    renderChat();
+    await user.click(screen.getByRole("button", { name: /^Pane settings for / }));
+    const dialog = await screen.findByRole("dialog", { name: "Pane settings" });
+    await user.click(within(dialog).getByRole("button", { name: "Rename" }));
+    // The settings sheet is gone and the rename view is the one on screen: its field and Save.
+    expect(await screen.findByRole("button", { name: "Save" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Pane settings" })).toBeNull();
+  });
+});
+
+// THE PANE HEADER'S IDENTITY BLOCK — TWO lines now: the name at full width, and a cwd line that only
+// appears when it has something to add. The caption line above them is gone, and the status word it
+// held moved DOWN to the composer's status strip, beside the host. The dot badged onto the agent's
+// own tile did NOT move: dot and word carry the state together (status-badge.tsx measures why a dot
+// alone cannot), and only one half of the pair changed address.
+//
+// Every query below is scoped to the render's OWN container by data-slot. `ui/strip-host.tsx` mounts
+// two permanent, empty sr-only live regions, so a bare `screen.getByRole("status")` is ambiguous in
+// any tree that holds a host, and the failure reads as a missing element rather than a duplicate one.
+describe("AgentChat — the pane header's identity block", () => {
+  /** The TAP SURFACE: the button laid over the block, which carries the accessible name and nothing
+   *  else. It holds no text — the lines are its siblings now, so the cache reading on line 2 can be a
+   *  control of its own (a button inside a button is neither valid nor reachable). */
+  const identity = (c: HTMLElement) => c.querySelector<HTMLElement>('[data-slot="pane-identity"]');
+  /** The block the eye sees: both lines and the tap surface under them. */
+  const block = (c: HTMLElement) =>
+    c.querySelector<HTMLElement>('[data-slot="pane-identity-block"]');
+  const slot = (c: HTMLElement, name: string) =>
+    c.querySelector<HTMLElement>(`[data-slot="pane-${name}"]`);
+  /** The composer's actions belt — where the machine went once the status band was removed. */
+  const belt = (c: HTMLElement) => c.querySelector<HTMLElement>('[data-slot="composer-actions"]');
+  /** Every named mark inside the identity block — the agent's own logo is one too. */
+  const names = (c: HTMLElement) =>
+    Array.from(block(c)?.querySelectorAll('[role="img"]') ?? []).map((e) =>
+      e.getAttribute("aria-label"),
+    );
+
+  it("says the state in the DOT up here, and NOWHERE as a word, in every state", () => {
+    // THE ONE THIS ROUND EXISTS FOR, restated after the second move. The word used to stand on the
+    // composer's status band; Altan asked for that band's status half to go ("the status is
+    // unnecessary at this place"), and it went rather than moving again. That is only safe while the
+    // state survives WITHOUT colour somewhere, because reducing it to colour alone does not: for a
+    // deuteranope, blocked / working / done collapse to ONE colour in light theme on the app's own
+    // tokens, and "needs you" against "done" — the most consequential opposite pair the app has —
+    // collapses in BOTH themes.
+    //
+    // What carries it now is this header's mark, which is the ONE NAMED StatusDot in the app: a span
+    // with `aria-label={statusLabel(...)}`, so a reader gets the word and the eye gets the SHAPE
+    // (a triangle, a half-filled circle, a disc, a ring: issue 420) with the colour as a second
+    // channel, and nothing is painted as a word. The shape does not read at 8px, so the badge is the
+    // status marks' own 12px box.
+    //
+    // THREE claims per status, and each fails on its own: the dot NAMES the state, no word is drawn
+    // in the header, and no word is drawn on the composer either. Drop the label while "tidying" the
+    // header and the first fails; put a caption line back and the second fails; restore the band and
+    // the third fails.
+    //
+    // Exhaustive by construction: a `Record<AgentStatus, string>` literal is complete-checked by tsc,
+    // so a sixth status cannot be added without either teaching this test or failing the typecheck.
+    const words = {
+      blocked: "needs you",
+      working: "working",
+      idle: "idle",
+      done: "done",
+      unknown: "unknown",
+    } satisfies Record<AgentStatus, string>;
+    // SAFETY: `words` is `satisfies Record<AgentStatus, string>` just above, so tsc has already
+    // proved its keys are exactly the members of AgentStatus — Object.entries widens them to string
+    // because it cannot see that proof.
+    for (const [status, word] of Object.entries(words) as [AgentStatus, string][]) {
+      const agent = { ...fixtureAgents[0]!, status };
+      const { container } = renderChat({ agent, agents: [agent] });
+      // The dot names it, badged onto the agent's own tile inside the identity block. (The AgentIcon
+      // beside it is also a role="img", hence the list rather than a first-match query.)
+      expect(names(container)).toContain(word);
+      // …in a 12px box that holds the shape.
+      const badge = block(container)?.querySelector(`[role="img"][aria-label="${word}"]`);
+      expect(badge?.className).toContain("size-3");
+      expect(badge?.querySelector("svg")).not.toBeNull();
+      // …and nothing DRAWS it: not the header's text, not the composer's.
+      expect(block(container)?.textContent).not.toContain(word);
+      expect(slot(container, "caption")).toBeNull(); // the caption line is gone, not merely emptied
+      expect(container.textContent).not.toContain(word);
+      cleanup();
+    }
+    // A bare shell has no agent status and therefore no dot to name. Its tile carries an `sr-only`
+    // "shell" instead, which is the same bargain: readable without colour, drawn nowhere.
+    const shell = renderChat({ agent: fixtureShellPanes[0]!, agents: [fixtureShellPanes[0]!] });
+    expect(names(shell.container)).toEqual([]); // no agent, no status, so no badge to name
+    // Two "shell"s now, and deliberately: the tile's sr-only word, and line 1, because a bare shell's
+    // NAME is the word "shell" under the one name rule (lib/pane-name.ts). The claim here is only
+    // about the tile's, which is the one that must not be drawn.
+    const shellWords = within(block(shell.container)!).getAllByText("shell");
+    expect(shellWords.some((e) => e.className.includes("sr-only"))).toBe(true);
+  });
+
+  it("says the state nowhere as a word, and the belt carries neither it nor the machine", () => {
+    // THE OTHER HALF, now complete. The caption line led with the machine, which spent the identity
+    // block's width on an answer to a question nobody has while READING; the machine left first, the
+    // word followed it onto a status band, and when that band was removed the machine came down one
+    // more row onto the actions belt while the word was deleted outright. The machine has since come
+    // back UP to this header — onto the end of the path line, which the case below pins.
+    //
+    // Scoped by data-slot, never by a bare role query: `ui/strip-host.tsx` mounts two permanent
+    // sr-only live regions, so `getByRole("status")` is ambiguous in any tree with a host in it and
+    // would fail as "missing" rather than "duplicated".
+    const { container } = renderCrewChat("workshop"); // a REAL crew — HostChip hides on a solo one
+    expect(slot(container, "caption")).toBeNull();
+    expect(block(container)?.textContent).not.toContain("needs you");
+    const row = belt(container);
+    expect(row!.querySelector('[aria-label*="host" i]')).toBeNull();
+    // The state is not down there either — that was the half Altan asked to be rid of.
+    expect(row!.textContent).not.toContain("needs you");
+  });
+
+  it("carries the machine at the END OF THE PATH LINE, beside the cache reading, on a crew only", () => {
+    // WHERE A PANE LIVES AND HOW LONG ITS WORK STAYS WARM ARE ONE SENTENCE, so they ride on the line
+    // the working directory already owns and the corner keeps the ⋮ alone. The pair stood in a
+    // two-slot column in that corner for a day, and Altan, reading his phone: "the top section with
+    // host and cache stuff is not where it needs to be yet". The nine options went to the playground
+    // and option 2 is this.
+    const { container } = renderCrewChat("workshop"); // a REAL crew — HostChip hides on a solo one
+    // The borderless `bare` run, and it still announces "host: …" — this header is ABOUT a pane, it
+    // is not the surface a reply is typed on, which is the whole of what `sends` marks. Unreachable
+    // here, so the run carries the fault with it.
+    const tag = screen.getByLabelText(/^host: workshop \(unreachable\)$/i);
+    // In the meta row, and that row is INSIDE the lines block, on the second line — not in the
+    // trailing corner and not beside the block, either of which would take the width from line 1 and
+    // from the pane's own name.
+    const meta = container.querySelector<HTMLElement>('[data-slot="pane-meta"]')!;
+    expect(meta.contains(tag)).toBe(true);
+    expect(slot(container, "lines")!.contains(meta)).toBe(true);
+    // SAFETY: the lines block's second child is the plain <div> line-2 row written in agent-chat.tsx,
+    // never an SVG or other non-HTMLElement.
+    const line2 = slot(container, "lines")!.children[1] as HTMLElement;
+    expect(line2.contains(meta)).toBe(true);
+    // The PATH is conditional and this fixture has none to add; the ROW is not. It stands either
+    // way, at the line's own height, so a pane with no path keeps the block at 36px and nothing
+    // around it moves when a reading arrives on the next poll.
+    expect(slot(container, "cwd")).toBeNull();
+    // THE CORNER IS THE ⋮ AND NOTHING ELSE, and the tap surface is not this run's parent: a button
+    // inside a button is a control no reader can reach, which is why the surface is a sibling laid
+    // under the lines rather than a box around them.
+    expect(meta.contains(screen.getByLabelText(/pane actions/i))).toBe(false);
+    expect(identity(container)!.contains(tag)).toBe(false);
+    cleanup();
+
+    // Solo — every install that exists today. The row is still drawn, so line 2 keeps its height;
+    // the chip inside it renders nothing at all.
+    const solo = renderChat();
+    expect(screen.queryByLabelText(/^host: /i)).toBeNull();
+    const soloMeta = solo.container.querySelector<HTMLElement>('[data-slot="pane-meta"]')!;
+    expect(soloMeta.className).toMatch(/(?:^|\s)h-3(?=\s|$)/);
+  });
+
+  it("never changes the header's height, whatever the meta has to say", () => {
+    // DESIGN.md §2, and two faults Altan reported from his phone: the header jumped as the host tag
+    // arrived, and then the corner it landed in was "increasing header row height". Both are the
+    // same sentence — the pair used to stand in a column TALLER than everything else in the row, so
+    // it set the height, and it was gated three ways that each took that height away and gave it
+    // back: it hung off `agent`, it sat in HeaderStatus's `children` (which a live status REPLACES
+    // outright), and each chip self-hides on its own.
+    //
+    // TWO CLAIMS, and the second is the one that ends the argument. The meta row states the path
+    // line's own 12px in every state — crew, solo, a reading that has not arrived yet — so line 2
+    // never grows and the block stays 20 + 4 + 12 = 36px, under the identity floor's 44px. The row's
+    // `min-h-15` is then what sets the header's height, and nothing on this line can raise it: the
+    // reading's tap target is reached with a `::before`, not drawn.
+    const metaHeight = (c: HTMLElement) =>
+      /(?:^|\s)(h-3)(?=\s|$)/.exec(
+        c.querySelector<HTMLElement>('[data-slot="pane-meta"]')?.className ?? "",
+      )?.[1];
+    const crew = renderCrewChat("workshop");
+    expect(metaHeight(crew.container)).toBe("h-3");
+    // The row still states one floor and no height of its own, and the meta is the path line's own
+    // 12px box, so line 2 measures the same whatever the two chips have to say.
+    const row = crew.container.querySelector<HTMLElement>('[data-slot="header-row"]')!;
+    expect(row.className).toMatch(/(?:^|\s)min-h-15(?=\s|$)/);
+    expect(row.className).not.toMatch(/(?:^|\s)h-\d/);
+    // Nothing in the meta draws a 44px box; the reading's target is reached with a `::before`.
+    const meta = crew.container.querySelector<HTMLElement>('[data-slot="pane-meta"]')!;
+    // SAFETY: every element inside the meta is HTML written in pane-meta.tsx or in the chips it
+    // mounts; the `svg` marks inside them are excluded by the selector, so every hit carries a
+    // string className.
+    for (const el of meta.querySelectorAll<HTMLElement>("div, button, span")) {
+      expect(el.className).not.toMatch(/(?:^|\s)(?:size-11|h-11|min-h-11)(?=\s|$)/);
+    }
+    cleanup();
+
+    // Solo: no host run, and the same box.
+    const solo = renderChat();
+    expect(metaHeight(solo.container)).toBe("h-3");
+    cleanup();
+
+    // A pane whose agent is gone: no lines at all, no ⋮ — and the corner column stands empty rather
+    // than collapsing, so the title beside it does not slide.
+    renderChat({ agent: undefined, agents: [] });
+    expect(screen.queryByLabelText(/pane actions/i)).toBeNull();
+  });
+
+  it("puts the state into the accessibility tree, which the caption's own text cannot do", () => {
+    // An aria-label on a button REPLACES everything inside it, so moving the status word into this
+    // block would have taken the pane's status out of the accessibility tree altogether — the badge
+    // it replaced sat outside the button and was read. The label carries it instead, via a locale
+    // string, because where the punctuation goes is a translator's decision.
+    const { container } = renderChat(); // fixtureAgents[0] is blocked → "needs you"
+    expect(identity(container)?.getAttribute("aria-label")).toBe(
+      "Open webapp overview, needs you",
+    );
+  });
+
+  it("gives the thing you tap a real 44px block, covered by two targets that fill it", () => {
+    // MEASURED, in the playground, at 390px: this button was 39.00px tall. It is the only way off the
+    // pane to the space overview, and it sat under the floor in the very row that states the floor
+    // for every other control in it. `min-h-11` is 44px, and it is what catches the COMMON case — the
+    // two-line block (name 20 + gap 4 + path 12) is 36px and would otherwise draw at 36.
+    //
+    // THE FLOOR IS ON THE BLOCK AND THE TAP LAYER COVERS IT. The block used to BE the button, and
+    // then the cache reading joined line 2 — a control of its own, which inside a button is neither
+    // valid markup nor reachable. So the surface became a layer laid over the block, and since 1.17.0
+    // it holds TWO buttons, one per line, splitting it in half. The layer reaches 8px past the block
+    // top and bottom (`-inset-y-2`): that is the row's own padding plus the air around the lines, so
+    // each target is 30px, half the 60px row, and nothing outside the row is covered.
+    const { container } = renderChat();
+    const cls = block(container)?.className ?? "";
+    expect(cls).toMatch(/(^|\s)min-h-11(?=\s|$)/);
+    expect(cls).toMatch(/(^|\s)relative(?=\s|$)/);
+    const taps = slot(container, "identity-taps");
+    expect(taps?.className).toMatch(/(^|\s)absolute(?=\s|$)/);
+    expect(taps?.className).toMatch(/(^|\s)inset-x-0(?=\s|$)/);
+    expect(taps?.className).toMatch(/(^|\s)-inset-y-2(?=\s|$)/);
+    // Two siblings, equal halves, name first: the top one covers the name line.
+    const buttons = Array.from(taps?.querySelectorAll("button") ?? []);
+    expect(buttons.map((b) => b.getAttribute("data-slot"))).toEqual(["pane-identity-name", "pane-identity"]);
+    for (const b of buttons) expect(b.className).toMatch(/(^|\s)flex-1(?=\s|$)/);
+    // And no vertical padding on top of it: 52px of lines plus a `py-0.5` is 56px in the row's 52px
+    // content box, which grows the row to 64px on the pane route alone — exactly the route-local jump
+    // `min-h-15` was stated to prevent.
+    expect(cls).not.toMatch(/(^|\s)(?:p|py)-\d/);
+  });
+
+  it("is TWO lines now, and the row still stands on its 60px floor rather than shrinking to them", () => {
+    // THE COUPLING, and it spans two files. agent-chat.tsx states the line boxes and the gap between
+    // them; app-header.tsx states the row's floor and the padding that has to hold them. Each edit
+    // looks complete on its own, and the failure is a header that changes height on ONE route — the
+    // navigation jump `min-h-15` exists to kill. So the arithmetic is read off the rendered elements
+    // rather than trusted.
+    //
+    // The block lost its caption line, so it is 20 + 4 + 12 = 36px where it was 52px. `min-h-15` is a
+    // FLOOR and not a sum: 36px of lines plus 2×4px of padding is 44px, well under 60, so the row
+    // measures 60px exactly as it did before and on every other route. That is the assertion —
+    // shrinking the header to fit the shorter block would lower a floor shared app-wide, which
+    // DESIGN.md §6 forbids. (Verified in the playground at a true 390px content width: the header
+    // row is 60.00px before and after, the identity button 52 → 44px, the lines box 52 → 36px.)
+    const { container } = renderChat({
+      agent: { ...fixtureAgents[0]!, cwd: "/home/you/webapp/worktrees/fix-42" },
+    });
+    const row = container.querySelector<HTMLElement>('header [data-slot="header-row"]');
+    const spacing = (cls: string, re: RegExp) => {
+      const m = re.exec(cls);
+      expect(m, `${re} in "${cls}"`).not.toBeNull();
+      return Number(m![1]) * 4; // Tailwind's --spacing is 0.25rem, and the app's root is 16px
+    };
+    const floor = spacing(row?.className ?? "", /(?:^|\s)min-h-(\d+)(?=\s|$)/);
+    const pad = spacing(row?.className ?? "", /(?:^|\s)py-(\d+)(?=\s|$)/);
+    const gap = spacing(slot(container, "lines")?.className ?? "", /(?:^|\s)gap-(\d+)(?=\s|$)/);
+    const name = spacing(slot(container, "name")?.className ?? "", /(?:^|\s)leading-(\d+)(?=\s|$)/);
+    const place = slot(container, "place");
+    expect(place, "the second line must actually be rendered for this to be a two-line test").not.toBeNull();
+    const placeBox = spacing(place?.className ?? "", /(?:^|\s)leading-(\d+)(?=\s|$)/);
+
+    // There is no third line to measure, and that is the first claim: the caption row is REMOVED,
+    // not emptied. An empty flex row would still cost its gap and would reappear the moment somebody
+    // put something back in it.
+    expect(slot(container, "caption")).toBeNull();
+    expect(slot(container, "lines")?.children).toHaveLength(2);
+    expect([name, placeBox, gap, pad, floor]).toEqual([20, 12, 4, 4, 60]);
+    // The lines no longer fill the content box — the FLOOR is what holds the row up, and it must.
+    expect(name + gap + placeBox + 2 * pad).toBeLessThan(floor);
+    // Which is also why the identity button has to state its own 44px box: 36px of lines would draw
+    // a 36px tap target in the row that states the floor for everything else.
+    expect(name + gap + placeBox).toBeLessThan(44);
+  });
+
+  it("carries the WORKSPACE on line 2, never the tab crumb or the cwd", () => {
+    // The one place rule (lib/pane-name.test.ts pins the rule itself); the header now takes only the
+    // `space` half of it, because the tab strip directly under the header already names the open tab.
+    const base = fixtureAgents[0]!; // workspaceLabel "webapp", tab w1:t1, cwd /home/you/webapp
+    const tab = { tabId: "w1:t1", workspaceId: "w1", number: 1, label: "review", focused: false, paneCount: 1 };
+    const named = renderChat({ agent: base, agents: [base], tabs: [tab] }).container;
+    expect(slot(named, "place")?.textContent).toBe("webapp");
+    cleanup();
+    // A named tab, a positional tab or no tab at all — the tab's title never reaches this line, only
+    // the tab strip below shows it now.
+    const numbered = renderChat({ agent: base, agents: [base], tabs: [{ ...tab, label: "2" }] }).container;
+    expect(slot(numbered, "place")?.textContent).toBe("webapp");
+    cleanup();
+    // The path is gone from this line, even for a pane sitting away from its space root.
+    const worktree = { ...base, cwd: "/home/you/webapp/worktrees/fix-42" };
+    const away = renderChat({ agent: worktree, agents: [worktree], tabs: [tab] }).container;
+    expect(slot(away, "place")?.textContent).toBe("webapp");
+    expect(away.textContent).not.toContain("worktrees/fix-42");
+  });
+
+  // THE TITLE NEVER SHOWS A RAW PANE ID. Line 1 used to append the multiplexer's own pane id suffix
+  // — `p3` — whenever it fell back to naming the tab and that tab held more than one pane, so the
+  // header could be matched against the pill row below, which printed the same suffix. Altan, reading
+  // his own phone: "idk what pN means". It is Hangar's coordinate for a pane, not a name.
+  //
+  // The two surfaces now say different things on purpose. The title names the tab and stops there;
+  // telling panes apart is the switcher's job, and the switcher does it with a position number and
+  // only when two pills would otherwise read the same (pane-strip.tsx, lib/pane-ordinal.ts).
+  //
+  // `base` has no paneLabel, no sessionName and no title, so its name is its agent word.
+  const solo = fixtureAgents[0]!; // w1:p1, workspaceLabel "webapp", tab w1:t1
+  const sibling: AgentView = { ...solo, paneId: "w1:p7", status: "working" };
+
+  it("never appends a pane id to the title, however many panes the tab holds", () => {
+    const { container } = renderChat({ agent: solo, agents: [solo, sibling] });
+    expect(slot(container, "name")?.textContent).toBe("claude");
+    expect(slot(container, "tag")).toBeNull();
+    // The pill row below IS on screen in this case — that is where the two panes are told apart.
+    expect(screen.getByRole("navigation", { name: "Panes" })).toBeInTheDocument();
+    expect(container.textContent).not.toMatch(/\bp[17]\b/);
+  });
+
+  it("keeps the clean name when the tab holds ONE pane, with no pill row either", () => {
+    const { container } = renderChat({ agent: solo, agents: [solo] });
+    expect(slot(container, "name")?.textContent).toBe("claude");
+    expect(slot(container, "tag")).toBeNull();
+    expect(screen.queryByRole("navigation", { name: "Panes" })).toBeNull();
+  });
+
+  it("still shows a name the operator or the agent chose, undecorated", () => {
+    const labelled = { ...solo, paneLabel: "logs" };
+    const { container: byLabel } = renderChat({ agent: labelled, agents: [labelled, sibling] });
+    expect(slot(byLabel, "name")?.textContent).toBe("logs");
+    expect(slot(byLabel, "tag")).toBeNull();
+
+    const session = { ...solo, sessionName: "refactor the parser" };
+    const { container: bySession } = renderChat({ agent: session, agents: [session, sibling] });
+    expect(slot(bySession, "name")?.textContent).toBe("refactor the parser");
+    expect(slot(bySession, "tag")).toBeNull();
+  });
+});
+
+describe("AgentChat — read-only device", () => {
+  it("disables the composer and shows the banner when the device isn't authorised", () => {
+    renderChat({ device: { enforced: true, device: "spare-phone", authorized: false } });
+
+    // The strip names the read-only state and the composer is locked. It no longer spells the
+    // device id: a strip never wraps, so it carries the short copy (read-only-banner.tsx says why,
+    // and its own test pins the trade). The fact is still stated at the point of refusal below —
+    // the placeholder — which is the stronger of the two places.
+    expect(screen.getByText(/read-only/i)).toBeInTheDocument();
+    expect(screen.queryByText(/spare-phone/)).toBeNull();
+    const box = screen.getByPlaceholderText(/read-only, not authorised/i);
+    expect(box).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    // The terminal mirror still renders — reading is always allowed.
+    expect(screen.getByText("recent pane output")).toBeInTheDocument();
+  });
+
+  it("keeps the composer live for an authorised device", () => {
+    renderChat({ device: { enforced: true, device: "my-phone", authorized: true } });
+    expect(screen.queryByText(/read-only/i)).not.toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/type a reply/i)).not.toBeDisabled();
+  });
+});
+
+// The bridge masks secret shapes before text leaves the machine, so a pane can show `sk-o••••••••`.
+// The first time one is on screen the pane says the dots are on purpose, once per device.
+describe("AgentChat — the one-time masked-text hint", () => {
+  const HINT = /some secrets on this screen are masked/i;
+  beforeEach(() => __resetMaskedHint());
+
+  it("stays out of the way when nothing on screen is masked", () => {
+    renderChat();
+    expect(screen.queryByText(HINT)).toBeNull();
+  });
+
+  it("explains the dots when the mirror holds a mask, and a dismiss retires it for good", async () => {
+    const user = userEvent.setup();
+    renderChat({ text: paneTextWithDraft("key: sk-o••••••••") });
+    expect(await screen.findByText(HINT)).toBeInTheDocument();
+    expect(screen.getByText(/read them on the machine/i)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Dismiss hint" }));
+    expect(maskedHintRetired()).toBe(true);
+    expect(localStorage.getItem("issance:masked-hint:v1")).toBe("1");
+    // Gone, or on its way out through Collapse.
+    const left = screen.queryByText(HINT);
+    if (left !== null) expect(left.closest('[data-slot="collapse"]')!.getAttribute("data-state")).toBe("closed");
+    cleanup();
+    // A fresh mount on a new mirror that still holds dots: never again on this device.
+    renderChat({ text: paneTextWithDraft("another sk-o••••••••") });
+    expect(screen.queryByText(HINT)).toBeNull();
+  });
+});
+
+// M46 specs 10 and 11: a pane drawn from the saved copy can be read and cannot be acted on. The pane
+// view dates it with one notice and hands `stale` to the card dock and the composer.
+describe("AgentChat — a stale saved copy", () => {
+  const SAVED_AT = new Date(2026, 0, 2, 14, 32).getTime();
+
+  it("dates the saved copy, and a stale render disables the card options", async () => {
+    renderChat({ text: MENU_TEXT, stale: true, lastSeenAt: SAVED_AT, error: true });
+    expect(screen.getByText(/^Saved copy from .+\. Older text is on the bridge\.$/)).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Yes" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "No" })).toBeDisabled();
+  });
+
+  it("disables the send button on a stale render of a pane with a composer", async () => {
+    const user = userEvent.setup();
+    renderChat({ stale: true, lastSeenAt: SAVED_AT, error: true });
+    await user.type(screen.getByPlaceholderText(/type a reply/i), "hello");
+    // Spec 11 names why: the send button says what it waits for, and stays off.
+    expect(screen.getByRole("button", { name: "Reconnect to send" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
+  });
+
+  it("draws no notice and leaves the controls alone on a live render", async () => {
+    renderChat({ text: MENU_TEXT });
+    expect(await screen.findByRole("button", { name: "Yes" })).not.toBeDisabled();
+    expect(screen.queryByText(/Saved copy from/)).toBeNull();
+  });
+
+  // "Gone" is a fact only a live answer can state: a pane the phone cannot place while the herd on
+  // screen is not live is named by its id, and says what the phone does not have.
+  it("never says gone when the herd is not live and the pane is not in it", async () => {
+    renderChat({ agent: undefined, text: "", error: true, noSavedCopy: true });
+    expect(screen.getByText(fixtureAgents[0]!.paneId)).toBeInTheDocument();
+    expect(screen.getByText("No saved copy of this pane on this phone.")).toBeInTheDocument();
+    expect(screen.queryByText("(agent gone)")).toBeNull();
+    expect(screen.queryByText("(no recent output)")).toBeNull();
+    expect(screen.queryByPlaceholderText("Pane is gone")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
+  });
+
+  it("still says gone when a live herd does not hold the pane", () => {
+    renderChat({ agent: undefined, text: "" });
+    expect(screen.getByText("(agent gone)")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Pane is gone")).toBeInTheDocument();
+  });
+});
+
+describe("AgentChat — raw-terminal escape hatch", () => {
+  afterEach(() => localStorage.clear());
+
+  it("lifts a tail menu into buttons by default (grammars on)", async () => {
+    renderChat({ text: MENU_TEXT });
+    expect(await screen.findByRole("button", { name: "Yes" })).toBeInTheDocument();
+    // The raw option row is consumed into the button, not shown as text.
+    expect(screen.queryByText(/❯ 1\. Yes/)).not.toBeInTheDocument();
+  });
+
+  it("shows the plain mirror (no buttons, menu as raw text) when raw terminal is on", () => {
+    localStorage.setItem(
+      "issance:display-prefs:v4",
+      JSON.stringify({ wrap: true, fontSize: 11, rawTerminal: true }),
+    );
+    renderChat({ text: MENU_TEXT });
+    // No native prompt buttons — the escape hatch bypasses the block grammars entirely…
+    expect(screen.queryByRole("button", { name: "Yes" })).not.toBeInTheDocument();
+    // …and the menu is rendered verbatim in the mirror, drivable by the keys pad.
+    expect(screen.getByText(/1\. Yes/)).toBeInTheDocument();
+  });
+
+  it("the Screen pill shows the raw rows in one tap, without a stored preference, and a second tap brings the cards back", async () => {
+    const user = userEvent.setup();
+    renderChat({ text: MENU_TEXT });
+    expect(await screen.findByRole("button", { name: "Yes" })).toBeInTheDocument();
+    const pill = screen.getByRole("button", { name: "Show the screen rows, without cards" });
+    await user.click(pill);
+    expect(screen.queryByRole("button", { name: "Yes" })).not.toBeInTheDocument();
+    expect(screen.getByText(/1\. Yes/)).toBeInTheDocument();
+    expect(localStorage.getItem("issance:display-prefs:v4")).toBeNull();
+    await user.click(pill);
+    expect(await screen.findByRole("button", { name: "Yes" })).toBeInTheDocument();
+  });
+
+  // "Tap to type" — on, the mirror is one big "start typing" target; off, it is a document. The
+  // pref must gate ONLY the focus, never the mirror's own controls: someone who turned it off to
+  // stop the keyboard appearing has not asked to lose the prompt buttons.
+  it("focuses the composer on a mirror tap by default", async () => {
+    renderChat({ text: "just some output\n" });
+    const line = screen.getByText(/just some output/);
+    fireEvent.click(line);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByPlaceholderText(/Type a reply/i)));
+  });
+
+  it("leaves focus alone on a mirror tap when Tap to type is off", async () => {
+    localStorage.setItem(
+      "issance:display-prefs:v4",
+      JSON.stringify({ wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: false }),
+    );
+    renderChat({ text: "just some output\n" });
+    const before = document.activeElement;
+    fireEvent.click(screen.getByText(/just some output/));
+    expect(document.activeElement).toBe(before);
+    expect(document.activeElement).not.toBe(screen.getByPlaceholderText(/Type a reply/i));
+  });
+
+  it("still lifts a menu into buttons with Tap to type off — it gates focus, not the grammars", async () => {
+    localStorage.setItem(
+      "issance:display-prefs:v4",
+      JSON.stringify({ wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: false }),
+    );
+    renderChat({ text: MENU_TEXT });
+    expect(await screen.findByRole("button", { name: "Yes" })).toBeInTheDocument();
+  });
+
+  it("lifts a multi-question wizard into native controls by default (grammars on)", async () => {
+    renderChat({ text: WIZARD_TEXT });
+    expect(await screen.findByRole("button", { name: /Parser/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Next step" })).toBeInTheDocument();
+    // The stepper header row is consumed into the wizard block, not mirrored as text.
+    expect(screen.queryByText(/☐ Focus area/)).not.toBeInTheDocument();
+  });
+
+  it("raw terminal bypasses the wizard too — the dialog shows verbatim, keys-pad drivable", () => {
+    localStorage.setItem(
+      "issance:display-prefs:v4",
+      JSON.stringify({ wrap: true, fontSize: 11, rawTerminal: true }),
+    );
+    renderChat({ text: WIZARD_TEXT });
+    expect(screen.queryByRole("button", { name: /Parser/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Next step" })).not.toBeInTheDocument();
+    expect(screen.getByText(/1\. Parser/)).toBeInTheDocument();
+    expect(screen.getByText(/☐ Focus area/)).toBeInTheDocument();
+  });
+
+  // The per-pane override reaches agents that DO have adapters — codex is the one #241 was opened
+  // about — so the escape hatch has to keep the two axes apart. Opting a pane out of inversion is a
+  // DISPLAY choice; it must not hand the pane's grammars back after raw terminal turned them off.
+  // The control case first, so the assertion below is not vacuous: with grammars on, codex's Tier-1
+  // chrome strip eats the composer and status rows.
+  it("strips codex chrome from the mirror by default (grammars on)", () => {
+    const agent = { ...fixtureAgents[0]!, agent: "codex" };
+    const { container } = renderChat({ agent, agents: [agent], text: CODEX_CHROME_TEXT });
+    // Scoped to the MIRROR: the status row is re-surfaced natively in the strip, so a document-wide
+    // query would find it either way and prove nothing.
+    expect(container.querySelector("pre")!.textContent).not.toContain("Context 90% left");
+  });
+
+  it("opting a codex pane into native rendering does not re-enable its grammars under raw terminal", () => {
+    localStorage.setItem(
+      "issance:display-prefs:v4",
+      JSON.stringify({ wrap: true, fontSize: 11, rawTerminal: true }),
+    );
+    const agent = { ...fixtureAgents[0]!, agent: "codex" };
+    // renderChat passes no scope, so the override is stored under the undefined scope this mounts in.
+    setPaneMirrorOverride(undefined, agent.paneId, true);
+    const { container } = renderChat({ agent, agents: [agent], text: CODEX_CHROME_TEXT });
+
+    // Raw terminal still means raw: the chrome is mirrored verbatim…
+    expect(container.querySelector("pre")!.textContent).toContain("Context 90% left");
+    // …while the pane still honours the override and renders on the native ground.
+    expect(container.querySelector("pre")!.className).toContain("bg-[#fffbf8]");
+  });
+
+  // The switch writes through `setMirrorNative`, which CLEARS rather than pins when the operator
+  // picks the agent's own answer. That is what keeps the 32-entry bound meaningful (only real
+  // decisions are stored) and stops a Muse pane freezing on today's answer if .adr/0047's set
+  // changes under it later.
+  it("stores an override that contradicts the agent, and clears it when the agent's own answer is picked back", async () => {
+    const user = userEvent.setup();
+    const agent = { ...fixtureAgents[0]!, agent: "muse" };
+    renderChat({ agent, agents: [agent], text: "body\n" });
+
+    await user.click(screen.getByRole("button", { name: "Display settings" }));
+    const toggle = screen.getByRole("switch", { name: "Render this pane natively" });
+    // Muse renders natively already, so the switch starts on with nothing stored.
+    expect(toggle).toBeChecked();
+    expect(paneMirrorOverride(undefined, agent.paneId)).toBeUndefined();
+
+    await user.click(toggle);
+    expect(paneMirrorOverride(undefined, agent.paneId)).toBe(false);
+
+    await user.click(toggle);
+    expect(paneMirrorOverride(undefined, agent.paneId)).toBeUndefined();
+  });
+
+  it.each([["muse"]])("keeps native rendering for %s with raw terminal on — the pref bypasses grammars, not display", (agentName) => {
+    localStorage.setItem(
+      "issance:display-prefs:v4",
+      JSON.stringify({ wrap: true, fontSize: 11, rawTerminal: true }),
+    );
+    const agent = { ...fixtureAgents[0]!, agent: agentName };
+    const { container } = renderChat({ agent, agents: [agent], text: "body\n" });
+    expect(container.querySelector("pre")!.className).toContain("terminal-muse");
+  });
+});
+
+// A minimal permission dialog at the buffer tail — enough for the REAL detector (not a mock) to
+// lift it into prompt-select buttons inside AgentChat's mirror.
+// Codex's Tier-1 chrome: the `\u203a ` composer row and the dot-separated status row at the tail.
+// Plain text on purpose — STATUS_ROW's text acceptor matches a row carrying `Context N% left`, so
+// this needs no SGR to be recognised as chrome.
+const CODEX_CHROME_TEXT = [
+  "some codex output",
+  "",
+  "\u203a a half typed draft",
+  "",
+  "  gpt-5 \u00b7 ~/code/issance \u00b7 Context 90% left",
+].join("\n");
+
+const MENU_TEXT = [
+  "Do you want to create hello.txt?",
+  " ❯ 1. Yes",
+  "   2. No",
+  "",
+  " Esc to cancel · Tab to amend",
+].join("\n");
+
+// The Surface the bridge folds MENU_TEXT into (M56 spec 06): a modal ask. The composer reads this,
+// not the mirror's blocks, for its Send slot and placeholder.
+const MENU_ASK: Surface = {
+  revision: 2,
+  turn: "idle",
+  modal: { ask: { id: "ask-create", kind: "permission", options: [{ id: "1", label: "Yes" }, { id: "2", label: "No" }], channel: "keys", hash: "0c4e11" } },
+  composer: "unknown",
+};
+const MENU_AGENT: AgentView = { ...fixtureAgents[0]!, surface: MENU_ASK };
+
+// A minimal Claude input-box buffer at the tail: top border, the "❯" prompt, bottom border, then the
+// statusline + a hint. For a Claude pane, chrome-stripping peels the box off the mirror and the
+// statusline is re-surfaced as the app strip; for a non-Claude pane none of that runs (raw mirror).
+const RULE = "─".repeat(60);
+const STATUS_TEXT = [
+  "Welcome back!",
+  "",
+  RULE,
+  "❯ ",
+  RULE,
+  "  [Opus 4.8] ~/webapp · main",
+  "  ← for agents",
+].join("\n");
+
+// A minimal multi-question wizard tail (stepper header + current question) — enough for the REAL
+// wizard detector to lift it into the native WizardBlock inside AgentChat's mirror.
+const WIZARD_TEXT = [
+  "←  ☐ Focus area  ☐ Scope  ✔ Submit  →",
+  "",
+  "Which focus area should we work on?",
+  "",
+  "❯ 1. Parser",
+  "  2. UI",
+  "",
+  "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+].join("\n");
+
+// M56 spec 08: a tap on a dialog card answers the pane's ask by its single-use id. The card keeps its
+// look; the tap posts one Answer with the ask's hash, and the phone sends no key of its own.
+describe("AgentChat: a dialog tap answers the pane's ask", () => {
+  const ASK_A: Ask = { id: "ask-0a0a0a0a0a0a0a", kind: "permission", options: [{ id: "1", label: "Yes" }, { id: "2", label: "No" }], channel: "keys", hash: "0c4e11" };
+  const ASK_B: Ask = { id: "ask-0b0b0b0b0b0b0b", kind: "permission", options: [{ id: "1", label: "Yes" }, { id: "2", label: "No" }], channel: "keys", hash: "5d6e77" };
+  const withAsk = (ask: Ask): AgentView => ({ ...fixtureAgents[0]!, surface: { revision: 0, turn: "idle", modal: { ask }, composer: "unknown" } });
+  type Posted = { readonly id: string; readonly body: JsonValue };
+
+  function answerWith(reply: (posted: Posted) => JsonValue) {
+    const posted: Posted[] = [];
+    server.use(
+      http.post(/\/api\/ask\/[^/]+$/, async ({ request }) => {
+        const id = decodeURIComponent(new URL(request.url).pathname.split("/").at(-1) ?? "");
+        // SAFETY: the phone's own JSON.stringify body is JSON, a JsonValue.
+        const one = { id, body: (await request.json()) as JsonValue };
+        posted.push(one);
+        return HttpResponse.json(reply(one));
+      }),
+    );
+    return posted;
+  }
+
+  const mockSubmit = vi.mocked(submitPromptOption);
+  beforeEach(() => {
+    mockSubmit.mockReset();
+    mockSubmit.mockResolvedValue({ status: "sent" });
+    render(<AskStatusLine />);
+  });
+
+  it("an ask tap posts the Answer with the hash and the option id, and sends no key of its own", async () => {
+    const user = userEvent.setup();
+    const posted = answerWith(({ id }) => ({ receipt: { askId: id, outcome: "sent", keys: ["1"] } }));
+    renderChat({ text: MENU_TEXT, agent: withAsk(ASK_A) });
+    await user.click(await screen.findByRole("button", { name: "Yes" }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]).toEqual({ id: ASK_A.id, body: { pane: fixtureAgents[0]!.paneId, hash: "0c4e11", optionId: "1", origin: "person_tap" } });
+    expect(mockSubmit).not.toHaveBeenCalled();
+  });
+
+  it("a refused ask is drawn as a new card: the next tap answers the new ask's id", async () => {
+    const user = userEvent.setup();
+    const posted = answerWith(({ id }) =>
+      id === ASK_A.id
+        ? { receipt: { askId: id, outcome: "refused", reason: "ask_changed", keys: [] }, ask: { id: ASK_B.id, kind: "permission", options: [{ id: "1", label: "Yes" }, { id: "2", label: "No" }], channel: "keys", hash: ASK_B.hash } }
+        : { receipt: { askId: id, outcome: "sent", keys: ["2"] } },
+    );
+    renderChat({ text: MENU_TEXT, agent: withAsk(ASK_A) });
+    await user.click(await screen.findByRole("button", { name: "Yes" }));
+    await waitFor(() => expect(screen.getByTestId("ask-status")).toHaveTextContent("The dialog changed; the card shows the new one"));
+    await user.click(screen.getByRole("button", { name: "No" }));
+    await waitFor(() => expect(posted).toHaveLength(2));
+    expect(posted.map((p) => p.id)).toEqual([ASK_A.id, ASK_B.id]);
+    expect(posted[1]!.body).toMatchObject({ hash: "5d6e77", optionId: "2" });
+    expect(mockSubmit).not.toHaveBeenCalled();
+  });
+
+  it("an ask that is gone says so, reads the screen again and sends nothing more", async () => {
+    const user = userEvent.setup();
+    const posted = answerWith(({ id }) => ({ receipt: { askId: id, outcome: "refused", reason: "ask_gone", keys: [] } }));
+    renderChat({ text: MENU_TEXT, agent: withAsk(ASK_A) });
+    await user.click(await screen.findByRole("button", { name: "Yes" }));
+    await waitFor(() => expect(screen.getByTestId("ask-status")).toHaveTextContent("The dialog is gone; issance read the screen again"));
+    expect(posted).toHaveLength(1);
+  });
+
+  it("an ask whose labels are not the card's posts no answer; the tap keeps the guarded key route", async () => {
+    const user = userEvent.setup();
+    const posted = answerWith(() => ({}));
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const other: Ask = { ...ASK_A, options: [{ id: "1", label: "Allow" }, { id: "2", label: "Deny" }] };
+    renderChat({ text: MENU_TEXT, agent: withAsk(other) });
+    await user.click(await screen.findByRole("button", { name: "Yes" }));
+    await waitFor(() => expect(mockSubmit).toHaveBeenCalledTimes(1));
+    expect(posted).toEqual([]);
+    info.mockRestore();
+  });
+
+  it("a menu's footer action answers the menu ask by the action's own row", async () => {
+    const user = userEvent.setup();
+    const posted = answerWith(({ id }) => ({ receipt: { askId: id, outcome: "sent", keys: ["s"] } }));
+    const picker = readFileSync(join(import.meta.dirname, "..", "fixtures", "panes", "claude--menu-model-picker.txt"), "utf8");
+    // The hash the bridge mints for this screen: a menu tap goes out only under an ask of the card's
+    // own dialog (agent-chat-menu-ask.test.tsx has the cases where the two differ).
+    const hash = liftDialog(readerBlocks(splitLines(parseAnsi(picker)), "claude"))!.hash;
+    const menuAsk: Ask = {
+      id: "ask-0c0c0c0c0c0c0c",
+      kind: "menu",
+      options: [{ id: "1", label: "Set as default" }, { id: "2", label: "Use this session only" }, { id: "3", label: "Cancel" }],
+      channel: "keys",
+      hash,
+    };
+    renderChat({ text: picker, agent: withAsk(menuAsk) });
+    await user.click(await screen.findByRole("button", { name: /Use this session only/ }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]).toEqual({ id: menuAsk.id, body: { pane: fixtureAgents[0]!.paneId, hash, optionId: "2", origin: "person_tap" } });
+  });
+
+  it("a pane whose Surface carries no ask keeps the guarded key route", async () => {
+    const user = userEvent.setup();
+    const posted = answerWith(() => ({}));
+    renderChat({ text: MENU_TEXT });
+    await user.click(await screen.findByRole("button", { name: "Yes" }));
+    await waitFor(() => expect(mockSubmit).toHaveBeenCalledTimes(1));
+    expect(posted).toEqual([]);
+  });
+});
+
+/** The header status line, mounted beside the pane so a test can read it. */
+function AskStatusLine() {
+  const status = useStatus();
+  return <div data-testid="ask-status">{status?.text ?? ""}</div>;
+}
+
+describe("AgentChat — prompt-select race guard wiring (frozen {text, revision} pair)", () => {
+  const mockSubmit = vi.mocked(submitPromptOption);
+  beforeEach(() => {
+    mockSubmit.mockReset();
+    mockSubmit.mockResolvedValue({ status: "sent" });
+  });
+
+  // Renders AgentChat inside a data router with EXTERNALLY-UPDATABLE pane props, standing in for the
+  // route loader delivering fresh polls. Returns a setter that advances {text, revision} in place.
+  function renderWithLivePane(initial: { text: string; revision: number }) {
+    const agent = fixtureAgents[0]!; // a claude agent — the block grammars are gated on the agent
+    let advance: (pane: { text: string; revision: number }) => void = () => {
+      throw new Error("harness not mounted");
+    };
+    function Harness() {
+      const [pane, setPane] = useState(initial);
+      advance = setPane;
+      return (
+        <AgentChat
+          paneId={agent.paneId}
+          agent={agent}
+          agents={fixtureAgents}
+          shellPanes={[]}
+          tabs={[]}
+          text={pane.text}
+          revision={pane.revision}
+          onBack={vi.fn()}
+          onSelect={vi.fn()}
+        />
+      );
+    }
+    const router = createMemoryRouter([{ path: "/", element: withHeaderHost(<Harness />) }]);
+    render(<RouterProvider router={router} />);
+    return (pane: { text: string; revision: number }) => advance(pane);
+  }
+
+  it("passes the FROZEN revision when the mirror is frozen and the pane advances underneath", async () => {
+    // Regression (found in review): the handler used to pass the LIVE loader revision, which keeps
+    // advancing via background polls even while the mirror is frozen — so the guard compared
+    // live-vs-live and could never catch drift that happened before the freeze. The menu the user
+    // taps is derived from the FROZEN text, so the guard must get the revision frozen WITH it.
+    const user = userEvent.setup();
+    const advance = renderWithLivePane({ text: MENU_TEXT, revision: 1 });
+
+    // The real detector lifted the tail menu into buttons.
+    await screen.findByRole("button", { name: "Yes" });
+
+    // Freeze the mirror (opening find pins the tail — the same `following=false` state a scroll-up
+    // freeze produces). Find is a row in the pane menu now, so this goes through the ⋮.
+    await openFind(user);
+
+    // The pane advances while frozen: new output below the menu + a bumped revision.
+    act(() => advance({ text: `${MENU_TEXT}\n● proceeding…\n`, revision: 2 }));
+
+    // The frozen mirror still shows the old menu; the tap must hand the guard the FROZEN pair.
+    await user.click(screen.getByRole("button", { name: "Yes" }));
+
+    await waitFor(() => expect(mockSubmit).toHaveBeenCalledTimes(1));
+    expect(mockSubmit).toHaveBeenCalledWith(expect.objectContaining({ detectedRevision: 1 }));
+  });
+
+  it("passes the LIVE revision while following (the frozen pair is the live pair)", async () => {
+    const user = userEvent.setup();
+    const advance = renderWithLivePane({ text: MENU_TEXT, revision: 1 });
+    await screen.findByRole("button", { name: "Yes" });
+
+    // Not frozen: a revision-only poll (same text) is adopted into the shown pair.
+    act(() => advance({ text: MENU_TEXT, revision: 2 }));
+
+    await user.click(screen.getByRole("button", { name: "Yes" }));
+
+    await waitFor(() => expect(mockSubmit).toHaveBeenCalledTimes(1));
+    expect(mockSubmit).toHaveBeenCalledWith(expect.objectContaining({ detectedRevision: 2 }));
+  });
+
+  // Same frozen-pair guarantee for the wizard path (the guard mirrors prompt-select's; this locks the
+  // wiring so the live-vs-frozen-revision bug can't regress here either).
+  it("wizard: passes the FROZEN revision when the mirror is frozen and the pane advances", async () => {
+    const mockWizard = vi.mocked(submitWizardKeys);
+    mockWizard.mockReset();
+    mockWizard.mockResolvedValue({ status: "sent" });
+
+    const user = userEvent.setup();
+    const advance = renderWithLivePane({ text: WIZARD_TEXT, revision: 1 });
+
+    // The real detector lifted the multi-question tail into a wizard with option buttons.
+    await screen.findByRole("button", { name: /Parser/ });
+
+    await openFind(user); // freeze the tail
+    act(() => advance({ text: `${WIZARD_TEXT}\n● advancing…\n`, revision: 2 }));
+
+    await user.click(screen.getByRole("button", { name: /Parser/ }));
+
+    await waitFor(() => expect(mockWizard).toHaveBeenCalledTimes(1));
+    expect(mockWizard).toHaveBeenCalledWith(expect.objectContaining({ detectedRevision: 1 }));
+  });
+});
+
+// The block grammars are provably scoped to the pane's own adapter (spec T8): an agent with no
+// adapter gets the plain raw mirror — no prompt-select buttons, no chrome stripping, no re-surfaced
+// status strip — because running Claude-tuned matchers on an unverified TUI could mis-lift or
+// mis-strip its output. opencode is such an agent (codex graduated to its own adapter); omp has an
+// adapter but lifts no dialog kind at all.
+describe("AgentChat — block-grammar scoping (an agent with no adapter)", () => {
+  // An opencode agent sharing the Claude fixture's ids, so only the agent kind differs from the default.
+  const opencodeAgent = { ...fixtureAgents[0]!, agent: "opencode" };
+
+  it("does NOT lift an adapterless agent's tail menu into buttons — it stays raw mirror text", () => {
+    renderChat({ text: MENU_TEXT, agent: opencodeAgent });
+    // No native prompt buttons: the Claude prompt-select grammar never runs without an adapter…
+    expect(screen.queryByRole("button", { name: "Yes" })).not.toBeInTheDocument();
+    // …and the menu row shows verbatim in the raw mirror instead (drivable by the keys pad).
+    expect(screen.getByText(/1\. Yes/)).toBeInTheDocument();
+  });
+
+  it("re-surfaces EVERY row of the Claude input-box statusline as an app strip above the composer", () => {
+    renderChat({ text: STATUS_TEXT }); // default claude agent
+    const strip = screen.getByText("[Opus 4.8] ~/webapp · main");
+    expect(strip.closest("pre")).toBeNull(); // the strip is app chrome, not <pre> mirror text
+    // Row 2 of the run: it used to be stripped off the mirror and rendered nowhere at all.
+    const second = screen.getByText("← for agents");
+    expect(second.closest("pre")).toBeNull();
+    // Stacked in the one strip. Compared at the ROW level: each row renders one <span> per ANSI
+    // segment (colour is carried through now), so the text node's own parent is a span, not the row.
+    const row = (el: HTMLElement) => el.closest("div.truncate");
+    expect(row(second)).not.toBe(row(strip));
+    expect(row(second)?.parentElement).toBe(row(strip)?.parentElement);
+    expect(screen.queryByText(/❯/)).toBeNull(); // the input box was stripped off the mirror
+  });
+
+  it("rides the actions belt's rule, below the statusline, always", () => {
+    // THE OPERATOR'S REPORT, verbatim: "the switch panel up drawer sits above the agent Statusline,
+    // it should always be right above the bottom status row."
+    //
+    // It did. MEASURED in the browser on the pane screen at a true 390px viewport, page-relative
+    // tops, with the agent's own statusline present (a 3-row Claude run):
+    //
+    //   BEFORE   mirror 217.8 → 629.8 · handle 629.8 → 663.8 · statusline 663.8 → 714 · composer 714
+    //   AFTER    mirror 217.8 → 629.8 · statusline 629.8 → 680 · handle 680 → 714 · composer 714
+    //
+    // The handle stood 50px further up on a pane whose agent prints a statusline than on one that
+    // does not — and it moved again whenever the agent added or dropped a row, because that strip
+    // is 1–3 rows re-derived from the pane tail on every poll. A control the thumb reaches for by
+    // muscle memory may not be relocated by something the terminal printed: DESIGN.md §2. "Always"
+    // is the whole claim, so BOTH cases are asserted below, and the handle must be the last thing
+    // before the composer in each.
+    //
+    // It also puts the statusline back against the mirror it was cut from — that strip is the
+    // mirror's own last row, and a 34px grab handle wedged into the seam read as a boundary
+    // between the terminal and a piece of chrome that IS the terminal.
+    //
+    // THE BAND IS GONE NOW, and this test moved with it rather than being deleted. The grip is drawn
+    // on the ACTIONS BELT'S own top rule (actions-row.tsx), absolutely positioned, so it costs no
+    // height at all — and it therefore sits INSIDE the composer, below every row the terminal can
+    // print. The claim above is now true by construction, and what is asserted is the construction:
+    // the grip is a child of the belt, the belt is inside the composer, and the statusline is still
+    // above the whole chrome block.
+    for (const text of [STATUS_TEXT, MENU_TEXT]) {
+      const { container } = renderChat({ text });
+      const handle = screen.getByRole("button", { name: "Switch pane" });
+      const belt = container.querySelector('[data-slot="composer-actions"]')!;
+      // The composer's own box, reached through the actions belt inside it — the status band this
+      // used to reach through is gone (composer.tsx says where it went).
+      const composer = belt.parentElement!;
+      // THE GRIP IS INSIDE THE BELT AND OUTSIDE ITS SCROLLER, and both halves are load-bearing: the
+      // scroller wears an overflow mask (ui/overflow-edges.tsx), a mask applies to its element's
+      // whole subtree, and a grip inside that wrapper would fade out exactly where the belt
+      // overflows. Pinned beside it, nothing masks it.
+      expect(belt.contains(handle)).toBe(true);
+      expect(belt.querySelector(".overflow-x-auto")!.contains(handle)).toBe(false);
+      // No Collapse of its OWN, either: the grip costs 0px, so there is no height for a presence
+      // animation to hand back. Asserted as "the nearest one above the grip is the nearest one above
+      // the belt" — the whole composer region sits inside one, and that one is not the grip's.
+      expect(handle.closest('[data-slot="collapse"]')).toBe(belt.closest('[data-slot="collapse"]'));
+      // THE BLOCK THE COMPOSER STANDS ON is what answered the operator's report that the drawer was
+      // "really hard to distinguish" in dark. The handle used to stand on the mirror's own black —
+      // `--background` IS the mirror's fill in dark (mirror-space.ts) — so a 6px grip was the only
+      // thing on screen saying a control was there. The block gives everything the thumb operates
+      // ONE ground and closes it against the terminal with ONE rule. Its fill and rule are
+      // unconditional; the grip inside it is not, so the seam is one hairline whether or not there
+      // is a pane to switch to (DESIGN.md §4).
+      const block = composer.parentElement!;
+      expect(block.getAttribute("data-slot")).toBe("chrome-block");
+      // --chrome, and NOT --muted: DESIGN.md §4 forbids --muted behind chrome, and the value it
+      // carried in dark (rgb 38, under a rgb 10 terminal) was read as a bright slab. --chrome is the
+      // raised surface the sheets already stand on.
+      expect(block.className).toMatch(/(?:^|\s)bg-chrome(?=\s|$)/);
+      expect(block.className).not.toMatch(/(?:^|\s)bg-muted(?=\s|$)/);
+      expect(block.className).toMatch(/(?:^|\s)border-t border-rule(?=\s|$)/);
+      // …and the composer's own dock draws neither, so the two never double the line.
+      expect(composer.className).not.toMatch(/(?:^|\s)border/);
+      // …and where a statusline exists it is ABOVE the block, welded to the mirror's bottom edge —
+      // so the grip, which is inside the composer inside the block, is below it in every state the
+      // terminal can reach. The composer is the FIRST thing inside the block now that the band is
+      // gone, so the belt's rule (with the grip on it) is the first chrome the thumb meets coming up
+      // from the terminal.
+      const strip = screen.queryByText("[Opus 4.8] ~/webapp · main")?.closest("div.truncate")
+        ?.parentElement;
+      if (strip) {
+        // ROW IDENTITY, NOT ELEMENT IDENTITY: the statusline stands down with the keyboard, so its
+        // row in this column is its own Collapse wrapper.
+        expect(strip.closest('[data-slot="collapse"]')!.nextElementSibling).toBe(block);
+        expect(block.firstElementChild).toBe(composer);
+      }
+      cleanup();
+    }
+  });
+
+  it("leaves an adapterless agent's input-box buffer fully raw — no status strip, box kept in the mirror", () => {
+    renderChat({ text: STATUS_TEXT, agent: opencodeAgent });
+    // The statusline is NOT hoisted into an app strip — it stays inside the raw <pre> mirror…
+    const status = screen.getByText(/\[Opus 4\.8\] ~\/webapp · main/);
+    expect(status.closest("pre")).not.toBeNull();
+    // …and the input box itself is preserved verbatim (no chrome stripping for a non-Claude agent).
+    expect(screen.getByText(/❯/)).toBeInTheDocument();
+  });
+
+  it("strips Grok's composer box and hoists the bottom-border status into the app strip", () => {
+    const grokBox = [
+      "Sandbox transcript",
+      "",
+      `  ╭${"─".repeat(60)}╮`,
+      "  │ ❯ testing stuff                                                     │",
+      `  ╰${"─".repeat(28)} Local Llama (xhigh) · plan ─╯`,
+      "",
+      "  Shift+Tab:mode  │  Ctrl+.:shortcuts",
+    ].join("\n");
+    const grokAgent = { ...opencodeAgent, agent: "grok", paneId: "w9:p5" };
+    renderChat({ text: grokBox, agent: grokAgent });
+    const strip = screen.getByText("Local Llama (xhigh) · plan");
+    expect(strip.closest("pre")).toBeNull();
+    expect(strip.textContent).toBe("Local Llama (xhigh) · plan");
+    expect(screen.queryByText(/Shift\+Tab:mode/)).toBeNull();
+    expect(screen.queryByText("╭")).toBeNull();
+  });
+});
+
+// Regression (user-reported on mobile): tapping a native prompt/wizard/preview option button popped
+// the phone keyboard. Those buttons live INSIDE the terminal-mirror div, whose onClick focuses the
+// composer (the "tap the mirror to start typing" affordance) — so an option tap bubbled up and
+// focused the input, opening the soft keyboard over the output. focusFromMirror must ignore taps
+// that land on an interactive control, while still focusing on a tap of the raw terminal text.
+describe("AgentChat — mirror tap must not pop the keyboard on option taps", () => {
+  const mockSubmit = vi.mocked(submitPromptOption);
+  beforeEach(() => {
+    mockSubmit.mockReset();
+    mockSubmit.mockResolvedValue({ status: "sent" });
+  });
+
+  it("does NOT focus the composer when a native prompt option is tapped", async () => {
+    const user = userEvent.setup();
+    // MENU_AGENT's Surface carries an ask, so the tap is one Answer to it (M56 spec 08).
+    let answered = 0;
+    server.use(
+      http.post(/\/api\/ask\/[^/]+$/, () => {
+        answered += 1;
+        return HttpResponse.json({ receipt: { outcome: "sent", keys: ["1"] } });
+      }),
+    );
+    renderChat({ text: MENU_TEXT, agent: MENU_AGENT });
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    const yes = await screen.findByRole("button", { name: "Yes" });
+
+    await user.click(yes);
+    await waitFor(() => expect(answered).toBe(1));
+    expect(mockSubmit).not.toHaveBeenCalled();
+    expect(box).not.toHaveFocus();
+  });
+
+  // The composer's "Answer the dialog" word is a way to the card: it focuses the card's first action
+  // button and sends nothing (M51 spec 10).
+  it("'Answer the dialog' focuses the card's first button and sends nothing", async () => {
+    const user = userEvent.setup();
+    renderChat({ text: MENU_TEXT, agent: MENU_AGENT });
+    const box = screen.getByPlaceholderText(/type a reply/i);
+
+    await user.type(box, "for after the dialog");
+    await user.click(screen.getByRole("button", { name: "Answer the dialog" }));
+
+    const yes = await screen.findByRole("button", { name: "Yes" });
+    expect(yes).toHaveFocus();
+    expect(mockSubmit).not.toHaveBeenCalled();
+    expect(box).toHaveValue("for after the dialog");
+  });
+
+  it("DOES still focus the composer when the raw mirror text is tapped", async () => {
+    const user = userEvent.setup();
+    renderChat({ text: "recent pane output" });
+    const box = screen.getByPlaceholderText(/type a reply/i);
+
+    await user.click(screen.getByText("recent pane output"));
+    await waitFor(() => expect(box).toHaveFocus());
+  });
+
+  it("focuses during the tap event so mobile browsers can open the software keyboard", () => {
+    renderChat({ text: "recent pane output" });
+    const box = screen.getByPlaceholderText(/type a reply/i);
+
+    fireEvent.click(screen.getByText("recent pane output"));
+
+    expect(box).toHaveFocus();
+  });
+});
+
+// Connection copy now lives in the single top ConnectionBanner (mounted in RootLayout), not in the
+// header — so the pane header has no pill. What it still owns: the agent's status DOT, which shows
+// the LAST snapshot's status and must stop reading as current during an outage (it dims on any
+// not-live). The dot is what carries this now: the word that used to stand on the composer's status
+// band went with the band.
+describe("AgentChat — shared header: stale-status dimming", () => {
+  beforeEach(() => __resetConnectionHealth());
+
+  it("dims the agent status dot while the connection is not live and restores it on recovery", () => {
+    // fixtureAgents[0] is a blocked claude agent → the dot is NAMED "needs you".
+    let setError: (e: boolean) => void = () => {};
+    function Harness() {
+      const [error, setErr] = useState(true);
+      setError = setErr;
+      const agent = fixtureAgents[0]!;
+      return (
+        <AgentChat
+          paneId={agent.paneId}
+          agent={agent}
+          agents={fixtureAgents}
+          shellPanes={[]}
+          tabs={[]}
+          text="out"
+          error={error}
+          onBack={vi.fn()}
+          onSelect={vi.fn()}
+        />
+      );
+    }
+    const router = createMemoryRouter([{ path: "/", element: withHeaderHost(<Harness />) }]);
+    render(<RouterProvider router={router} />);
+
+    // Addressed by its accessible name, which is the only handle it has: the dot is an empty span,
+    // so it matches no text query. That naming is load-bearing in its own right now — it is how a
+    // reader gets the state at all since the word left.
+    const dot = screen.getByLabelText("needs you");
+    expect(dot).toHaveClass("opacity-40"); // not live → frozen status dimmed
+    act(() => setError(false)); // snapshot recovers → live
+    expect(dot).not.toHaveClass("opacity-40"); // undimmed instantly
+  });
+});
+
+// The pane screen's status used to float over the tab strip (dock="top"), landing on the tab
+// strip's own "+" the moment a fresh tab earned its first status. It now rides in the header's
+// title slot (HeaderStatus) instead — this is the regression test for that move.
+describe("AgentChat — status rides the header title slot, not the tab strip", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    clearStatus();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("shows a live status in place of the title, and the tab strip's + stays usable", () => {
+    renderChat({ tabs: fixtureTabs });
+
+    // The title is showing, no status yet. Line 2 now names the workspace alone — the tab crumb
+    // left this line for the tab strip under the header.
+    expect(screen.getByText("webapp")).toBeInTheDocument();
+
+    act(() => setStatus("Sent", "success"));
+
+    // The title's own text is gone from the header slot — the status replaced it in place.
+    expect(screen.queryByText("webapp")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Sent");
+
+    // The tab strip's "+" never moved and is still enabled — the control the operator just
+    // tapped to earn this exact status, on the old placement, is untouched by the swap.
+    const newTab = screen.getByRole("button", { name: "New tab" });
+    expect(newTab).toBeInTheDocument();
+    expect(newTab).toBeEnabled();
+  });
+
+  it("brings the title back once the status's TTL expires", () => {
+    renderChat({ tabs: fixtureTabs });
+    act(() => setStatus("Sent", "success"));
+    expect(screen.getByRole("status")).toHaveTextContent("Sent");
+
+    act(() => vi.advanceTimersByTime(2500));
+
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByText("webapp")).toBeInTheDocument();
+  });
+});
+
+// The History affordance opens the agent's own transcript — the only real scrollback a Claude pane
+// has, because its terminal runs on the alternate screen and Hangar retains nothing behind the
+// viewport. It's gated on the pane actually reporting an agent session, so the button can never
+// lead to an empty screen.
+describe("AgentChat \u2014 the pane menu in the header", () => {
+  /** The header's own row \u2014 the screen below it is full of buttons, so every query here is scoped. */
+  const headerRow = (container: HTMLElement) =>
+    container.querySelector<HTMLElement>('header [data-slot="header-row"]')!;
+
+  // THE POINT OF THE CHANGE. Two icons became one control; the row must not carry find or history as
+  // controls of its own any more. Asserted over the header row's whole button list, so a stray third
+  // control added later fails here rather than on a phone.
+  it("no longer renders Find and History as separate header controls", () => {
+    const agent = { ...fixtureAgents[0]!, hasSession: true };
+    const { container } = renderChat({ agent, agents: [agent] });
+    const title = screen.getByRole("button", { name: /open webapp overview/i });
+    const after = Array.from(headerRow(container).querySelectorAll("button")).filter(
+      (b) => title.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(after.map((b) => b.getAttribute("aria-label"))).toEqual(["Pane actions"]);
+  });
+
+  // The glyph is a \u22ee and names nothing on its own, so the accessible name is the whole of what a
+  // screen reader gets. It has to say what the control OPENS.
+  it("gives the one control an accessible name that says what it opens", () => {
+    renderChat();
+    const menu = screen.getByRole("button", { name: "Pane actions" });
+    expect(menu).toBeInTheDocument();
+    // 44px, DRAWN, because the menu has a column of its own now: `w-11` wide and stretched against
+    // a `min-h-11` floor. It was a `size-5` glyph reaching out with a `::before` while it stood
+    // inside the meta stack, where a real box would have been twice the slot; out of the stack there
+    // is room for the box, and a real box can show that it was pressed.
+    expect(menu.className).toMatch(/(?:^|\s)w-11(?=\s|$)/);
+    expect(menu.className).toMatch(/(?:^|\s)min-h-11(?=\s|$)/);
+    expect(menu.className).not.toMatch(/before:-inset-3/);
+  });
+
+  // \u00a72: no state may move content. Opening the menu must not touch the row that triggered it \u2014
+  // the sheet is a fixed overlay mounted OUTSIDE the header, so the row's own box is untouched.
+  it("leaves the header row's geometry alone when the menu opens", async () => {
+    const user = userEvent.setup();
+    const { container } = renderChat();
+    const before = headerRow(container).className;
+    expect(before).toContain("min-h-15"); // the 60px floor \u2014 app-header.tsx states it once
+    await openPaneMenu(user);
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    const row = headerRow(container);
+    expect(row.className).toBe(before);
+    // The sheet is not INSIDE the header \u2014 ui/sheet.tsx uses no portal, so a sheet mounted in the
+    // sticky header would be positioned and stacked against it instead of the viewport.
+    expect(container.querySelector("header")!.contains(screen.getByRole("dialog"))).toBe(false);
+  });
+
+  it("offers History behind the menu when the pane reports an agent session id", async () => {
+    const user = userEvent.setup();
+    const agent = { ...fixtureAgents[0]!, hasSession: true };
+    renderChat({ agent, agents: [agent] });
+    expect(screen.queryByRole("button", { name: /conversation history/i })).not.toBeInTheDocument();
+    await openPaneMenu(user);
+    expect(screen.getByRole("button", { name: /conversation history/i })).toBeInTheDocument();
+  });
+
+  it("hides the History row when the pane has no agent session (a shell, or a harness without one)", async () => {
+    const user = userEvent.setup();
+    renderChat(); // fixture agents carry no session
+    await openPaneMenu(user);
+    expect(screen.getByRole("dialog")).toBeInTheDocument(); // the menu really did open
+    expect(screen.queryByRole("button", { name: /conversation history/i })).not.toBeInTheDocument();
+  });
+
+  // The row must reach the SAME route the header icon reached \u2014 that is the whole of what moved.
+  it("navigates History to the pane's transcript route", async () => {
+    const user = userEvent.setup();
+    const agent = { ...fixtureAgents[0]!, hasSession: true };
+    const props: ComponentProps<typeof AgentChat> = {
+      paneId: agent.paneId,
+      agent,
+      agents: [agent],
+      shellPanes: [],
+      tabs: [],
+      text: "recent pane output",
+      onBack: vi.fn(),
+      onSelect: vi.fn(),
+    };
+    const router = createMemoryRouter([
+      { path: "/", element: withHeaderHost(<AgentChat {...props} />) },
+      { path: "/pane/:paneId/history", element: <div>transcript route</div> },
+    ]);
+    render(<RouterProvider router={router} />);
+    await openPaneMenu(user);
+    await user.click(screen.getByRole("button", { name: /conversation history/i }));
+    expect(await screen.findByText("transcript route")).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe(`/pane/${encodeURIComponent(agent.paneId)}/history`);
+  });
+
+  // M53 spec 12: the conversation list on the dashboard is a durable program's history, so a pane with no
+  // screen draws no History row at all, session or not. A pane with a screen keeps the transcript row.
+  function declaresMux(capabilities: Record<string, boolean>) {
+    server.use(
+      http.get("/api/config", () =>
+        HttpResponse.json({
+          push: false,
+          vapidPublicKey: "",
+          mux: { name: "reference", capabilities, unsupportedKeys: [], notes: {} },
+        }),
+      ),
+    );
+  }
+
+  it("history row: a pane with no screen draws none, even where the program serves its history", async () => {
+    declaresMux({ paneGrid: false, programHistory: true });
+    const user = userEvent.setup();
+    const agent = { ...fixtureAgents[0]!, hasSession: true };
+    const sibling: AgentView = { ...agent, paneId: "w1:p7" };
+    renderChat({ agent, agents: [agent, sibling], tabs: fixtureTabs });
+    // The config arrives after the first paint; the strips leaving is the sign it has landed.
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Panes" })).toBeNull());
+    await openPaneMenu(user);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /conversation history/i })).not.toBeInTheDocument();
+  });
+
+  // durable-simple (2026-10-13): a durable conversation's screen keeps the header lines, the thread and the
+  // composer, and drops what belongs to a terminal: the header's two tap targets, Pin and Pane settings in
+  // the sheet, and the Switch and Files pills in the belt. Close says what it closes.
+  it("a pane with no screen: no header taps, no Pin or settings, Close conversation, no Switch or Files pill", async () => {
+    declaresMux({ paneGrid: false, closePane: true });
+    const user = userEvent.setup();
+    // A bridge that does not mark the program for the Send Protocol: it has no receipts to list.
+    const { sendProtocol: _marked, ...unmarked } = fixtureAgents[0]!;
+    const agent: AgentView = { ...unmarked, cwd: "/srv/support" };
+    const sibling: AgentView = { ...agent, paneId: "w1:p7" };
+    const { container } = renderChat({ agent, agents: [agent, sibling], tabs: fixtureTabs });
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Panes" })).toBeNull());
+    await waitFor(() => expect(container.querySelector('[data-slot="pane-identity-taps"]')).toBeNull());
+    expect(container.querySelector('[data-slot="pane-lines"]')).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Switch pane" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Files" })).toBeNull();
+    await openPaneMenu(user);
+    const sheet = screen.getByRole("dialog");
+    expect(within(sheet).queryByRole("button", { name: /Pin to top/ })).toBeNull();
+    expect(within(sheet).queryByRole("button", { name: /Pane settings/ })).toBeNull();
+    expect(within(sheet).getByRole("button", { name: /Close conversation/ })).toBeInTheDocument();
+  });
+
+  it("a program on this machine with the Send Protocol: Pane settings opens its Recent sends, with no cache switch (M56 spec 14)", async () => {
+    declaresMux({ paneGrid: false, closePane: true });
+    server.use(
+      http.get("/api/send/receipts", () =>
+        HttpResponse.json({ receipts: [{ requestId: "req00003", at: Date.now(), mode: "send", outcome: "sent", queued: true, keys: [], gapsMs: {}, harness: "desk", version: null }] }),
+      ),
+    );
+    const user = userEvent.setup();
+    const agent: AgentView = { ...fixtureAgents[0]!, cwd: "/srv/support", sendProtocol: true };
+    renderChat({ agent, agents: [agent] });
+    await openPaneMenu(user);
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: /Pane settings/ }));
+    expect(await screen.findByText("Recent sends")).toBeInTheDocument();
+    expect(await screen.findByText("Queued behind the agent's turn")).toBeInTheDocument();
+    expect(screen.queryByRole("switch", { name: /cache goes cold/i })).toBeNull();
+  });
+
+  it("Go to the question focuses the question card of THIS chat, with a second chat mounted (M56 spec 14)", async () => {
+    declaresMux({ paneGrid: false, closePane: true });
+    const question: NonNullable<AgentView["asks"]>[number] = {
+      id: "pa-1",
+      kind: "permission",
+      toolCallId: "tc-1",
+      revision: 1,
+      title: "Save this note?",
+      itemId: "item-1",
+      options: [
+        { id: "save", label: "Save", effect: "allow" },
+        { id: "skip", label: "Don't save", effect: "deny" },
+      ],
+    };
+    server.use(
+      http.post("/api/send", () =>
+        HttpResponse.json({
+          offers: [],
+          receipt: { outcome: "refused", reason: "not_free", keys: [] },
+          surface: { revision: 9, turn: "running", modal: { ask: { id: "ask-0123456789abcd", kind: "permission", options: [{ id: "1", label: "Save" }, { id: "2", label: "Don't save" }], channel: "program", hash: "abc" } }, composer: "empty" },
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    const first: AgentView = { ...fixtureAgents[0]!, status: "blocked", sendProtocol: true, asks: [question] };
+    const second: AgentView = { ...first, paneId: "w1:p9" };
+    const one = renderChat({ agent: first, agents: [first], paneId: first.paneId, text: "" });
+    const two = renderChat({ agent: second, agents: [second], paneId: second.paneId, text: "" });
+    await waitFor(() => expect(two.container.querySelector('[data-slot="ask-card"]')).not.toBeNull());
+    expect(one.container.querySelector('[data-slot="ask-card"]')).not.toBeNull();
+    const field = within(two.container).getByPlaceholderText("Message this conversation");
+    await user.type(field, "check the logs");
+    await user.click(within(two.container).getByRole("button", { name: "Send" }));
+    await user.click(await within(two.container).findByRole("button", { name: "Go to the question" }));
+    const focused = document.activeElement;
+    expect(focused?.closest('[data-slot="ask-card"]')).not.toBeNull();
+    expect(two.container.contains(focused)).toBe(true);
+    expect(one.container.contains(focused)).toBe(false);
+  });
+
+  it("history row: a pane with a screen keeps it, on Hangar's declaration", async () => {
+    declaresMux({ paneGrid: true, agentSessionRef: true });
+    const user = userEvent.setup();
+    const agent = { ...fixtureAgents[0]!, hasSession: true };
+    renderChat({ agent, agents: [agent] });
+    await openPaneMenu(user);
+    expect(await screen.findByRole("button", { name: /conversation history/i })).toBeInTheDocument();
+  });
+
+  // THE FIND PATH, end to end, because it is the one that spans three components. The row closes the
+  // sheet and opens find in ONE React event: the sheet's focus-restore (aimed at the \u22ee, which the
+  // takeover has just removed) must lose to the find bar's own mount focus, or a one-handed operator
+  // gets a sheet-shaped animation and no keyboard.
+  it("opening Find from the menu takes the header row over, with focus in the field", async () => {
+    const user = userEvent.setup();
+    const { container } = renderChat();
+    await openFind(user);
+    // The sheet is gone \u2026
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    // \u2026 the find bar owns the whole row (the identity block and the \u22ee are both out of it) \u2026
+    const field = screen.getByRole("textbox", { name: /find in output/i });
+    expect(headerRow(container).contains(field)).toBe(true);
+    expect(screen.queryByRole("button", { name: "Pane actions" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /open webapp overview/i })).not.toBeInTheDocument();
+    // \u2026 and it is focused, so the phone keyboard is already up.
+    expect(document.activeElement).toBe(field);
+  });
+
+  // FIND HIGHLIGHTS THE MIRROR, and that only works because the query reaches AnsiOutput. The bar
+  // owns the field, the match count and prev/next, so every one of those can look right while the
+  // one thing find is for — seeing the hit in the output — is off. That is exactly what happened
+  // when the `query` prop was dropped from the mirror: the bar counted matches it never marked.
+  it("passes the find query down to the mirror, so a hit is highlighted", async () => {
+    const user = userEvent.setup();
+    const { container } = renderChat({ text: paneTextWithDraft("alpha needle omega") });
+    expect(container.querySelector("[data-find-match]")).toBeNull();
+    await openFind(user);
+    await user.type(screen.getByRole("textbox", { name: /find in output/i }), "needle");
+    const hit = container.querySelector("[data-find-match]");
+    expect(hit).not.toBeNull();
+    expect(hit!.textContent).toBe("needle");
+  });
+
+  // The takeover happens INSIDE the one hoisted shell (app-header.tsx): the header element itself is
+  // mounted above the outlet and is not the route's to replace. Opening and closing find therefore
+  // swaps the row's CONTENTS and nothing else — the same <header>, the same prerelease strip, the
+  // same 60px floor. A find bar that mounted a header of its own would pass every assertion in the
+  // case above and fail this one.
+  it("takes the row over inside the one shell, not by mounting a header of its own", async () => {
+    const user = userEvent.setup();
+    const { container } = renderChat();
+    const shell = container.querySelector("header");
+    const row = container.querySelector('[data-slot="header-row"]');
+    const recipe = row?.className;
+    await openFind(user);
+    expect(document.querySelectorAll("header")).toHaveLength(1);
+    expect(container.querySelector("header")).toBe(shell);
+    expect(container.querySelector('[data-slot="header-row"]')).toBe(row);
+    expect(row?.className).toBe(recipe); // the row's box is the shell's, not the find bar's
+    await user.click(screen.getByRole("button", { name: /close find/i }));
+    expect(container.querySelector("header")).toBe(shell);
+  });
+
+  // The status word has left this row, and then left the app's paint entirely — it stood on the
+  // composer's status band for a while and went with it. What the header row still owes is its
+  // ORDER: the identity leads and the one action follows it. The word's own absence here is
+  // asserted rather than assumed, because "the header got quieter" is exactly the kind of change
+  // that silently takes a state report with it — and what keeps this honest is the NAMED dot on the
+  // agent's tile, pinned in the identity-block describe above.
+  it("holds the identity ahead of the menu, and holds no status word at all", () => {
+    const agent = { ...fixtureAgents[0]!, hasSession: true };
+    const { container } = renderChat({ agent, agents: [agent] });
+    const menu = screen.getByRole("button", { name: "Pane actions" });
+    const title = screen.getByRole("button", { name: /open webapp overview/i });
+    expect(title.compareDocumentPosition(menu) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(headerRow(container).textContent).not.toContain("needs you");
+    // …and it is not one row down either: nothing in this tree DRAWS the word any more.
+    expect(container.textContent).not.toContain("needs you");
+  });
+});
+
+// The top-of-mirror affordance. This block previously rendered on NO pane at all: it was gated on
+// `truncated`, which Hangar never sets true even when a read demonstrably cut scrollback off. The
+// working signal is `readableLines` (scrollback depth + viewport), and which button appears is
+// decided by what the pane can actually offer — the two are never simultaneously possible.
+describe("AgentChat — top-of-mirror history affordance", () => {
+  // These cases are about the terminal mirror, and Chat is the default body now (ADR 0082), so the
+  // device is pinned to the terminal the way an operator who chose it is.
+  beforeEach(() => {
+    localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ paneView: "terminal" }));
+  });
+
+  const showHistory = () => screen.queryByRole("button", { name: /show entire history/i });
+  const loadOlder = () => screen.queryByRole("button", { name: /load older/i });
+
+  it("an agent pane with a transcript offers the full history, not scrollback paging", () => {
+    // A Claude pane: alt-screen, so readableLines is just its viewport — there IS no scrollback.
+    const agent = { ...fixtureAgents[0]!, hasSession: true, readableLines: 51 };
+    renderChat({ agent, agents: [agent], requestedLines: 600 });
+    expect(showHistory()).toBeInTheDocument();
+    expect(loadOlder()).not.toBeInTheDocument();
+  });
+
+  it("a pane with real scrollback and no transcript offers Load older", () => {
+    // A shell on the primary screen: 6895 lines of ring + 51 viewport, and we've only asked for 600.
+    const agent = { ...fixtureAgents[0]!, kind: "shell" as const, readableLines: 6946 };
+    renderChat({ agent, agents: [agent], requestedLines: 600 });
+    expect(loadOlder()).toBeInTheDocument();
+    expect(showHistory()).not.toBeInTheDocument();
+  });
+
+  it("offers nothing when the pane has neither", () => {
+    const agent = { ...fixtureAgents[0]!, kind: "shell" as const, readableLines: 51 };
+    renderChat({ agent, agents: [agent], requestedLines: 600 });
+    expect(loadOlder()).not.toBeInTheDocument();
+    expect(showHistory()).not.toBeInTheDocument();
+  });
+
+  it("hides Load older once the window already covers everything Hangar can return", () => {
+    const agent = { ...fixtureAgents[0]!, kind: "shell" as const, readableLines: 700 };
+    renderChat({ agent, agents: [agent], requestedLines: 1000 }); // at the cap, past the content
+    expect(loadOlder()).not.toBeInTheDocument();
+  });
+
+  // 2026-10-07: a saved copy has no bridge to page from, so the dated line stands where the button
+  // would, at the top of the mirror's scrolled text, and no bar sits above the mirror.
+  const SAVED_AT = new Date(2026, 0, 2, 14, 32).getTime();
+  it.each([
+    ["Load older", { kind: "shell" as const, readableLines: 6946 }],
+    ["Show entire history", { hasSession: true, readableLines: 51 }],
+  ])("a saved copy puts its line in the top slot instead of %s", (_name, paneFacts) => {
+    const agent = { ...fixtureAgents[0]!, ...paneFacts };
+    const { container } = renderChat({
+      agent,
+      agents: [agent],
+      requestedLines: 600,
+      stale: true,
+      lastSeenAt: SAVED_AT,
+      error: true,
+    });
+    const line = screen.getByText(/^Saved copy from .+\. Older text is on the bridge\.$/);
+    const slot = line.closest('[data-slot="saved-copy"]')!;
+    expect(slot).not.toBeNull();
+    // The first thing in the mirror's scroller, so it scrolls with the text it dates.
+    expect(slot.parentElement!.className).toContain("overflow-y-auto");
+    expect(slot.parentElement!.firstElementChild).toBe(slot);
+    expect(loadOlder()).not.toBeInTheDocument();
+    expect(showHistory()).not.toBeInTheDocument();
+    expect(container.querySelector('[data-slot="notice"]')).toBeNull();
+  });
+
+  it("live, the mirror's top slot has no saved line and keeps its button", () => {
+    const agent = { ...fixtureAgents[0]!, kind: "shell" as const, readableLines: 6946 };
+    const { container } = renderChat({ agent, agents: [agent], requestedLines: 600 });
+    expect(loadOlder()).toBeInTheDocument();
+    expect(container.querySelector('[data-slot="saved-copy"]')).toBeNull();
+  });
+
+  it("stays hidden when readableLines is unknown (older bridge) rather than offering a dud tap", () => {
+    const agent = { ...fixtureAgents[0]!, kind: "shell" as const }; // no readableLines
+    renderChat({ agent, agents: [agent], requestedLines: 600 });
+    expect(loadOlder()).not.toBeInTheDocument();
+    expect(showHistory()).not.toBeInTheDocument();
+  });
+
+  it("a transcript wins even when the pane also reports scrollback", () => {
+    const agent = { ...fixtureAgents[0]!, hasSession: true, readableLines: 6946 };
+    renderChat({ agent, agents: [agent], requestedLines: 600 });
+    expect(showHistory()).toBeInTheDocument();
+    expect(loadOlder()).not.toBeInTheDocument();
+  });
+});
+
+// EXPLAIN, don't hide, one level below the multiplexer note (#137). `hasSession` folds two facts
+// into one flag, so its absence is silent about which half failed: an agent that CAN keep a session
+// log and reported none is the operator's to fix (the `hangar integration install` hook), while an
+// agent with no journal adapter has nothing to say. The line is prose, never a control — there is
+// still no transcript to open.
+describe("AgentChat — no session reported", () => {
+  // These cases are about the terminal mirror, and Chat is the default body now (ADR 0082), so the
+  // device is pinned to the terminal the way an operator who chose it is.
+  beforeEach(() => {
+    localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ paneView: "terminal" }));
+  });
+
+  const noSessionNote = () => screen.queryByText(/has not reported a session to Hangar/i);
+
+  it("explains the silence on an agent that could have a transcript but reported none", () => {
+    const agent = { ...fixtureAgents[0]!, agent: "claude" }; // journal adapter, no hasSession
+    renderChat({ agent, agents: [agent] });
+    const note = noSessionNote();
+    expect(note).toBeInTheDocument();
+    expect(note).toHaveTextContent(/^claude /);
+    // Prose, not an affordance: nothing here is tappable, and the history button stays absent.
+    expect(note?.closest("button")).toBeNull();
+    expect(screen.queryByRole("button", { name: /show entire history/i })).not.toBeInTheDocument();
+  });
+
+  it("says nothing once the pane has reported a session", () => {
+    const agent = { ...fixtureAgents[0]!, agent: "claude", hasSession: true };
+    renderChat({ agent, agents: [agent] });
+    expect(noSessionNote()).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /show entire history/i })).toBeInTheDocument();
+  });
+
+  // #294: Codex reports its session only once its first prompt is submitted, so a fresh Codex pane
+  // has none and nothing is broken. Its note must not tell the operator to reinstall a working hook.
+  it("tells a Codex pane with no session yet that it reports on its first message", () => {
+    const agent = { ...fixtureAgents[0]!, agent: "codex" };
+    renderChat({ agent, agents: [agent] });
+    expect(noSessionNote()).not.toBeInTheDocument();
+    const note = screen.getByText(/reports its session to Hangar only after its first message/i);
+    expect(note).toHaveTextContent(/^codex /);
+    expect(note).toHaveTextContent("/hooks in codex");
+    expect(note.closest("button")).toBeNull();
+  });
+
+  it("says nothing for an agent with no journal adapter — there is no transcript to promise", () => {
+    const agent = { ...fixtureAgents[0]!, agent: "unknown-agent" }; // block grammars, no journal
+    renderChat({ agent, agents: [agent] });
+    expect(noSessionNote()).not.toBeInTheDocument();
+  });
+});
+
+// The strip has its own scroll bound (`max-h-[18dvh]`) for a statusline tall enough to spill it. On a
+// phone, dragging past that bound with no `overscroll-contain` chains the gesture into the document
+// (there is no other scrollable ancestor to absorb it) and drags the whole app — composer included —
+// down with it. See sheet.tsx's own scrollports for the same contract already in force there.
+describe("AgentChat — statusline strip scroll containment", () => {
+  it("renders the strip with overscroll-contain so a drag past its bound can't chain into the page", () => {
+    const text = readFileSync(join(import.meta.dirname, "..", "fixtures", "panes", "omp--fresh-idle.txt"), "utf8");
+    const agent = { ...fixtureAgents[0]!, agent: "omp" };
+    const { container } = renderChat({ agent, agents: [agent], text });
+    const strip = Array.from(container.querySelectorAll("div")).find((el) =>
+      el.className.includes("max-h-[18dvh]"),
+    );
+    expect(strip).toBeDefined();
+    expect(strip!.className).toMatch(/(?:^|\s)overscroll-contain(?=\s|$)/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TIER 2 — the pane's MACHINE is quiet, the phone's link is fine (M5/03).
+//
+// Everything here is about one distinction: a peer outage degrades THIS pane and says so, while the
+// app-wide connection surfaces (banner, header dog, polling) belong to tier 1 and stay out of it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const crewRoster: ServerSummary[] = [
+  { id: "bluefin", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 5_000 },
+  // Reachable-but-long-unseen would be equally stale; unreachable is the case the operator meets.
+  { id: "workshop", name: "workshop", isLead: false, reachable: false, protocol: "ok", lastSeenAt: 1_000 },
+  {
+    id: "attic",
+    name: "attic",
+    isLead: false,
+    reachable: false,
+    protocol: "incompatible",
+    protocolDetail: "crew protocol 2 (this issance speaks 1)",
+    lastSeenAt: 0,
+  },
+];
+
+/** As above, but inside a crew whose lead assembled the snapshot at `ts` (the lead's own clock). */
+function renderCrewChat(host: string, overrides: Partial<ComponentProps<typeof AgentChat>> = {}) {
+  const agent = { ...fixtureAgents[0]!, host };
+  const props: ComponentProps<typeof AgentChat> = {
+    paneId: agent.paneId,
+    scope: { host },
+    agent,
+    agents: [agent],
+    shellPanes: [],
+    tabs: [],
+    text: "output from before it went quiet",
+    onBack: vi.fn(),
+    onSelect: vi.fn(),
+    ...overrides,
+  };
+  const router = createMemoryRouter([
+    {
+      path: "/",
+      element: withHeaderHost(
+        <CrewProvider servers={crewRoster} ts={20_000} pollMs={1500}>
+          <AgentChat {...props} />
+        </CrewProvider>,
+      ),
+    },
+  ]);
+  const { container } = render(<RouterProvider router={router} />);
+  return { props, container };
+}
+
+describe("AgentChat — a pane on a host the lead can't reach", () => {
+  it("keeps showing the last known mirror, attributed to the machine by name", () => {
+    renderCrewChat("workshop");
+    // Never blank, never a spinner: the content is real, it is just not current.
+    expect(screen.getByText(/output from before it went quiet/)).toBeInTheDocument();
+    const notice = screen.getByRole("status");
+    expect(notice).toHaveTextContent(/workshop is unreachable/i);
+    expect(notice).toHaveTextContent(/last known/i);
+  });
+
+  it("says a write will be refused — before the user taps Send to find out", () => {
+    renderCrewChat("workshop");
+    expect(screen.getByRole("status")).toHaveTextContent(/refused/i);
+    // The composer names the machine rather than the generic read-only reason.
+    expect(screen.getByPlaceholderText(/workshop is unreachable/i)).toBeDisabled();
+    expect(screen.queryByPlaceholderText(/type a reply/i)).not.toBeInTheDocument();
+  });
+
+  it("refuses the reply BEFORE any request is made (§10.3 — no queue, no retry)", async () => {
+    const calls: string[] = [];
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/(reply|keys)$/, ({ request }) => {
+        calls.push(request.url);
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+    renderCrewChat("workshop");
+    const box = screen.getByPlaceholderText(/workshop is unreachable/i);
+    // Disabled, so the user can't even get text in — and Send is off with it. The point of asserting
+    // the network too is that nothing routes around the disabled state.
+    expect(box).toBeDisabled();
+    expect(screen.getByLabelText("Send")).toBeDisabled();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(calls).toEqual([]);
+  });
+
+  it("gives an incompatible member its own reason, verbatim", () => {
+    renderCrewChat("attic");
+    const notice = screen.getByRole("status");
+    expect(notice).toHaveTextContent(/attic is running an incompatible issance/i);
+    expect(notice).toHaveTextContent(/crew protocol 2 \(this issance speaks 1\)/);
+    // Never seen at all → there is no last-good screen under the banner, and it says so rather than
+    // implying the empty mirror is the machine's real state.
+    expect(notice).toHaveTextContent(/nothing cached/i);
+  });
+
+  it("a live host in the same crew is completely untouched", () => {
+    renderCrewChat("bluefin");
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/type a reply/i)).not.toBeDisabled();
+  });
+});
+
+// The mirror draws its own top edge — `tab-strip.tsx` no longer draws a baseline of any kind (no
+// folder shape, no horizontal rule), so this file's `border-t border-rule` on the mirror wrapper is
+// the only horizontal line between the strips above and the terminal output below.
+//
+// The three values below are one set. The gap is what makes the mirror's rule a clean boundary
+// rather than a doubled one against whatever chrome sits above it; `pt-0` is what pays for it
+// (ChatMessageList's own base is `py-4`, so merely dropping the override lets 16px back in, not 0).
+// Verified to fail in both directions: remove the margin and the doubling assertion trips; restore
+// the scroller's top padding and the last one does.
+describe("AgentChat — the mirror's top edge", () => {
+  // `div[role="presentation"]`, not `[role="presentation"]`: the issance mark's SVG carries the same
+  // role, and an SVG's `className` is an SVGAnimatedString rather than a string — the assertion then
+  // fails on the wrong element with a type error instead of a diff.
+  function mirrorAndTabs(container: HTMLElement) {
+    const mirror = [...container.querySelectorAll<HTMLElement>('div[role="presentation"]')].find(
+      (el) => el.querySelector(".overflow-y-auto"),
+    );
+    const nav = screen.getByRole("navigation", { name: /tabs/i });
+    return { mirror, nav };
+  }
+
+  it("draws the mirror's own rule; the tab strip above draws no horizontal rule at all", () => {
+    const { container } = renderChat({ tabs: fixtureTabs });
+    const { mirror, nav } = mirrorAndTabs(container);
+
+    // The tab strip draws neither edge — no baseline, no top rule — only its own chrome ground.
+    expect(nav?.className).not.toMatch(/\bborder-[tb]\b/);
+    expect(nav?.className).toMatch(/\bbg-chrome\b/);
+
+    // The mirror announces itself with the structural line, not the component line.
+    expect(mirror?.className).toMatch(/\bborder-t\b/);
+    expect(mirror?.className).toMatch(/\bborder-rule\b/);
+
+    // …and it is set down off the baseline, so the two rules are two boundaries and never one.
+    expect(mirror?.className).toMatch(/\bmt-\d/);
+  });
+
+  it("keeps the scroller's top padding at zero, which is what bought the rule", () => {
+    const { container } = renderChat({ tabs: fixtureTabs });
+    const { mirror } = mirrorAndTabs(container);
+    const scroller = mirror?.querySelector<HTMLElement>(".overflow-y-auto");
+
+    // `pt-0` stated, not merely absent: the base `py-4` is still on the element and Tailwind's own
+    // sheet order is what lets the later `pt-0` beat it, so dropping the class restores 16px.
+    expect(scroller?.className).toMatch(/\bpt-0\b/);
+    expect(scroller?.className).toMatch(/\bpb-3\b/);
+  });
+});
+
+// Closing the in-pane TabStrip's CURRENT tab used to read as "leave the pane view" (onBack ->
+// dashboard). It must instead read as closing a browser tab: land on another tab of the same space,
+// via closeCurrentTab's goToTab-style resolution, and only fall back to onBack() when the space has
+// nothing left to land on. Each test drives the real two-tap close UI (long-press -> "Close tab" ->
+// confirm) so the wiring from TabStrip's onClosed through to onSelect/onBack is exercised end to end,
+// not just the helper in isolation.
+describe("AgentChat — closing the current tab", () => {
+  // A folder tab's accessible name is its (optional) status word immediately followed by its label
+  // — e.g. "workingcode" for a tab named "code" with a working agent inside (tab-strip.tsx renders
+  // an sr-only status word ahead of the label with no separating whitespace). Match on the label
+  // trailing the name rather than the name in full, so a test doesn't have to track each fixture's
+  // triage status.
+  async function closeTab(user: User, label: string, confirmName: RegExp | string) {
+    fireEvent.contextMenu(screen.getByRole("button", { name: new RegExp(`${label}$`) }));
+    await user.click(screen.getByRole("button", { name: "Close tab" }));
+    await user.click(screen.getByRole("button", { name: confirmName }));
+  }
+
+  it("moves to the neighbouring tab in the strip's own order, not the dashboard", async () => {
+    const user = userEvent.setup();
+    const onBack = vi.fn();
+    const onSelect = vi.fn();
+    server.use(
+      http.post(/\/api\/tab\/[^/]+\/close$/, () => HttpResponse.json({ ok: true })),
+    );
+    // w2 has two tabs (fixtureTabs): "code" (w2:t1, the current pane's tab) and "shell" (w2:t2,
+    // fixtureShellPanes' pane). Closing "code" — the current tab, and the FIRST of the two — must
+    // land on its one neighbour, "shell", not eject to Home.
+    renderChat({
+      agent: fixtureAgents[1], // w2:p1, tabId w2:t1 ("code")
+      agents: fixtureAgents,
+      shellPanes: fixtureShellPanes, // w2:p2, tabId w2:t2 ("shell")
+      tabs: fixtureTabs,
+      onBack,
+      onSelect,
+    });
+
+    await closeTab(user, "code", "Tap again to close 1 pane");
+
+    await waitFor(() => expect(onSelect).toHaveBeenCalledExactlyOnceWith("w2:p2"));
+    expect(onBack).not.toHaveBeenCalled();
+    // …AND IT SAYS SO. Closing the tab you are IN navigates, so the ✓ on the tapped control is
+    // drawn inside a strip that is unmounting, on a screen the operator is leaving — an
+    // acknowledgement nobody can be looking at. `createTab` takes a status for exactly this reason
+    // (lib/ack-manifest.ts) and this path is the same shape. Every status publish also turns the
+    // mark's orbit one round, which is the half the operator noticed was missing.
+    expect(await screen.findByText("Tab closed")).toBeInTheDocument();
+  });
+
+  it("closing the LAST tab in the strip falls back to the previous one", async () => {
+    const user = userEvent.setup();
+    const onBack = vi.fn();
+    const onSelect = vi.fn();
+    server.use(
+      http.post(/\/api\/tab\/[^/]+\/close$/, () => HttpResponse.json({ ok: true })),
+    );
+    const agentIn = (paneId: string, tabId: string): AgentView => ({
+      paneId,
+      workspaceId: "w2",
+      workspaceLabel: "issance",
+      workspaceNumber: 2,
+      tabId,
+      agent: "claude",
+      status: "idle",
+      cwd: "/home/you/issance",
+      focused: false,
+    });
+    const threeTabs: TabView[] = [
+      { tabId: "w2:t1", workspaceId: "w2", number: 1, label: "a", focused: false, paneCount: 1 },
+      { tabId: "w2:t2", workspaceId: "w2", number: 2, label: "b", focused: false, paneCount: 1 },
+      { tabId: "w2:t3", workspaceId: "w2", number: 3, label: "c", focused: true, paneCount: 1 },
+    ];
+    const current = agentIn("w2:p3", "w2:t3");
+    renderChat({
+      agent: current,
+      agents: [agentIn("w2:p1", "w2:t1"), agentIn("w2:p2", "w2:t2"), current],
+      shellPanes: [],
+      tabs: threeTabs,
+      onBack,
+      onSelect,
+    });
+
+    // "c" (w2:t3) is last in the strip's own order, so there is no next tab — the previous one, "b"
+    // (w2:t2), is what a browser tab bar would land on.
+    await closeTab(user, "c", "Tap again to close 1 pane");
+
+    await waitFor(() => expect(onSelect).toHaveBeenCalledExactlyOnceWith("w2:p2"));
+    expect(onBack).not.toHaveBeenCalled();
+  });
+
+  it("falls back to onBack() when the space has no other tab to go to", async () => {
+    const user = userEvent.setup();
+    const onBack = vi.fn();
+    const onSelect = vi.fn();
+    server.use(
+      http.post(/\/api\/tab\/[^/]+\/close$/, () => HttpResponse.json({ ok: true })),
+    );
+    // w1 (fixtureAgents[0], tabId w1:t1) has exactly one tab — fixtureTabs' w1 entry.
+    renderChat({
+      agent: fixtureAgents[0],
+      tabs: [fixtureTabs[0]!],
+      onBack,
+      onSelect,
+    });
+
+    await closeTab(user, "1", "Tap again to close 1 pane");
+
+    await waitFor(() => expect(onBack).toHaveBeenCalledOnce());
+    expect(onSelect).not.toHaveBeenCalled();
+    // Both exits from `closeCurrentTab` say it, because it is the same fact either way: the tab you
+    // were in is gone and you are somewhere else now. A status on only one branch would be silent on
+    // the more disorienting of the two.
+    expect(await screen.findByText("Tab closed")).toBeInTheDocument();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE BOTTOM FITS THE SCREEN IT IS ON — and the screen is measured, never assumed.
+//
+// The operator's report: "here for example the bottom is cut off, and when the keyboard is open…".
+// It is arithmetic, not a padding bug. The route column is `h-(--app-h)` (routes/root.tsx). Inside
+// it the mirror carries `min-h-0 flex-1`, so the mirror is the row that gives — and it gives all
+// the way to zero. Everything below it is content-sized, so once the mirror is at zero the surplus
+// paints past the bottom edge of the viewport, under the soft keyboard, and the send button becomes
+// unreachable. With the keyboard up a phone has ~440px of page and the un-shrinkable rows wanted
+// ~454px.
+//
+// The repair is NOT to let the bottom shrink — nothing inside it scrolls, so it would clip the
+// composer instead of overflowing it, which is the same loss with a tidier edge. The repair is to
+// BOUND the two parts of it that grow, and to bound them as a fraction of the viewport rather than
+// at a constant. `dvh` already tracks the soft keyboard, because the viewport meta is
+// `interactive-widget=resizes-content` (hooks/use-keyboard.ts says so from the other side), so one
+// unit does the job on every device instead of encoding one phone's pixels.
+//
+// These three assertions are the whole argument, and each one fails on the edit that would undo it.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("the pane fits its viewport", () => {
+  it("holds the bottom region's size and bounds what grows inside it — never the reverse", () => {
+    const { container } = renderChat({ text: STATUS_TEXT });
+    const block = container.querySelector('[data-slot="chrome-block"]')!;
+    const bottom = block.parentElement!;
+    // ROW IDENTITY, NOT ELEMENT IDENTITY — the same reading the docking test above states. The whole
+    // bottom region now stands inside a `Collapse`: it leaves as one row when zen hides the chrome.
+    // `Collapse` is a presence animation and styles NOTHING, so the ROW in this flex column is that
+    // wrapper, and the adjacency claim is about the row. Asserted through it rather than around it:
+    // the wrapper must be found, so a bottom region that quietly escaped its Collapse fails here too.
+    const bottomRow = bottom.closest('[data-slot="collapse"]')!;
+    expect(bottomRow).not.toBeNull();
+    // The mirror is the bottom row's own previous sibling — taken that way rather than by a
+    // selector, so this asserts the ADJACENCY the argument rests on instead of merely finding two
+    // elements that happen to match.
+    const mirror = bottomRow.previousElementSibling!;
+
+    // The two are flex siblings in the same column: one gives, one does not.
+    expect(mirror.getAttribute("role")).toBe("presentation");
+    expect(mirror.parentElement).toBe(bottomRow.parentElement);
+    expect(mirror.className).toMatch(/(?:^|\s)min-h-0(?=\s|$)/);
+    expect(mirror.className).toMatch(/(?:^|\s)flex-1(?=\s|$)/);
+
+    // STATED, not inherited. `shrink-0` is what makes the bound below the whole story.
+    expect(bottom.className).toMatch(/(?:^|\s)shrink-0(?=\s|$)/);
+    // And explicitly NOT the tempting repair: `min-h-0` here clips the composer from the bottom.
+    expect(bottom.className).not.toMatch(/(?:^|\s)min-h-0(?=\s|$)/);
+  });
+
+  it("caps the agent statusline against the viewport, and scrolls rather than eating a row", () => {
+    // The status-row bound (8, `idle.volatile.below.maxRows` in the Claude profile) is a ROW COUNT, and a row count is not a height: eight rows of
+    // `CTX:44% CACHE:100% LIMITS…` is a quarter of a keyboard-open phone, held against a mirror
+    // already showing zero rows of what the agent actually SAID.
+    const { container } = renderChat({ text: STATUS_TEXT });
+    // Through the Collapse wrapper the strip now stands in — see the docking test above.
+    const strip = container
+      .querySelector('[data-slot="chrome-block"]')!
+      .previousElementSibling!.querySelector("div.font-mono")!;
+    // The cap is relative — a `dvh` fraction, so it follows the device and the keyboard.
+    expect(strip.className).toMatch(/max-h-\[\d+dvh\]/);
+    // …and scrolled, not clipped: this strip carries the permission mode, and silently eating that
+    // row is worse than any height.
+    expect(strip.className).toMatch(/(?:^|\s)overflow-y-auto(?=\s|$)/);
+  });
+
+  // jsdom has no `visualViewport`, so `useKeyboardOpen` returns early and every other test in this
+  // file renders the RESTING geometry — which is what makes this stub necessary and also what makes
+  // it safe: it is installed and removed inside the one test that wants it.
+  function withSoftKeyboard() {
+    const listeners = new Set<() => void>();
+    const vv = {
+      width: 390,
+      height: 844,
+      addEventListener: (_: string, fn: () => void) => void listeners.add(fn),
+      removeEventListener: (_: string, fn: () => void) => void listeners.delete(fn),
+    };
+    const had = Object.getOwnPropertyDescriptor(window, "visualViewport");
+    Object.defineProperty(window, "visualViewport", { value: vv, configurable: true });
+    return {
+      open: (height: number) => {
+        vv.height = height;
+        act(() => listeners.forEach((fn) => fn()));
+      },
+      restore: () => {
+        if (had) Object.defineProperty(window, "visualViewport", had);
+        else Reflect.deleteProperty(window, "visualViewport");
+      },
+    };
+  }
+
+  it("stands the statusline down while the keyboard is up — and NOT the switcher grip", async () => {
+    // THE OPERATOR'S OWN SUGGESTION, verbatim: "when the keyboard is open I have a feeling that we
+    // could hide the scroll up row and status row could be hidden?" — taken, and half of it
+    // declined, which is why this test names both halves.
+    //
+    // TAKEN: the 21–112px agent statusline. It is read BEFORE typing, not during it: CTX/CACHE/LIMITS
+    // is reference data, and it is the largest block below the mirror.
+    //
+    // THE SWITCHER LEFT THIS LIST, and that is a DECISION, not a regression. The grab handle was once
+    // here too, on the same reasoning — nobody switches panes mid-sentence — but the real argument was
+    // always the 30px it cost at the one moment the screen had none to give. The grip rides the
+    // actions belt's own rule now (actions-row.tsx) and costs 0px in every state, so there is nothing
+    // to buy back by hiding it, and the switcher sheet became reachable mid-sentence into the bargain.
+    //
+    // DECLINED, and still declined: the status band. It was 14px — the cheapest row on the screen —
+    // and the only place the pane's state was spelled as a WORD rather than a coloured dot (WCAG
+    // 1.4.1). It is gone for other reasons entirely (composer.tsx says where it went); it never
+    // stood down for the keyboard, and the belt that replaced it does not either.
+    const kb = withSoftKeyboard();
+    try {
+      const { container } = renderChat({ text: STATUS_TEXT });
+      expect(screen.queryByRole("button", { name: "Switch pane" })).not.toBeNull();
+
+      kb.open(460); // a soft keyboard: -384px, well past the open threshold
+
+      // `Collapse` unmounts at the END of its exit, so the statusline leaves the tree — and leaving
+      // the tree is the a11y half of that claim: what is not on screen must not still be focusable.
+      await waitFor(() => expect(screen.queryByText("[Opus 4.8] ~/webapp · main")).toBeNull());
+      // …and the grip stays, keyboard or no keyboard. It is in no `Collapse` at all.
+      expect(screen.queryByRole("button", { name: "Switch pane" })).not.toBeNull();
+
+      // THE NAVIGATION ROWS ARE ON A DIFFERENT LIST NOW, and the distinction is the point. They
+      // were once declined here outright — "the tab row is how you know where you are, and losing
+      // it the moment you start typing costs more than the pixels are worth" — and that reasoning
+      // still holds against DELETING them. It does not hold against FOLDING them: they collapse to
+      // the 32px bead bar, which keeps "where am I" and "is anything shouting" on screen and puts
+      // the rows back in one tap. Pinned in its own describe below, not here; this test is about
+      // the two rows that genuinely leave.
+
+      // …and the actions belt is untouched, keyboard or no keyboard. (It used to be the status band
+      // that was asserted here; the band is gone and the belt is what now stands directly above the
+      // input, so it is the row this claim is about.)
+      expect(container.querySelector('[data-slot="composer-actions"]')).not.toBeNull();
+      // The dock also stops paying the home-indicator inset twice: the keyboard covers the
+      // indicator, so reserving for it as well is ~24px spent on the one screen that has none.
+      const dock = container.querySelector('[data-slot="composer-actions"]')!.parentElement!;
+      expect(dock.className).toMatch(/(?:^|\s)pb-2(?=\s|$)/);
+      expect(dock.className).not.toMatch(/safe-area-inset-bottom/);
+    } finally {
+      kb.restore();
+    }
+  });
+
+  it("keeps a floor under the folder tab — the gap above the mirror may shrink, never close", () => {
+    // THE OPERATOR ASKED FOR A DENSER TAB ROW and chose this gap rather than shrinking the tab's
+    // own tap area: the tab draws at `h-8` and answers a 44px hit box through the same invisible
+    // `::before` reach the strip pills use (`STRIP_TAP_TARGET`), so every pixel off the drawn tab is
+    // still a pixel the thumb can hit. This gap costs no target at all.
+    //
+    // It may not go to zero, and the reason is measured (agent-chat.tsx states it in full): the
+    // active tab's fill and the terminal's ground are byte-identical under BOTH themes, on purpose
+    // — `--background` IS MIRROR_SPACE's fill in dark and exactly what that fill inverts to in
+    // light. With no page between them the open tab has no floor and bleeds into the mirror, and
+    // the baseline rule lands flush against the mirror's top rule as one doubled 2px hairline,
+    // which DESIGN.md §4 forbids by name. Both halves are pinned here, positively.
+    //
+    // WHERE THE GAP LIVES MOVED, AND THAT IS WHY THIS TEST NOW LOOKS IN TWO PLACES. It is the page an
+    // OPEN FOLDER TAB sits on, so it belongs to the tab row and not to the mirror: parked on the
+    // mirror it was unconditional, and folded — no tab, nothing sitting on it — it was 4px of
+    // nothing under a 24px bar. It is the strips' own `pb-1` now, inside their Collapse, and the
+    // mirror keeps a copy only for the states where those strips are not there to provide one.
+    // Either way the claim is the same and the floor is never zero under a folder tab.
+    const { container } = renderChat({ text: STATUS_TEXT });
+    // Through the bottom region's own `Collapse` row — see the region test above for why that
+    // wrapper, not the region's element, is the row this column is made of.
+    const mirror = container
+      .querySelector('[data-slot="chrome-block"]')!
+      .closest('[data-slot="collapse"]')!.previousElementSibling!;
+    expect(mirror.className).toMatch(/(?:^|\s)border-t border-rule(?=\s|$)/);
+    // No strips on this render (`tabs` is empty), so the mirror is carrying the gap itself — a real
+    // one, not `mt-0` and not absent.
+    expect(mirror.className).toMatch(/(?:^|\s)mt-[1-9](?:\.5)?(?=\s|$)/);
+
+    // …and with the strips there, the same 4px is theirs: the wrapper the two rows stand in, inside
+    // the band, so it arrives and leaves with them instead of popping on a boolean.
+    cleanup();
+    const withTabs = renderChat({ text: STATUS_TEXT, tabs: fixtureTabs }).container;
+    const band = withTabs.querySelector('[data-slot="collapse-swap"]')!;
+    expect(band.querySelector("div.pb-1")).not.toBeNull();
+    const secondMirror = withTabs
+      .querySelector('[data-slot="chrome-block"]')!
+      .closest('[data-slot="collapse"]')!.previousElementSibling!;
+    expect(secondMirror.className).toMatch(/(?:^|\s)mt-0(?=\s|$)/);
+  });
+
+  it("caps the draft field as a fraction of the viewport, not at a constant", () => {
+    // `max-h-40` was 160px, chosen against a full-height screen — a THIRD of everything visible
+    // with the keyboard up, and the growth that pushed the send button off the bottom. `10rem` IS
+    // that 160px, so at rest on any ordinary screen this field is byte-identical to before; only
+    // the case that was broken changes.
+    renderChat({ text: STATUS_TEXT });
+    const field = screen.getByRole("textbox");
+    expect(field.className).toMatch(/max-h-\[min\(10rem,\d+dvh\)\]/);
+    expect(field.className).not.toMatch(/(?:^|\s)max-h-40(?=\s|$)/);
+  });
+});
+
+// ZEN MODE — the whole point is that the chrome LEAVES, so these assert the absence of surfaces
+// every other test in this file leans on, and that the one floating way out brings them all back.
+//
+// "The chrome" is read as its ROWS, not as its elements: the shared `<header>` element stays mounted
+// (it keeps its reserved rule, and the safe-area inset whenever nothing above it is holding one) and
+// its ROW collapses away inside it, and the
+// bottom region leaves as one row through its own `Collapse`. Both leave the tree at the end of the
+// exit rather than at the start, which is why the disappearance is awaited — a control that is off
+// the screen must not still be focusable, and that is the half worth pinning.
+describe("AgentChat — zen mode", () => {
+  const headerRowOf = (container: HTMLElement) =>
+    container.querySelector('header [data-slot="header-row"]');
+
+  async function enterZen(user: User) {
+    await openPaneMenu(user);
+    await user.click(screen.getByRole("button", { name: "Zen mode" }));
+  }
+
+  it("offers no way in while the setting is off, which is the default", async () => {
+    // Zen takes away every way back except one floating button, so it may never arrive uninvited.
+    const user = userEvent.setup();
+    renderChat();
+
+    await openPaneMenu(user);
+    expect(screen.queryByRole("button", { name: "Zen mode" })).not.toBeInTheDocument();
+    // …and the rows it stands beside are untouched, so this is a hidden row and not a broken sheet.
+    expect(screen.getByRole("button", { name: "Find in output" })).toBeInTheDocument();
+  });
+
+  it("offers nothing on a pane with no output either — the same gate Find takes", async () => {
+    setZenEnabled(true);
+    const user = userEvent.setup();
+    renderChat({ text: "" });
+
+    await openPaneMenu(user);
+    expect(screen.queryByRole("button", { name: "Zen mode" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Find in output" })).not.toBeInTheDocument();
+  });
+
+  it("takes every issance surface off the screen and leaves the pane's own output", async () => {
+    setZenEnabled(true);
+    const user = userEvent.setup();
+    const { container } = renderChat({ tabs: fixtureTabs, text: STATUS_TEXT });
+
+    await enterZen(user);
+
+    // The header ROW, the tab strip and the whole bottom region (statusline, handle, composer).
+    await waitFor(() => expect(headerRowOf(container)).toBeNull());
+    expect(screen.queryByRole("navigation", { name: /tabs/i })).not.toBeInTheDocument();
+    expect(container.querySelector('[data-slot="chrome-block"]')).toBeNull();
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Switch pane" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Pane actions" })).not.toBeInTheDocument();
+
+    // The header ELEMENT stays, and here — with no strip band mounted above it — it is what
+    // reserves the notch, row or no row. A route taking that inset over would pay for it twice.
+    // WHICH element holds it is not fixed any more: once a `StripHost` above it is showing a strip,
+    // that band reserves it and this element reserves nothing (`app-header.tsx` states the handover,
+    // `routes/root.test.tsx` proves it is exactly one reservation in both states). What is pinned
+    // here is the case this tree actually is: no band, so the header owns it.
+    const header = container.querySelector("header");
+    expect(header).not.toBeNull();
+    expect(header?.className).toContain("[padding-top:env(safe-area-inset-top)]");
+
+    // Content stays. Zen hides issance's chrome, never the pane's output — the mirror keeps polling
+    // and keeps rendering exactly as it did.
+    expect(screen.getByText("Welcome back!")).toBeInTheDocument();
+  });
+
+  it("brings all of it back from the one floating way out", async () => {
+    setZenEnabled(true);
+    const user = userEvent.setup();
+    const { container } = renderChat({ tabs: fixtureTabs });
+
+    await enterZen(user);
+    await waitFor(() => expect(headerRowOf(container)).toBeNull());
+
+    await user.click(screen.getByRole("button", { name: "Exit zen mode" }));
+
+    await waitFor(() => expect(headerRowOf(container)).not.toBeNull());
+    expect(screen.getByRole("navigation", { name: /tabs/i })).toBeInTheDocument();
+    expect(container.querySelector('[data-slot="chrome-block"]')).not.toBeNull();
+    expect(screen.getByRole("textbox")).toBeInTheDocument();
+    // …and the way out goes with it, so nothing floats over a screen that already has its chrome.
+    expect(screen.queryByRole("button", { name: "Exit zen mode" })).not.toBeInTheDocument();
+  });
+
+  it("gives the one way out a REAL 44px box, not a bled hit area", async () => {
+    // DESIGN.md §6. This is the last control in the app that should be under-sized: it is the only
+    // thing on the screen that is not terminal output.
+    setZenEnabled(true);
+    const user = userEvent.setup();
+    renderChat();
+
+    await enterZen(user);
+
+    const pill = screen.getByRole("button", { name: "Exit zen mode" });
+    expect(pill.className).toMatch(/(?:^|\s)size-11(?=\s|$)/);
+    // A ground of its own, and not the page colour: in dark `--background` IS the mirror's fill
+    // (mirror-space.ts), so a pill painted in it would be a control standing on nothing.
+    expect(pill.className).toMatch(/(?:^|\s)bg-chrome(?=\s|$)/);
+  });
+
+  it("hides the chrome THROUGH Collapse, never by tearing it out of the flow", async () => {
+    // DESIGN.md §1: an in-flow surface appears and disappears through `ui/collapse.tsx` and through
+    // nothing else, which is also §2's answer to 60px of header vanishing between two frames. The
+    // coupling is asserted rather than commented: read the surface, walk up to its row, require the
+    // row to be a Collapse that is CLOSED. A bare conditional passes every other test in this file.
+    setZenEnabled(true);
+    const user = userEvent.setup();
+    const { container } = renderChat({ tabs: fixtureTabs });
+
+    const headerRow = headerRowOf(container)!;
+    const bottom = container.querySelector('[data-slot="chrome-block"]')!.parentElement!;
+    const rowOf = (el: Element) => el.closest('[data-slot="collapse"]')!;
+    expect(rowOf(headerRow)).not.toBeNull();
+    expect(rowOf(bottom)).not.toBeNull();
+
+    await enterZen(user);
+
+    // Read while the exit is still running — `Collapse` holds its child for the full slide, so this
+    // is the frame that proves the surface is animating out rather than simply gone.
+    expect(rowOf(headerRow).getAttribute("data-state")).toBe("closed");
+    expect(rowOf(bottom).getAttribute("data-state")).toBe("closed");
+  });
+
+  it("leaves on Escape, the way every other full-screen surface here does", async () => {
+    setZenEnabled(true);
+    const user = userEvent.setup();
+    const { container } = renderChat();
+
+    await enterZen(user);
+    await waitFor(() => expect(headerRowOf(container)).toBeNull());
+
+    await user.keyboard("{Escape}");
+
+    await waitFor(() => expect(headerRowOf(container)).not.toBeNull());
+  });
+
+  it("drops focus before the composer leaves, so iOS dismisses the keyboard with it", async () => {
+    // On iOS the soft keyboard belongs to whatever holds focus, so unmounting a focused <textarea>
+    // can leave the keyboard standing over a screen that no longer has an input.
+    setZenEnabled(true);
+    const user = userEvent.setup();
+    renderChat();
+
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    await user.click(box);
+    expect(box).toHaveFocus();
+
+    await enterZen(user);
+
+    expect(box).not.toHaveFocus();
+  });
+
+  it("keeps the entry out of the Display dock — that dock is prefs, this is an act", async () => {
+    setZenEnabled(true);
+    const user = userEvent.setup();
+    renderChat();
+
+    await openPaneMenu(user);
+    // Exactly ONE way in, and it is this row — a second entry point creeping back in fails here.
+    expect(screen.getAllByRole("button", { name: "Zen mode" })).toHaveLength(1);
+    await user.keyboard("{Escape}");
+
+    await user.click(screen.getByRole("button", { name: "Display settings" }));
+    expect(screen.getByRole("switch", { name: "Wrap lines" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Zen mode" })).not.toBeInTheDocument();
+  });
+
+  // The gear opens a SHEET, not the in-flow dock it opened until 2026-09-30. A dock takes its height
+  // out of the mirror, so opening the settings moved the thing you opened them to look at, and the
+  // terminal and chat row lists are different lengths, so switching bodies moved it again. `dialog`
+  // is the structural fact that makes it cover instead of push; the panel is `fixed inset-0`.
+  it("the Display gear opens a sheet over the pane rather than a dock inside it", async () => {
+    const user = userEvent.setup();
+    renderChat();
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Display settings" }));
+
+    const sheet = screen.getByRole("dialog");
+    expect(sheet).toHaveAttribute("aria-modal", "true");
+    expect(within(sheet).getByRole("switch", { name: "Wrap lines" })).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  // "Transient by design" is what justifies never persisting zen, and the mechanism lives entirely
+  // in DetailRoute's key={paneId} — nothing inside AgentChat implements it. Pinned here, or removing
+  // that key would silently leak a chrome-free view into the next pane with the suite still green.
+  it("resets on a pane switch, because the pane view is keyed by paneId", async () => {
+    setZenEnabled(true);
+    const user = userEvent.setup();
+    const first = fixtureAgents[0]!;
+    const second = fixtureAgents[1]!;
+    let advance: (paneId: string) => void = () => {};
+
+    function Harness() {
+      const [paneId, setPaneId] = useState(first.paneId);
+      advance = setPaneId;
+      const agent = paneId === first.paneId ? first : second;
+      // The key is what DetailRoute does; without it this state would survive the switch.
+      return (
+        <AgentChat
+          key={paneId}
+          paneId={paneId}
+          agent={agent}
+          agents={fixtureAgents}
+          shellPanes={[]}
+          tabs={[]}
+          text="recent pane output"
+          onBack={vi.fn()}
+          onSelect={vi.fn()}
+        />
+      );
+    }
+    const router = createMemoryRouter([{ path: "/", element: withHeaderHost(<Harness />) }]);
+    const { container } = render(<RouterProvider router={router} />);
+
+    await enterZen(user);
+    await waitFor(() => expect(headerRowOf(container)).toBeNull());
+
+    act(() => advance(second.paneId));
+
+    expect(headerRowOf(container)).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Exit zen mode" })).not.toBeInTheDocument();
+  });
+
+  describe("auto-zen follows the rotation", () => {
+    // The viewport-height query AgentChat asks for.
+    const LANDSCAPE_QUERY = "(max-height: 520px)";
+
+    // ScreenOrientation tracks physical rotation; matchMedia tracks viewport height independently.
+    // A keyboard may shrink the viewport without ever rotating the phone.
+    let emitOrientation: (landscape: boolean) => void;
+    let emitViewport: (short: boolean) => void;
+    function installOrientation(initial: boolean, viewportHeight = 380) {
+      const orientation = new EventTarget();
+      Object.defineProperty(orientation, "type", { configurable: true, value: initial ? "landscape-primary" : "portrait-primary" });
+      Object.defineProperty(window.screen, "orientation", { configurable: true, value: orientation });
+      // The fake speaks only the half of MediaQueryListEvent the hook reads (`matches`) — a full
+      // event object here would need a cast that discards type evidence for nothing.
+      const listeners = new Set<(e: { matches: boolean }) => void>();
+      const mql = {
+        matches: viewportHeight <= 520,
+        media: LANDSCAPE_QUERY,
+        onchange: null,
+        addEventListener: (_: string, fn: (e: { matches: boolean }) => void) => {
+          void listeners.add(fn);
+        },
+        removeEventListener: (_: string, fn: (e: { matches: boolean }) => void) => {
+          void listeners.delete(fn);
+        },
+      };
+      vi.stubGlobal("matchMedia", () => mql);
+      emitOrientation = (landscape: boolean) => {
+        Object.defineProperty(orientation, "type", { configurable: true, value: landscape ? "landscape-primary" : "portrait-primary" });
+        orientation.dispatchEvent(new Event("change"));
+      };
+      emitViewport = (short: boolean) => {
+        mql.matches = short;
+        for (const fn of listeners) fn({ matches: short });
+      };
+    }
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      Reflect.deleteProperty(window.screen, "orientation");
+    });
+
+    it("keeps the composer focused when a portrait cover screen becomes viewport-landscape under the keyboard", async () => {
+      setZenEnabled(true);
+      setAutoZenEnabled(true);
+      installOrientation(false, 900);
+      const { container } = renderChat();
+      const box = screen.getByPlaceholderText(/type a reply/i);
+      box.focus();
+
+      // A keyboard changes only the CSS viewport; ScreenOrientation does not change.
+      act(() => emitViewport(true));
+
+      expect(headerRowOf(container)).not.toBeNull();
+      expect(box).toBeInTheDocument();
+      expect(box).toHaveFocus();
+    });
+
+    it("enters zen on rotation to landscape and leaves on rotation back", async () => {
+      setZenEnabled(true);
+      setAutoZenEnabled(true);
+      installOrientation(false);
+      const { container } = renderChat();
+      expect(headerRowOf(container)).not.toBeNull();
+
+      act(() => emitOrientation(true));
+      await waitFor(() => expect(headerRowOf(container)).toBeNull());
+      expect(screen.getByRole("button", { name: "Exit zen mode" })).toBeInTheDocument();
+
+      act(() => emitOrientation(false));
+      await waitFor(() => expect(headerRowOf(container)).not.toBeNull());
+      expect(screen.queryByRole("button", { name: "Exit zen mode" })).not.toBeInTheDocument();
+    });
+
+    it("falls back to the CSS orientation where screen.orientation does not exist", async () => {
+      setZenEnabled(true);
+      setAutoZenEnabled(true);
+      // iOS Safari before 16.4: no ScreenOrientation, so the CSS query decides as it always did.
+      Reflect.deleteProperty(window.screen, "orientation");
+      const queries = new Map<string, { matches: boolean; fns: Set<(e: { matches: boolean }) => void> }>();
+      vi.stubGlobal("matchMedia", (query: string) => {
+        const entry = queries.get(query) ?? { matches: false, fns: new Set() };
+        queries.set(query, entry);
+        return {
+          get matches() {
+            return entry.matches;
+          },
+          media: query,
+          onchange: null,
+          addEventListener: (_: string, fn: (e: { matches: boolean }) => void) => void entry.fns.add(fn),
+          removeEventListener: (_: string, fn: (e: { matches: boolean }) => void) => void entry.fns.delete(fn),
+        };
+      });
+      const { container } = renderChat();
+      expect(headerRowOf(container)).not.toBeNull();
+
+      act(() => {
+        for (const [query, entry] of queries) {
+          if (query === "(max-height: 520px)" || query === "(orientation: landscape)") {
+            entry.matches = true;
+            for (const fn of entry.fns) fn({ matches: true });
+          }
+        }
+      });
+      await waitFor(() => expect(headerRowOf(container)).toBeNull());
+    });
+
+    it("does nothing while zen itself is unavailable", async () => {
+      setAutoZenEnabled(true);
+      installOrientation(false);
+      const { container } = renderChat();
+
+      act(() => emitOrientation(true));
+      expect(headerRowOf(container)).not.toBeNull();
+      expect(screen.queryByRole("button", { name: "Exit zen mode" })).not.toBeInTheDocument();
+    });
+
+    it("does nothing on rotation once the landscape sub-toggle is turned off", async () => {
+      // The two bits are independent: the operator who wants zen on a tap only turns this row off,
+      // and rotation goes inert while the hand entry point (the actions sheet's row) still works.
+      setZenEnabled(true);
+      setAutoZenEnabled(false);
+      installOrientation(false);
+      const { container } = renderChat();
+
+      act(() => emitOrientation(true));
+      expect(headerRowOf(container)).not.toBeNull();
+      expect(screen.queryByRole("button", { name: "Exit zen mode" })).not.toBeInTheDocument();
+    });
+
+    it("leaves a hand-entered zen alone on both flips", async () => {
+      setZenEnabled(true);
+      setAutoZenEnabled(true);
+      installOrientation(false);
+      const user = userEvent.setup();
+      const { container } = renderChat();
+
+      await enterZen(user);
+      await waitFor(() => expect(headerRowOf(container)).toBeNull());
+
+      act(() => emitOrientation(true));
+      expect(headerRowOf(container)).toBeNull();
+      act(() => emitOrientation(false));
+      expect(headerRowOf(container)).toBeNull();
+    });
+
+    it("a hand exit in landscape stays out until the next rotation", async () => {
+      setZenEnabled(true);
+      setAutoZenEnabled(true);
+      installOrientation(false);
+      const user = userEvent.setup();
+      const { container } = renderChat();
+
+      act(() => emitOrientation(true));
+      await waitFor(() => expect(headerRowOf(container)).toBeNull());
+
+      await user.click(screen.getByRole("button", { name: "Exit zen mode" }));
+      await waitFor(() => expect(headerRowOf(container)).not.toBeNull());
+
+      act(() => emitOrientation(false));
+      expect(headerRowOf(container)).not.toBeNull();
+      act(() => emitOrientation(true));
+      await waitFor(() => expect(headerRowOf(container)).toBeNull());
+    });
+
+    it("keeps a zen the operator re-opened by hand when the phone turns back", async () => {
+      // The mark says "the rotation opened this one". A hand exit clears the zen, so the mark is
+      // stale from that moment, and the hand entry that follows is the operator's own zen. Turning
+      // the phone back to portrait must leave it standing, exactly as it does for a zen that was
+      // opened by hand in the first place.
+      setZenEnabled(true);
+      setAutoZenEnabled(true);
+      installOrientation(false);
+      const user = userEvent.setup();
+      const { container } = renderChat();
+
+      act(() => emitOrientation(true));
+      await waitFor(() => expect(headerRowOf(container)).toBeNull());
+
+      await user.click(screen.getByRole("button", { name: "Exit zen mode" }));
+      await waitFor(() => expect(headerRowOf(container)).not.toBeNull());
+
+      await enterZen(user);
+      await waitFor(() => expect(headerRowOf(container)).toBeNull());
+
+      act(() => emitOrientation(false));
+      expect(headerRowOf(container)).toBeNull();
+      expect(screen.getByRole("button", { name: "Exit zen mode" })).toBeInTheDocument();
+    });
+
+    it("ignores a landscape viewport tall enough to be a desktop or a tablet", async () => {
+      // Chrome rows cost terminal lines on a phone held sideways, not on a 900px-tall window that
+      // is landscape all day. The `and (max-height: 520px)` half of the query is what tells them
+      // apart, so this case holds it: same setting, same flip, no zen.
+      setZenEnabled(true);
+      setAutoZenEnabled(true);
+      installOrientation(false, 900);
+      const { container } = renderChat();
+
+      act(() => emitOrientation(true));
+      expect(headerRowOf(container)).not.toBeNull();
+      expect(screen.queryByRole("button", { name: "Exit zen mode" })).not.toBeInTheDocument();
+    });
+  });
+});
+
+// ── THE FOLDED STRIPS ─────────────────────────────────────────────────────────
+// The pane screen is the one screen that stacks two strips, and they are chrome ABOUT the pane
+// rather than the pane's own output. Zen already answers "take it all away" and takes the header and
+// the composer with it; this is the smaller ask; fold the two rows into a 24px bar of beads that
+// still says how many there are, where you are in them, and whether anything is shouting.
+//
+// Four claims, and each one fails on the edit that would undo it: the rows are shown until asked
+// otherwise, the fold is remembered, the bar puts them back, and the soft keyboard changes NOTHING
+// (it used to fold the rows on its own; the operator read that as a layout shift, 2026-10-16).
+describe("AgentChat — folding the tab and pane rows", () => {
+  // A second pane in the open pane's own tab, so the pane row renders too (it draws nothing below
+  // two) and the bar has both bead groups to show.
+  const sibling: AgentView = {
+    ...fixtureAgents[0]!,
+    paneId: "w1:p9",
+    status: "working",
+  };
+  function renderStrips(overrides: Partial<ComponentProps<typeof AgentChat>> = {}) {
+    return renderChat({ tabs: fixtureTabs, agents: [...fixtureAgents, sibling], ...overrides });
+  }
+
+  it("draws both rows and no bar until the operator folds them", () => {
+    // Default OFF, and it is the loud direction: the rows are the pane's only visible way to reach
+    // a sibling tab or pane, so a first run that folded them would hide the navigation with them.
+    renderStrips();
+    expect(screen.queryByRole("navigation", { name: "Tabs" })).not.toBeNull();
+    expect(screen.queryByRole("navigation", { name: "Panes" })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: /^Show tabs/ })).toBeNull();
+  });
+
+  it("folds both rows together, and remembers it on this device", async () => {
+    const user = userEvent.setup();
+    renderStrips();
+    // ONE toggle for both rows, pinned to the tab row's trailing end where it costs no height —
+    // that row is already 44px. Its name says which rows it is about, because the glyph says none.
+    await user.click(screen.getByRole("button", { name: "Hide tabs and panes" }));
+
+    // `Collapse` unmounts at the END of its exit, so both rows leave the tree — which is the a11y
+    // half of the claim: a pill that is not on screen must not still be focusable.
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Tabs" })).toBeNull());
+    expect(screen.queryByRole("navigation", { name: "Panes" })).toBeNull();
+
+    // The bar's beads are decorative — colour is their only channel — so the counts are carried in
+    // words, and the words are the button's whole accessible name.
+    expect(
+      screen.queryByRole("button", { name: "Show tabs and panes. 1 tab, 2 panes hidden." }),
+    ).not.toBeNull();
+    // Device-level and persisted: the same bit lib/strips-collapsed.ts pins from the other side.
+    expect(localStorage.getItem("issance:strips-collapsed:v1")).toBe("1");
+  });
+
+  it("draws ONE seam between the folded chrome and the mirror, and draws it from below", async () => {
+    // THE OPERATOR'S SECOND READING, verbatim: "taking up a bit too much space still and the double
+    // border is ugly". The bar carried a `border-b` copied from the tab row, and the mirror's own
+    // unconditional `border-t border-rule` sits 4px under it — two hairlines 4px apart, which is the
+    // doubled line DESIGN.md §4 forbids, just spaced far enough to look deliberate.
+    //
+    // The tab row's baseline is not a decoration this bar inherits: it exists because a FOLDER TAB
+    // has to own the line it breaks, and folded there is no folder tab. So the bar draws nothing and
+    // the mirror keeps the one seam — which is also the half that may not move, being unconditional
+    // by design (one geometry, no state in which the seam is drawn differently).
+    const user = userEvent.setup();
+    const { container } = renderStrips();
+    await user.click(screen.getByRole("button", { name: "Hide tabs and panes" }));
+    const bar = await screen.findByRole("button", { name: /^Show tabs and panes/ });
+
+    expect(bar.className).not.toMatch(/border-b/);
+    expect(bar.className).not.toMatch(/border-rule/);
+    // …and the seam it used to double is still there, drawn once, by the mirror.
+    const mirror = container
+      .querySelector('[data-slot="chrome-block"]')!
+      .closest('[data-slot="collapse"]')!.previousElementSibling!;
+    expect(mirror.className).toMatch(/(?:^|\s)border-t border-rule(?=\s|$)/);
+  });
+
+  it("leaves nothing under the bar when folded — the page goes with the tabs", async () => {
+    // THE OPERATOR'S THIRD READING: "some pixels are wasted towards the bottom still". They were.
+    // The 4px above the mirror's rule is the page an OPEN FOLDER TAB sits on, and it was parked on
+    // the mirror unconditionally — so folded, with no tab and nothing sitting on anything, it was
+    // 4px of nothing under a 24px bar and the beads read 4px/8px instead of centred.
+    //
+    // It belongs to the tab row, so it travels with it: `pb-1` inside the band's own Collapse, which
+    // also means it animates with the fold instead of popping on a boolean. Folded, the band is
+    // exactly the bar between the header's rule and the mirror's.
+    const user = userEvent.setup();
+    const { container } = renderStrips();
+    await user.click(screen.getByRole("button", { name: "Hide tabs and panes" }));
+    await screen.findByRole("button", { name: /^Show tabs and panes/ });
+
+    const mirror = container
+      .querySelector('[data-slot="chrome-block"]')!
+      .closest('[data-slot="collapse"]')!.previousElementSibling!;
+    // Stated, not merely absent: `mt-0` is the claim that the gap was moved, and it is the assertion
+    // that fails if someone puts an unconditional margin back on the mirror.
+    expect(mirror.className).toMatch(/(?:^|\s)mt-0(?=\s|$)/);
+    // …and the page it replaced left with the rows it belonged to.
+    await waitFor(() =>
+      expect(container.querySelector('[data-slot="collapse-swap"] div.pb-1')).toBeNull(),
+    );
+  });
+
+  it("spends 24px of drawn height and still answers a 44px thumb", async () => {
+    // The bar REPLACES two 47px strips, so every drawn pixel is a pixel the fold did not save — 32px
+    // was still heavy. 24px is the floor its contents set: the beads are 16px boxes, so 24 leaves
+    // 4px of air and the next step down leaves 2px, which reads as a row jammed under the header.
+    //
+    // The floor is bought as HIT area, not drawn height (DESIGN.md §6). Both halves are asserted
+    // because they are ONE number: 24 + 10 + 10 = 44, so shrinking the bar without re-cutting the
+    // inset silently drops the target.
+    const user = userEvent.setup();
+    renderStrips();
+    await user.click(screen.getByRole("button", { name: "Hide tabs and panes" }));
+    const bar = await screen.findByRole("button", { name: /^Show tabs and panes/ });
+    expect(bar.className).toMatch(/(?:^|\s)h-6(?=\s|$)/);
+    expect(bar.className).toMatch(/(?:^|\s)before:-inset-y-2\.5(?=\s|$)/);
+  });
+
+  it("puts the rows back on a tap anywhere on the bar", async () => {
+    const user = userEvent.setup();
+    setStripsCollapsed(true);
+    renderStrips();
+    // The whole bar is the target, not a chevron you have to find — the fold costs the tabs' NAMES,
+    // so getting them back may not also cost aim.
+    await user.click(screen.getByRole("button", { name: /^Show tabs and panes/ }));
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Tabs" })).not.toBeNull());
+    expect(localStorage.getItem("issance:strips-collapsed:v1")).toBe("0");
+  });
+
+  it("names only the rows that are actually there", async () => {
+    // A tab holding one pane draws no pane row, so the bar must not offer a pane bead group and the
+    // chevron must not promise to hide one. Naming both unconditionally is the easy bug here.
+    const user = userEvent.setup();
+    renderChat({ tabs: fixtureTabs });
+    await user.click(screen.getByRole("button", { name: "Hide tabs" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Show tabs. 1 tab hidden." })).not.toBeNull(),
+    );
+  });
+
+  // jsdom has no `visualViewport`, so `useKeyboardOpen` returns early and every other case here
+  // renders the RESTING geometry — which is what makes this stub necessary and also what makes it
+  // safe: it is installed and removed inside the one test that wants it.
+  function withSoftKeyboard() {
+    const listeners = new Set<() => void>();
+    const vv = {
+      width: 390,
+      height: 844,
+      addEventListener: (_: string, fn: () => void) => void listeners.add(fn),
+      removeEventListener: (_: string, fn: () => void) => void listeners.delete(fn),
+    };
+    const had = Object.getOwnPropertyDescriptor(window, "visualViewport");
+    Object.defineProperty(window, "visualViewport", { value: vv, configurable: true });
+    return {
+      resize: (height: number) => {
+        vv.height = height;
+        act(() => listeners.forEach((fn) => fn()));
+      },
+      restore: () => {
+        if (had) Object.defineProperty(window, "visualViewport", had);
+        else Reflect.deleteProperty(window, "visualViewport");
+      },
+    };
+  }
+
+  /** Put the caret in the message composer's own field, the way tapping it on a phone would. */
+  function focusComposer() {
+    const field = document.querySelector<HTMLTextAreaElement>('[data-slot="chat-input"]')!;
+    act(() => field.focus());
+  }
+
+  it("the keyboard does not fold the rows, and the preference rules under it", async () => {
+    // THE OLD RULE, and why it went: while the composer's keyboard was up the rows stood down
+    // whatever the preference said, and an expand taken under it was transient. On the phone that
+    // was a band folding on its own the moment the field took focus, which moved the mirror under
+    // the operator's eyes, and rows that came back on their own, undoing a choice he had just made
+    // (2026-10-16). Now the keyboard is not a state of the fold at all: shown stays shown, folded
+    // stays folded, and a tap under the keyboard writes the preference like any other tap.
+    const kb = withSoftKeyboard();
+    try {
+      const user = userEvent.setup();
+      renderStrips();
+      expect(screen.queryByRole("navigation", { name: "Tabs" })).not.toBeNull();
+
+      focusComposer();
+      kb.resize(460); // a soft keyboard: -384px, well past the open threshold
+      // Past the full exit: if the band ever started closing, the strip would be gone by now.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, COLLAPSE_MS + 60));
+      });
+      expect(screen.queryByRole("navigation", { name: "Tabs" })).not.toBeNull();
+      expect(screen.queryByRole("button", { name: /^Show tabs and panes/ })).toBeNull();
+      expect(localStorage.getItem("issance:strips-collapsed:v1")).toBeNull();
+
+      // A fold taken with the keyboard up is a choice like any other, so it is written down…
+      await user.click(screen.getByRole("button", { name: "Hide tabs and panes" }));
+      await waitFor(() => expect(screen.queryByRole("navigation", { name: "Tabs" })).toBeNull());
+      expect(localStorage.getItem("issance:strips-collapsed:v1")).toBe("1");
+
+      // …and the keyboard closing does not undo it: the rows stay folded on the operator's terms.
+      kb.resize(844);
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, COLLAPSE_MS + 60));
+      });
+      expect(screen.queryByRole("navigation", { name: "Tabs" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /^Show tabs and panes/ })).not.toBeNull();
+
+      // And an expand under the keyboard holds past it too.
+      kb.resize(460);
+      await user.click(screen.getByRole("button", { name: /^Show tabs and panes/ }));
+      await waitFor(() =>
+        expect(screen.queryByRole("navigation", { name: "Tabs" })).not.toBeNull(),
+      );
+      expect(localStorage.getItem("issance:strips-collapsed:v1")).toBe("0");
+      kb.resize(844);
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, COLLAPSE_MS + 60));
+      });
+      expect(screen.queryByRole("navigation", { name: "Tabs" })).not.toBeNull();
+    } finally {
+      kb.restore();
+    }
+  });
+
+  it("the rename sheet inside the band survives its own keyboard", async () => {
+    // THE BUG, from the phone: tap a tab → the actions sheet opens → tap Rename → "things flash" and
+    // the sheet is gone, with nothing renameable on the device at all.
+    //
+    // The sheet is TabStrip's, so it renders INSIDE the band that folds. Its rename field
+    // autofocuses, the field's own keyboard opens, and a fold gated on "is a keyboard up" fired on
+    // it, and 240ms later `Collapse` unmounted the strip, the sheet and the half-typed name together.
+    // No keyboard folds the band any more (the case above); this one stays as the guard that the
+    // band never again closes on a keyboard, whoever raised it.
+    const kb = withSoftKeyboard();
+    try {
+      const user = userEvent.setup();
+      renderStrips();
+
+      // Tapping the tab you are already in opens the actions sheet rather than re-selecting.
+      const tabs = screen.getByRole("navigation", { name: "Tabs" });
+      await user.click(within(tabs).getByRole("button", { current: true }));
+      await user.click(screen.getByRole("button", { name: "Rename" }));
+      const field = screen.getByLabelText<HTMLInputElement>("Label");
+      expect(field).toBe(document.activeElement); // the sheet autofocuses it
+
+      kb.resize(460); // the RENAME field's keyboard, not the composer's
+
+      // Past the full exit — `Collapse` unmounts at the end of it, so if the band ever started
+      // closing the strip, the sheet and this field would be gone by now.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, COLLAPSE_MS + 60));
+      });
+
+      expect(screen.queryByRole("navigation", { name: "Tabs" })).not.toBeNull();
+      expect(screen.queryByLabelText("Label")).not.toBeNull();
+      // And still editable, which is the operator's actual complaint.
+      await user.type(field, "x");
+      expect(field.value).toContain("x");
+    } finally {
+      kb.restore();
+    }
+  });
+});
+
+// The pane header's rocket is gone; the switcher sheet is one of its two remaining homes (the other
+// is the dashboard's own LaunchStrip, covered by launch-strip.test.tsx). Same launchers.toml rows,
+// declared here through GET /api/launchers — a session-scoped route (server.ts), never a field on
+// /api/config, so rows come from the host that runs them (CREW_PROTOCOL.md §5).
+/** What `api.launch`'s POST body carries — mirrors lib/api.ts's `LaunchRequestBody`. */
+interface LaunchPostedBody {
+  command?: string;
+  paneId?: string;
+}
+
+describe("AgentChat: Launch section in the switcher", () => {
+  function declareLaunchers() {
+    server.use(
+      http.get("/api/launchers", () =>
+        HttpResponse.json({
+          launchers: [{ command: "rumen-peek", label: "Runs & quota", cwd: "/home" }],
+          home: "/home",
+        }),
+      ),
+      http.post("/api/launch", () =>
+        HttpResponse.json({
+          ok: true,
+          pane: {
+            paneId: "w9:p1",
+            workspaceId: "w9",
+            workspaceLabel: "Runs & quota",
+            tabId: "w9:t1",
+            cwd: "/home",
+          },
+        }),
+      ),
+    );
+  }
+
+  it("shows the Launch section in the switcher when launchers are declared", async () => {
+    declareLaunchers();
+    const user = userEvent.setup();
+    renderChat();
+    await user.click(screen.getByRole("button", { name: "Switch pane" }));
+    expect(await screen.findByText("Launch")).toBeInTheDocument();
+    expect(screen.getByText("Runs & quota")).toBeInTheDocument();
+    expect(screen.getByText("rumen-peek")).toBeInTheDocument();
+  });
+
+  it("closes the sheet and launches when a row is tapped", async () => {
+    declareLaunchers();
+    const user = userEvent.setup();
+    renderChat();
+    await user.click(screen.getByRole("button", { name: "Switch pane" }));
+    await screen.findByText("rumen-peek");
+
+    await user.click(screen.getByText("Runs & quota"));
+    // Closing is the launch's own signal that it landed: the sheet is gone and the switch handle is
+    // reachable again, on a route that is about to change under it.
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("launches BESIDE this pane — the request carries this pane's own id", async () => {
+    let posted: LaunchPostedBody | undefined;
+    const agent = fixtureAgents[0]!;
+    server.use(
+      http.get("/api/launchers", () =>
+        HttpResponse.json({
+          launchers: [{ command: "rumen-peek", label: "Runs & quota", cwd: "/home" }],
+          home: "/home",
+        }),
+      ),
+      http.post("/api/launch", async ({ request }) => {
+        // SAFETY: this test's own client call (`api.launch`) is the only thing that can hit this
+        // handler, and it always sends exactly these two fields (lib/api.ts's `LaunchRequestBody`).
+        posted = (await request.json()) as LaunchPostedBody;
+        return HttpResponse.json({
+          ok: true,
+          pane: { paneId: "w9:p1", workspaceId: "w9", workspaceLabel: "Runs & quota", tabId: "w9:t1", cwd: "/home" },
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderChat();
+    await user.click(screen.getByRole("button", { name: "Switch pane" }));
+    await user.click(await screen.findByText("Runs & quota"));
+    await waitFor(() => expect(posted).toEqual({ command: "rumen-peek", paneId: agent.paneId }));
+  });
+
+  // THE NO PROMPTS CONFIRM (ADR 0094) in the switcher: a row that skips permission prompts asks first.
+  describe("a row that skips permission prompts", () => {
+    afterEach(() => localStorage.clear());
+
+    function declareNoPrompts(posted: LaunchPostedBody[]) {
+      server.use(
+        http.get("/api/launchers", () =>
+          HttpResponse.json({
+            launchers: [{ command: "claude --yolo", label: "Claude, no prompts", noPrompts: true, cwd: "/home" }],
+            home: "/home",
+          }),
+        ),
+        http.post("/api/launch", async ({ request }) => {
+          // SAFETY: the switcher's launch (`api.launch`) is the only caller and sends these two fields.
+          posted.push((await request.json()) as LaunchPostedBody);
+          return HttpResponse.json({
+            ok: true,
+            pane: { paneId: "w9:p1", workspaceId: "w9", workspaceLabel: "x", tabId: "w9:t1", cwd: "/home" },
+          });
+        }),
+      );
+    }
+
+    it("asks first and sends nothing until Start; Cancel sends nothing and the switcher stays open", async () => {
+      const posted: LaunchPostedBody[] = [];
+      declareNoPrompts(posted);
+      const user = userEvent.setup();
+      renderChat();
+      await user.click(screen.getByRole("button", { name: "Switch pane" }));
+      await user.click(await screen.findByText("Claude, no prompts"));
+      const sheet = await screen.findByRole("dialog", { name: "Start without prompts?" });
+      expect(within(sheet).getByTestId("no-prompts-command")).toHaveTextContent("claude --yolo");
+      expect(posted).toHaveLength(0);
+      await user.click(within(sheet).getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: "Start without prompts?" })).toBeNull());
+      expect(posted).toHaveLength(0);
+      expect(screen.getByText("Claude, no prompts")).toBeInTheDocument();
+    });
+
+    it("Start launches beside this pane and remembers the answer", async () => {
+      const posted: LaunchPostedBody[] = [];
+      declareNoPrompts(posted);
+      const agent = fixtureAgents[0]!;
+      const user = userEvent.setup();
+      renderChat();
+      await user.click(screen.getByRole("button", { name: "Switch pane" }));
+      await user.click(await screen.findByText("Claude, no prompts"));
+      await user.click(within(await screen.findByRole("dialog", { name: "Start without prompts?" })).getByRole("button", { name: "Start" }));
+      await waitFor(() => expect(posted).toEqual([{ command: "claude --yolo", paneId: agent.paneId }]));
+      expect(noPromptsConfirmed("", "claude --yolo")).toBe(true);
+    });
+
+    it("a line this device already confirmed on this machine launches with no question", async () => {
+      const posted: LaunchPostedBody[] = [];
+      declareNoPrompts(posted);
+      rememberNoPromptsConfirm("", "claude --yolo");
+      const user = userEvent.setup();
+      renderChat();
+      await user.click(screen.getByRole("button", { name: "Switch pane" }));
+      await user.click(await screen.findByText("Claude, no prompts"));
+      await waitFor(() => expect(posted).toHaveLength(1));
+      expect(screen.queryByRole("dialog", { name: "Start without prompts?" })).toBeNull();
+    });
+  });
+
+  it("is not offered on a read-only device", async () => {
+    declareLaunchers();
+    const user = userEvent.setup();
+    renderChat({ device: { enforced: true, device: "spare-phone", authorized: false } });
+    await user.click(screen.getByRole("button", { name: "Switch pane" }));
+    // The sheet itself still opens (it's switch-only otherwise), but nothing in it offers a write
+    // this device isn't authorised to make.
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(screen.queryByText("Launch")).toBeNull();
+    expect(screen.queryByText("rumen-peek")).toBeNull();
+  });
+
+  it("does not show the switch handle's launcher affordance when nothing is declared", async () => {
+    const user = userEvent.setup();
+    renderChat();
+    await user.click(screen.getByRole("button", { name: "Switch pane" }));
+    expect(screen.queryByText("Launch")).toBeNull();
+  });
+});
+
+// Putting a clipped reply back. An agent pane's terminal keeps no scrollback, so a reply longer than
+// the pane is tall reaches the mirror with its opening already gone; the agent's own journal still has
+// it. What has to hold here is BOTH halves: the full message appears when the mirror is showing its
+// tail, and nothing appears when the journal's newest turn is not the message on screen (a streaming
+// reply, a stale read) — presenting an older reply as the current one is the failure that matters.
+describe("AgentChat — full latest reply", () => {
+  // These cases are about the terminal mirror, and Chat is the default body now (ADR 0082), so the
+  // device is pinned to the terminal the way an operator who chose it is.
+  beforeEach(() => {
+    localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ paneView: "terminal" }));
+  });
+
+  const REPLY = [
+    "Short answer: approve-only. The author knows when they want it to land; your job was the",
+    "approval. Enabling auto-merge makes you the actor for the merge itself, which is a materially",
+    "bigger claim than saying this looks fine to me.",
+  ].join(" ");
+
+  /** Serve one assistant turn as the pane's journal, and count the reads so a negative assertion can
+   *  wait for the fetch to have landed rather than racing it. */
+  function withJournalReply(text: string): () => number {
+    let hits = 0;
+    server.use(
+      http.get(/\/api\/pane\/[^/]+\/history/, () => {
+        hits += 1;
+        return HttpResponse.json({
+          paneId: "w1:p1",
+          available: true,
+          entries: [
+            {
+              uuid: "reply-1",
+              ts: "2026-08-28T09:14:00.000Z",
+              role: "assistant",
+              parts: [{ kind: "text", text }],
+            },
+          ],
+          hasMore: false,
+          total: 1,
+          fileTruncated: false,
+        });
+      }),
+    );
+    return () => hits;
+  }
+
+  const card = () => screen.queryByRole("button", { name: /full reply/i });
+  const sessionAgent = () => ({ ...fixtureAgents[0]!, hasSession: true, readableLines: 51 });
+  /** Just the terminal mirror's text — the card renders the same words, so a screen-wide query can't
+   *  tell which surface a match came from. */
+  const mirror = () => document.querySelector("pre")?.textContent ?? "";
+
+  // A screen holding the END of the reply, then what the agent did next.
+  const AFTER = "abc1234 fix";
+  // The input box rides along: a claude pane without one is the unread-dialog card's screen
+  // since M34 (.adr/0053), and the card renders the whole pane itself.
+  const SCREEN = paneTextWithDraft(`${REPLY.slice(120)}\n\nBash(git log --oneline)\n  ${AFTER}`);
+
+  it("shows the whole message, and takes the rows it covers out of the mirror", async () => {
+    withJournalReply(REPLY);
+    renderChat({ agent: sessionAgent(), agents: [sessionAgent()], text: SCREEN });
+    await waitFor(() => expect(card()).toBeInTheDocument());
+
+    // The opening the terminal lost is on screen now, from the transcript…
+    expect(screen.getByText(/Short answer: approve-only/)).toBeInTheDocument();
+    // …the rows that held its tail are gone, so the words appear exactly once…
+    expect(mirror()).not.toContain("bigger claim");
+    // …and the terminal below the reply is untouched.
+    expect(mirror()).toContain(AFTER);
+  });
+
+  it("gives the terminal rows back when you collapse it", async () => {
+    const user = userEvent.setup();
+    withJournalReply(REPLY);
+    renderChat({ agent: sessionAgent(), agents: [sessionAgent()], text: SCREEN });
+    await waitFor(() => expect(card()).toBeInTheDocument());
+
+    await user.click(card()!);
+    expect(screen.queryByText(/Short answer: approve-only/)).not.toBeInTheDocument();
+    expect(mirror()).toContain("bigger claim"); // the raw rows are back
+    expect(card()).toBeInTheDocument(); // and the header stays, so it can be reopened
+  });
+
+  // Find searches the mirror and highlights only there, so a hidden row would be a match you can see
+  // but cannot find. Opening find restores the whole mirror and stands the card down.
+  it("hands the whole mirror back while the find bar is open", async () => {
+    const user = userEvent.setup();
+    withJournalReply(REPLY);
+    renderChat({ agent: sessionAgent(), agents: [sessionAgent()], text: SCREEN });
+    await waitFor(() => expect(card()).toBeInTheDocument());
+
+    await openFind(user);
+    expect(card()).not.toBeInTheDocument();
+    expect(mirror()).toContain("bigger claim");
+  });
+
+  it("shows nothing when the journal's newest reply is not what the mirror is showing", async () => {
+    const hits = withJournalReply(REPLY);
+    renderChat({
+      agent: sessionAgent(),
+      agents: [sessionAgent()],
+      text: "an entirely different screen",
+    });
+    await waitFor(() => expect(hits()).toBe(1));
+    await waitFor(() => expect(card()).not.toBeInTheDocument());
+  });
+
+  it("shows nothing when the mirror already holds the whole reply", async () => {
+    const hits = withJournalReply(REPLY);
+    renderChat({ agent: sessionAgent(), agents: [sessionAgent()], text: REPLY });
+    await waitFor(() => expect(hits()).toBe(1));
+    await waitFor(() => expect(card()).not.toBeInTheDocument());
+    expect(screen.getAllByText(/Short answer/).length).toBe(1); // the mirror's copy, and only it
+  });
+
+  // The pref is the whole opt-out: off, the pane is exactly what it was before this existed — and it
+  // costs no journal read either, which is the reason it is a pref rather than always-on.
+  it("reads no journal at all once the operator turns it off", async () => {
+    localStorage.setItem(
+      "issance:display-prefs:v4",
+      JSON.stringify({ wrap: true, fontSize: 12, expandClippedReply: false }),
+    );
+    const hits = withJournalReply(REPLY);
+    renderChat({ agent: sessionAgent(), agents: [sessionAgent()], text: REPLY.slice(120) });
+    await waitFor(() => expect(screen.getByText(/bigger claim/)).toBeInTheDocument());
+    expect(hits()).toBe(0);
+    expect(card()).not.toBeInTheDocument();
+    localStorage.clear();
+  });
+
+  it("reads no journal at all on a pane that has none", async () => {
+    const hits = withJournalReply(REPLY);
+    const shell = { ...fixtureAgents[0]!, kind: "shell" as const, readableLines: 51 };
+    renderChat({ agent: shell, agents: [shell], text: REPLY.slice(120) });
+    await waitFor(() => expect(screen.getByText(/bigger claim/)).toBeInTheDocument());
+    expect(hits()).toBe(0);
+    expect(card()).not.toBeInTheDocument();
+  });
+});
+
+// ADR 0059 — a card docks above the belt. The lifted card used to render inside the mirror's
+// scroller, after the terminal text, so its bottom edge moved with the text above it and floated
+// mid-page on a short screen. It now renders in ONE slot: outside the scroller, directly above the
+// chrome block (the actions belt and the input). These pin the slot, the empty case, and the one
+// property the move could have broken, ADR 0056's per-dialog Terminal choice surviving a poll.
+describe("AgentChat — a card docks above the belt (ADR 0059)", () => {
+  function mirrorScroller(container: HTMLElement) {
+    const mirror = [...container.querySelectorAll<HTMLElement>('div[role="presentation"]')].find(
+      (el) => el.querySelector(".overflow-y-auto") && !el.matches('[data-slot="card-dock"]'),
+    )!;
+    return { mirror, scroller: mirror.querySelector<HTMLElement>(".overflow-y-auto")! };
+  }
+
+  it("renders the card outside the mirror's scroller, in the slot directly above the chrome block", async () => {
+    const { container } = renderChat({ text: MENU_TEXT });
+    const yes = await screen.findByRole("button", { name: "Yes" });
+    const dock = yes.closest<HTMLElement>('[data-slot="card-dock"]');
+    expect(dock).not.toBeNull();
+
+    // Not inside the scroller any more: the text above cannot move it.
+    const { mirror, scroller } = mirrorScroller(container);
+    expect(scroller.contains(yes)).toBe(false);
+
+    // Its own row of the pane column, between the mirror and the bottom region that holds the belt.
+    const bottomRow = container
+      .querySelector('[data-slot="chrome-block"]')!
+      .closest('[data-slot="collapse"]')!;
+    expect(dock!.previousElementSibling).toBe(mirror);
+    expect(dock!.nextElementSibling).toBe(bottomRow);
+
+    // A tall card scrolls inside the dock instead of pushing the composer off the screen.
+    expect(dock!.className).toMatch(/(?:^|\s)max-h-\[55dvh\](?=\s|$)/);
+    expect(dock!.className).toMatch(/(?:^|\s)overflow-y-auto(?=\s|$)/);
+    expect(dock!.className).toMatch(/(?:^|\s)border-t border-border(?=\s|$)/);
+  });
+
+  it("renders no dock at all when no card is on screen", () => {
+    const { container } = renderChat({ text: STATUS_TEXT });
+    expect(container.querySelector('[data-slot="card-dock"]')).toBeNull();
+    // …so the mirror is still the row right above the bottom region, as before the dock existed.
+    const bottomRow = container
+      .querySelector('[data-slot="chrome-block"]')!
+      .closest('[data-slot="collapse"]')!;
+    expect(bottomRow.previousElementSibling).toBe(mirrorScroller(container).mirror);
+  });
+
+  it("keeps the Terminal choice across a poll of the same dialog, and drops it when the dialog goes", async () => {
+    const user = userEvent.setup();
+    let setText: (t: string) => void = () => {};
+    function Harness() {
+      const [text, set] = useState(`building...\n${MENU_TEXT}`);
+      setText = set;
+      const agent = fixtureAgents[0]!;
+      return (
+        <AgentChat
+          paneId={agent.paneId}
+          agent={agent}
+          agents={fixtureAgents}
+          shellPanes={[]}
+          tabs={[]}
+          text={text}
+          onBack={vi.fn()}
+          onSelect={vi.fn()}
+        />
+      );
+    }
+    const router = createMemoryRouter([{ path: "/", element: withHeaderHost(<Harness />) }]);
+    render(<RouterProvider router={router} />);
+
+    await user.click(
+      await screen.findByRole("button", { name: "Show the terminal instead of this card" }),
+    );
+    expect(screen.getByRole("button", { name: "Back to the card" })).toBeInTheDocument();
+
+    // A poll lands with new output above the SAME dialog: the card instance is reused, so the
+    // operator's choice holds.
+    act(() => setText(`building...\ndone.\n${MENU_TEXT}`));
+    expect(screen.getByRole("button", { name: "Back to the card" })).toBeInTheDocument();
+
+    // The dialog leaves and a new one arrives: a fresh card, back in card mode.
+    act(() => setText(STATUS_TEXT));
+    expect(screen.queryByRole("button", { name: "Back to the card" })).toBeNull();
+    act(() => setText(MENU_TEXT));
+    expect(await screen.findByRole("button", { name: "Yes" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Back to the card" })).toBeNull();
+  });
+});
+
+// ADR 0061: the terminal-draft notice floats over the mirror's bottom edge. It used to be a strip in
+// the composer's flow, so a draft stranding on the host pushed the belt and the field up and the
+// mirror's scroller down. jsdom measures no heights, so the no-shift claim is asserted as structure:
+// the notice lives in an absolutely positioned slot INSIDE the mirror region, and nowhere in the
+// bottom region, whose rows are the only things that could have grown.
+describe("AgentChat — the terminal draft notice floats (ADR 0061)", () => {
+  const withHostDraft = (draft: string) =>
+    paneTextWithDraft("recent pane output").replace(/^❯ .*$/m, `❯ ${draft}`);
+
+  it("renders in the mirror's own slot, never in the bottom region", async () => {
+    const { container } = renderChat({ text: withHostDraft("typed on the host") });
+    await screen.findByText(/draft in terminal/i, undefined, { timeout: 4000 });
+
+    const slot = container.querySelector('[data-slot="draft-notice-slot"]')!;
+    expect(slot).toHaveTextContent("typed on the host");
+    expect(slot.className).toMatch(/(?:^|\s)absolute(?=\s|$)/);
+    expect(slot.className).toMatch(/(?:^|\s)pointer-events-none(?=\s|$)/);
+    // The slot is the last child of the mirror wrapper, beside the scroller, not in it.
+    expect(slot.parentElement!.className).toMatch(/(?:^|\s)relative(?=\s|$)/);
+    expect(slot.parentElement!.className).toMatch(/(?:^|\s)flex-1(?=\s|$)/);
+
+    // The bottom region holds no part of it.
+    const bottom = container.querySelector('[data-slot="chrome-block"]')!.parentElement!;
+    expect(bottom).not.toHaveTextContent(/draft in terminal/i);
+    expect(bottom.querySelector('[data-slot="terminal-draft-notice"]')).toBeNull();
+  });
+
+  it("the x hides it without moving anything into the flow", async () => {
+    const user = userEvent.setup();
+    const { container } = renderChat({ text: withHostDraft("typed on the host") });
+    await screen.findByText(/draft in terminal/i, undefined, { timeout: 4000 });
+
+    await user.click(screen.getByRole("button", { name: "Dismiss the terminal draft notice" }));
+    expect(screen.queryByText(/draft in terminal/i)).toBeNull();
+    // The slot stays, empty, and pass-through.
+    expect(container.querySelector('[data-slot="draft-notice-slot"]')!.childElementCount).toBe(0);
+  });
+});
+
+// EXPERIMENT (operator, 2026-09-23): the Changes entry (ADR 0065) moved off the ⋮ sheet onto the
+// belt's pinned block, beside the switcher mark. Still gated on the pane reporting a folder.
+// Named Files since 2026-10-06 (ADR 0083), with the list-tree glyph; same place, same gate.
+describe("AgentChat — the belt's Files pill", () => {
+  it("shows on the belt when the pane has a folder, and not in the pane menu", async () => {
+    const user = userEvent.setup();
+    const { container } = renderChat();
+    const belt = container.querySelector<HTMLElement>('[data-slot="composer-actions"]')!;
+    expect(within(belt).getByRole("button", { name: "Files" })).toBeInTheDocument();
+    await openPaneMenu(user);
+    expect(within(screen.getByRole("dialog")).queryByRole("button", { name: "Files" })).toBeNull();
+  });
+
+  it("is hidden when the pane reports no folder", () => {
+    renderChat({ agent: { ...fixtureAgents[0]!, cwd: "" } });
+    expect(screen.queryByRole("button", { name: "Files" })).toBeNull();
+  });
+});
+
+
+// Settings -> Hand: the pane reads the stored hand and lays the belt and the reply box out for it.
+describe("AgentChat — the hand setting", () => {
+  afterEach(() => localStorage.clear());
+  const scrollerOf = (container: HTMLElement) =>
+    container.querySelector<HTMLElement>('[data-slot="composer-actions"] .overflow-x-auto')!;
+  const boxOf = (container: HTMLElement) => container.querySelector<HTMLElement>('[data-slot="composer-box"]')!;
+
+  it("lays the pane out for the right hand by default", () => {
+    const { container } = renderChat();
+    expect(scrollerOf(container).className).not.toContain("[direction:rtl]");
+    expect(boxOf(container).className).not.toMatch(/(?:^|\s)flex-row-reverse(?=\s|$)/);
+  });
+
+  it("hands the stored left hand to the composer: the belt runs right to left and the box is mirrored", () => {
+    localStorage.setItem("issance:display-prefs:v4", JSON.stringify({ hand: "left" }));
+    const { container } = renderChat();
+    expect(scrollerOf(container).className).toContain("[direction:rtl]");
+    expect(boxOf(container).className).toMatch(/(?:^|\s)flex-row-reverse(?=\s|$)/);
+    // The Switch block stands at the belt's left end.
+    expect(screen.getByRole("button", { name: /^Switch pane/ }).parentElement!.parentElement!.className).toMatch(
+      /(?:^|\s)left-0(?=\s|$)/,
+    );
+  });
+});
+
+
+// ── Copy output ──────────────────────────────────────────────────────────────
+//
+// The SHEET's half of this is covered in pane-actions-sheet.test.tsx: which row shows, and that the
+// sheet closes before the copy fires. What is covered here is the handler the sheet is given, which
+// is where the decisions live: WHAT gets written, WHEN the row is offered at all, and what the
+// operator is told when the write fails. `navigator.clipboard` is absent in jsdom exactly as it is
+// over plain HTTP, so every case that wants the row has to stand one up, which is the gate itself
+// under test.
+describe("AgentChat — copy the pane's output", () => {
+  /** The status singleton is module-scoped; this is how the other suites read it (composer.test). */
+  function StatusSentinel() {
+    const status = useStatus();
+    return <div data-testid="status">{status?.text ?? ""}</div>;
+  }
+
+  /** Stand up a clipboard for one case, and take it away again. */
+  function withClipboard(writeText: (text: string) => Promise<void>) {
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: vi.fn(writeText) },
+      configurable: true,
+    });
+    return vi.mocked(navigator.clipboard.writeText);
+  }
+  afterEach(() => {
+    // `configurable: true` above is what lets this undo itself. Left in place, a stubbed clipboard
+    // would make every later case in this file render a row it never asked for.
+    Reflect.deleteProperty(navigator, "clipboard");
+  });
+
+  const OUTPUT = paneTextWithDraft("copy me please");
+
+  /** AgentChat plus the status sentinel, with externally-advanceable pane props. */
+  function renderWithPane(initial: { text: string; logicalText?: string }) {
+    const agent = fixtureAgents[0]!;
+    let advance: (pane: { text: string; logicalText?: string }) => void = () => {
+      throw new Error("harness not mounted");
+    };
+    function Harness() {
+      const [pane, setPane] = useState(initial);
+      advance = setPane;
+      return (
+        <>
+          <AgentChat
+            paneId={agent.paneId}
+            agent={agent}
+            agents={fixtureAgents}
+            shellPanes={[]}
+            tabs={[]}
+            text={pane.text}
+            logicalText={pane.logicalText}
+            revision={1}
+            onBack={vi.fn()}
+            onSelect={vi.fn()}
+          />
+          <StatusSentinel />
+        </>
+      );
+    }
+    const router = createMemoryRouter([{ path: "/", element: withHeaderHost(<Harness />) }]);
+    render(<RouterProvider router={router} />);
+    return (pane: { text: string; logicalText?: string }) => advance(pane);
+  }
+
+  async function copyOutput(user: User) {
+    await openPaneMenu(user);
+    await user.click(screen.getByRole("button", { name: "Copy output" }));
+  }
+
+  // THE GATE, and it is not a nicety: `navigator.clipboard` is undefined in an insecure context, and
+  // plain HTTP is a supported deploy (docs/deployment.md Variant E). A row offered there could only
+  // ever fail, so it is absent, the same rule find and history follow.
+  it("offers no row where there is no clipboard to write to", async () => {
+    // `userEvent.setup()` INSTALLS a clipboard of its own, so the absence has to be staged after it
+    // and before the render that reads it. That is also why every other case in this file now sees
+    // the row at all: the harness supplies what an insecure context does not.
+    const user = userEvent.setup();
+    Reflect.deleteProperty(navigator, "clipboard");
+    expect(navigator.clipboard).toBeUndefined();
+    renderWithPane({ text: OUTPUT });
+    await openPaneMenu(user);
+    expect(screen.queryByRole("button", { name: "Copy output" })).toBeNull();
+    // The control it sits beside IS there, so this is the clipboard's absence and not a closed sheet.
+    expect(screen.getByRole("button", { name: "Find in output" })).toBeInTheDocument();
+  });
+
+  it("offers no row when there is nothing on screen to copy", async () => {
+    const user = userEvent.setup();
+    withClipboard(async () => {});
+    renderWithPane({ text: "" });
+    await openPaneMenu(user);
+    expect(screen.queryByRole("button", { name: "Copy output" })).toBeNull();
+  });
+
+  // The unwrapped form is the whole point of preferring it: the mirror's own text carries the hard
+  // wraps the phone's width put in, so a paste of it reads as broken lines.
+  it("copies the UNWRAPPED text when the multiplexer reports one", async () => {
+    const user = userEvent.setup();
+    const writeText = withClipboard(async () => {});
+    renderWithPane({ text: OUTPUT, logicalText: "one whole line that was never wrapped" });
+    await copyOutput(user);
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+    expect(writeText).toHaveBeenCalledWith("one whole line that was never wrapped");
+  });
+
+  it("falls back to the text on screen when no unwrapped form exists", async () => {
+    const user = userEvent.setup();
+    const writeText = withClipboard(async () => {});
+    renderWithPane({ text: OUTPUT });
+    await copyOutput(user);
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+    expect(writeText).toHaveBeenCalledWith(OUTPUT);
+  });
+
+  // The case the handler's own comment claims, and the reason it reads `shown` rather than the live
+  // props: a poll lands between the operator reading a screen and tapping the row. What gets copied
+  // must be what they were looking at.
+  it("copies the FROZEN buffer, not a poll that landed under the tap", async () => {
+    const user = userEvent.setup();
+    const writeText = withClipboard(async () => {});
+    const advance = renderWithPane({ text: OUTPUT, logicalText: "the screen they read" });
+
+    // Freeze the mirror, then put the find bar away again. Opening find pins the tail, which is the
+    // same `following=false` state a scroll-up freeze produces (the frozen-pair suite above freezes
+    // the same way), and closing it deliberately does NOT re-follow — so this leaves a frozen mirror
+    // with the ⋮ reachable, which a scroll-up freeze would too and jsdom cannot drive.
+    await openFind(user);
+    await user.click(screen.getByRole("button", { name: "Close find" }));
+    act(() => advance({ text: `${OUTPUT}\nlater output\n`, logicalText: "a screen they never saw" }));
+
+    await copyOutput(user);
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+    expect(writeText).toHaveBeenCalledWith("the screen they read");
+  });
+
+  // A refusal has to READ as one. Reporting success for a write that never happened is worse than
+  // the failure, because the operator walks away believing they have the output.
+  it("says it could not copy when the clipboard refuses", async () => {
+    const user = userEvent.setup();
+    withClipboard(() => Promise.reject(new Error("denied")));
+    renderWithPane({ text: OUTPUT });
+    await copyOutput(user);
+    await waitFor(() => expect(screen.getByTestId("status")).toHaveTextContent(/couldn't copy/i));
+  });
+
+  it("says it copied when the write goes through", async () => {
+    const user = userEvent.setup();
+    withClipboard(async () => {});
+    renderWithPane({ text: OUTPUT });
+    await copyOutput(user);
+    await waitFor(() => expect(screen.getByTestId("status")).toHaveTextContent(/copied output/i));
+  });
+});
+
+// ── CHAT IS THE DEFAULT MODE, THE TERMINAL IS ONE TAP AWAY (M41/11, ADR 0082) ──────────────────────────────────────────────────────────
+//
+// The mode is not a route: the pane view swaps the box between the mirror's top rule and the chrome
+// block, and nothing else. So these cases assert the two things that make it a mode — the chrome
+// around it does not move, and the switch is a row in the ⋮ menu rather than a second screen.
+describe("AgentChat — the chat body", () => {
+  /** Pick a body, the way the ⋮ row does. Chat is the default (ADR 0082), so this only pins it. */
+  function chooseChat(paneView: "chat" | "terminal") {
+    localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ paneView, showToolCalls: true }));
+  }
+
+  const journalAgent = () => ({ ...fixtureAgents[0]!, hasSession: true });
+
+  it("draws the chat on a fresh device, with no choice stored and no experiment switched on", async () => {
+    const user = userEvent.setup();
+    renderChat({ agent: journalAgent() });
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+    expect(screen.queryByText(/recent pane output/)).toBeNull();
+    await openPaneMenu(user);
+    expect(screen.getByRole("button", { name: "Terminal view" })).toBeInTheDocument();
+  });
+
+  it("ignores a stored chatExperiment: false and still draws the chat", async () => {
+    localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ chatExperiment: false }));
+    renderChat({ agent: journalAgent() });
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+  });
+
+  it("keeps the terminal on a device that chose it", async () => {
+    chooseChat("terminal");
+    renderChat({ agent: journalAgent() });
+    expect(screen.getByText(/recent pane output/)).toBeInTheDocument();
+    expect(screen.queryByText("what changed today?")).toBeNull();
+  });
+
+  it("draws the session instead of the mirror once Chat is the standing body", async () => {
+    chooseChat("chat");
+    renderChat({ agent: journalAgent() });
+    // The transcript fixture's own two turns, off the live window (test/handlers.ts).
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+    expect(screen.getByText("One commit: abc1234.")).toBeInTheDocument();
+    expect(screen.queryByText(/recent pane output/)).toBeNull();
+  });
+
+  // M46 spec 09: no bridge, and the phone kept this pane's Chat tail. The body draws it, dated, with
+  // nothing to act on.
+  it("stale render: draws the saved Chat tail with its notice when the chat read fails", async () => {
+    chooseChat("chat");
+    // Within the 1-day lifetime: an older record would read as a miss.
+    const at = Date.now() - 60_000;
+    await saveChatTail(undefined, fixtureAgents[0]!.paneId, [
+      { uuid: "s1", seq: 7, ts: "", role: "assistant", parts: [{ kind: "text", text: "the saved reply" }] },
+    ], "1d", at);
+    server.use(http.get(/\/api\/pane\/[^/]+\/chat/, () => HttpResponse.error()));
+    renderChat({ agent: journalAgent(), stale: true, lastSeenAt: at, error: true });
+    expect(await screen.findByText("the saved reply")).toBeInTheDocument();
+    expect(screen.getByText(/^Saved copy from .+\. Older text is on the bridge\.$/)).toBeInTheDocument();
+    expect(screen.queryByText(/recent pane output/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
+  });
+
+  // M46 pass 3, the blank Altan saw: the PWA reopened with Tailscale up and the radio off. The chat
+  // read does not fail there, it hangs, and the body stood empty until its deadline. A pane whose
+  // mirror is already the saved copy now draws its saved Chat at once.
+  it("stale render: draws the saved Chat tail at once while the chat read hangs", async () => {
+    chooseChat("chat");
+    const at = Date.now() - 60_000;
+    await saveChatTail(undefined, fixtureAgents[0]!.paneId, [
+      { uuid: "s1", seq: 7, ts: "", role: "assistant", parts: [{ kind: "text", text: "the saved reply" }] },
+    ], "1d", at);
+    server.use(http.get(/\/api\/pane\/[^/]+\/chat/, () => new Promise<Response>(() => {})));
+    renderChat({ agent: journalAgent(), stale: true, lastSeenAt: at, error: true });
+    expect(await screen.findByText("the saved reply")).toBeInTheDocument();
+    expect(screen.getByText(/^Saved copy from .+\. Older text is on the bridge\.$/)).toBeInTheDocument();
+  });
+
+  it("keeps the composer, the belt and the header in the chat body", async () => {
+    chooseChat("chat");
+    renderChat({ agent: journalAgent() });
+    await screen.findByText("what changed today?");
+    expect(screen.getByPlaceholderText(/type a reply/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Pane actions" })).toBeInTheDocument();
+  });
+
+  it("withholds find in the chat body, because find highlights in a mirror nobody can see", async () => {
+    chooseChat("chat");
+    const user = userEvent.setup();
+    renderChat({ agent: journalAgent() });
+    await screen.findByText("what changed today?");
+    await openPaneMenu(user);
+    expect(screen.queryByRole("button", { name: "Find in output" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Conversation history" })).toBeInTheDocument();
+  });
+
+  it("switches back to the mirror from the ⋮ row, without leaving the pane", async () => {
+    chooseChat("chat");
+    const user = userEvent.setup();
+    renderChat({ agent: journalAgent() });
+    await screen.findByText("what changed today?");
+    await openPaneMenu(user);
+    await user.click(screen.getByRole("button", { name: "Terminal view" }));
+    await waitFor(() => expect(screen.getByText(/recent pane output/)).toBeInTheDocument());
+    expect(screen.queryByText("what changed today?")).toBeNull();
+  });
+
+  // M56 spec 07: the way out. The Screen pill on the belt is the raw rows in one tap, in every state.
+  it("the Screen pill leaves Chat for the terminal rows in one tap, and the next tap goes back", async () => {
+    chooseChat("chat");
+    const user = userEvent.setup();
+    renderChat({ agent: journalAgent() });
+    await screen.findByText("what changed today?");
+    const pill = screen.getByRole("button", { name: "Show the screen rows, without cards" });
+    await user.click(pill);
+    await waitFor(() => expect(screen.getByText(/recent pane output/)).toBeInTheDocument());
+    expect(screen.queryByText("what changed today?")).toBeNull();
+    // Nothing was stored: the device's standing choice is still Chat, and the second tap shows it again.
+    await user.click(pill);
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+  });
+
+  // A pane with no journal SHOWS the switch and explains itself; it never hides.
+  it("falls back to the terminal on a pane with no session, and the row carries the reason", async () => {
+    chooseChat("chat");
+    const user = userEvent.setup();
+    renderChat({ agent: { ...fixtureAgents[0]!, hasSession: false } });
+    expect(screen.getByText(/recent pane output/)).toBeInTheDocument();
+    await openPaneMenu(user);
+    expect(screen.getByRole("button", { name: /Terminal view/ })).toBeInTheDocument();
+    expect(
+      screen.getByText(/This pane has no agent session.*The terminal stays here\./),
+    ).toBeInTheDocument();
+  });
+});
+
+// ── "SEND NOW" ON THE WAITING CARD: WHO MAY TAP IT, AND WHAT IT SENDS ───────────────────────────
+//
+// The keys are the bridge's data (`sendQueuedNow` on the chat answer), the write gate is the pane
+// view's. These cases pin the second half: the same answer draws the button on a device that may
+// write and withholds it on one that may not, and a tap goes through the ordinary keys route once.
+describe("AgentChat — Send now on the waiting card", () => {
+  const agent = () => ({ ...fixtureAgents[0]!, hasSession: true });
+
+  /** The fixture window, plus a queue and the keys the bridge declares for it. */
+  function answerWithQueue(declared: string[] | undefined) {
+    const body: ChatWindowBody & { paneId: string; available: true } = {
+      paneId: "w1:p1",
+      available: true,
+      page: "live",
+      gen: 7,
+      rev: 1,
+      head: 1,
+      oldest: 1,
+      hasOlder: false,
+      upserts: [],
+      queued: ["first", "second"],
+    };
+    if (declared !== undefined) body.sendQueuedNow = declared;
+    server.use(http.get(/\/api\/pane\/[^/]+\/chat/, () => HttpResponse.json(body)));
+  }
+
+  it("draws the button for a device that may write and sends the declared keys once", async () => {
+    answerWithQueue(["ctrl+Enter"]);
+    const sent: unknown[] = [];
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        sent.push(await request.json());
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+    const user = userEvent.setup();
+    renderChat({ agent: agent(), device: { enforced: true, device: "my-phone", authorized: true } });
+    const button = await screen.findByRole("button", { name: "Send now, the waiting messages" });
+    await user.click(button);
+    await waitFor(() => expect(sent).toHaveLength(1));
+    expect(sent[0]).toMatchObject({ keys: ["ctrl+Enter"] });
+    await user.click(button);
+    expect(sent).toHaveLength(1);
+  });
+
+  it("withholds the button on a read-only device", async () => {
+    answerWithQueue(["ctrl+Enter"]);
+    renderChat({ agent: agent(), device: { enforced: true, device: "spare-phone", authorized: false } });
+    expect(await screen.findByText("Waiting to send")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send now, the waiting messages" })).toBeNull();
+  });
+
+  // A queue is non-empty exactly while the agent works, which is when a permission prompt appears,
+  // and the declared keys would answer it. The button is withheld, not disabled.
+  it("withholds the button while a permission dialog is on screen, and sends nothing", async () => {
+    answerWithQueue(["ctrl+Enter"]);
+    const sent: unknown[] = [];
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        sent.push(await request.json());
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+    renderChat({
+      agent: agent(),
+      device: { enforced: true, device: "my-phone", authorized: true },
+      text: MENU_TEXT,
+    });
+    expect(await screen.findByText("Waiting to send")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send now, the waiting messages" })).toBeNull();
+    expect(sent).toHaveLength(0);
+  });
+
+  // The liveness backstop (M46 spec 11): a pane the bridge has not answered lately is not written to.
+  it("withholds the button while the pane is not live", async () => {
+    answerWithQueue(["ctrl+Enter"]);
+    liveness.live = false;
+    try {
+      renderChat({ agent: agent(), device: { enforced: true, device: "my-phone", authorized: true } });
+      expect(await screen.findByText("Waiting to send")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Send now, the waiting messages" })).toBeNull();
+    } finally {
+      liveness.live = true;
+    }
+  });
+
+  it("refuses at the handler when the pane went dark after the card was drawn", async () => {
+    answerWithQueue(["ctrl+Enter"]);
+    const sent: unknown[] = [];
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        sent.push(await request.json());
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+    const user = userEvent.setup();
+    renderChat({ agent: agent(), device: { enforced: true, device: "my-phone", authorized: true } });
+    const button = await screen.findByRole("button", { name: "Send now, the waiting messages" });
+    // The render that would hide the button has not happened yet: `isLive` flips without a re-render.
+    liveness.live = false;
+    try {
+      await user.click(button);
+      expect(sent).toHaveLength(0);
+    } finally {
+      liveness.live = true;
+    }
+  });
+
+  it("withholds the button when the bridge declared no keys", async () => {
+    answerWithQueue(undefined);
+    renderChat({ agent: agent(), device: { enforced: true, device: "my-phone", authorized: true } });
+    expect(await screen.findByText("Waiting to send")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send now, the waiting messages" })).toBeNull();
+  });
+});
+
+// ── NOTHING SAVED CAN ACT: THE STRUCTURAL WRITES OF THE PANE VIEW ──────────────────────────────
+//
+// Rename, Focus, Close and the branch-off live in the ⋮ sheet, and the tab "+" in the tab row. A pane
+// the bridge has not answered lately gets the sheet's note instead of the rows, and the "+" refuses.
+describe("AgentChat — structural writes on a pane that is not live", () => {
+  it("replaces Rename, Focus and Close with the saved-copy note in the pane menu", async () => {
+    liveness.live = false;
+    try {
+      const user = userEvent.setup();
+      renderChat();
+      await openPaneMenu(user);
+      expect(screen.getByText("Saved copy. Reconnect to make changes.")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Close pane" })).toBeNull();
+    } finally {
+      liveness.live = true;
+    }
+  });
+
+  it("keeps Rename and Close on a live pane", async () => {
+    const user = userEvent.setup();
+    renderChat();
+    await openPaneMenu(user);
+    expect(screen.getByRole("button", { name: "Rename" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close pane" })).toBeInTheDocument();
+  });
+});
+
+// ── ONE SEQUENCE: THE BLOOM AND THE BODY SWAP (1.17.0, ADR 0082) ────────────────────────────────
+//
+// A shell becomes an agent while the pane is open. The bloom (components/agent-start.tsx) and the
+// terminal-to-Chat swap used to run on clocks that never met; hooks/use-handover.ts makes them one
+// sequence. jsdom fires no `animationend`, so the covering phase ends on its timer here, which is
+// the fallback the real thing relies on when an animation never runs.
+describe("AgentChat — the handover from a shell to an agent", () => {
+  const shell = fixtureShellPanes[0]!;
+  const agentNow: AgentView = {
+    ...shell,
+    agent: "claude",
+    kind: "agent",
+    status: "working",
+    hasSession: true,
+  };
+
+  function renderShell() {
+    let setAgent: (a: AgentView) => void = () => {};
+    function Host() {
+      const [agent, set] = useState<AgentView>(shell);
+      setAgent = set;
+      return (
+        <AgentChat
+          paneId={shell.paneId}
+          agent={agent}
+          agents={agent.kind === "shell" ? [] : [agent]}
+          shellPanes={agent.kind === "shell" ? [agent] : []}
+          tabs={[]}
+          text={paneTextWithDraft("recent pane output")}
+          onBack={vi.fn()}
+          onSelect={vi.fn()}
+        />
+      );
+    }
+    const router = createMemoryRouter([{ path: "/", element: withHeaderHost(<Host />) }]);
+    render(<RouterProvider router={router} />);
+    return { becomeAgent: () => act(() => setAgent(agentNow)) };
+  }
+
+  const wait = (ms: number) => act(() => new Promise<void>((r) => setTimeout(r, ms)));
+
+  it("holds the terminal while the layer covers, swaps to Chat under it, and the layer leaves after", async () => {
+    const { becomeAgent } = renderShell();
+    expect(screen.getByText(/recent pane output/)).toBeInTheDocument();
+
+    becomeAgent();
+    expect(screen.getByRole("status", { name: "Handed to claude" })).toBeInTheDocument();
+
+    // The first chat answer lands within milliseconds, long before the cover is complete. The body
+    // must not change beside the animation: the terminal is still what is drawn.
+    await wait(200);
+    expect(screen.getByRole("status", { name: "Handed to claude" })).toHaveAttribute("data-phase", "covering");
+    expect(screen.getByText(/recent pane output/)).toBeInTheDocument();
+    expect(screen.queryByText("what changed today?")).toBeNull();
+
+    // At the rest the swap lands, and the layer is still up over it.
+    expect(await screen.findByText("what changed today?", {}, { timeout: 2000 })).toBeInTheDocument();
+    expect(screen.queryByText(/recent pane output/)).toBeNull();
+    expect(screen.getByRole("status", { name: "Handed to claude" })).toBeInTheDocument();
+
+    // And then the layer leaves with Chat drawn: the reveal uncovers the final body.
+    await waitFor(() => expect(screen.queryByRole("status", { name: "Handed to claude" })).toBeNull(), {
+      timeout: 3000,
+    });
+    expect(screen.getByText("what changed today?")).toBeInTheDocument();
+  });
+
+  it("a tap on the layer ends it at once and applies the held swap in the same commit", async () => {
+    const { becomeAgent } = renderShell();
+    becomeAgent();
+    await wait(50);
+    expect(screen.getByText(/recent pane output/)).toBeInTheDocument();
+    act(() => screen.getByRole("status", { name: "Handed to claude" }).dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })));
+    expect(screen.queryByRole("status", { name: "Handed to claude" })).toBeNull();
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+  });
+});
+
+// ── CHAT FROM THE FIRST FRAME: THE TIMELINES, WITH FAKE TIMERS (1.17.0 review) ─────────────────
+//
+// The operator's report: Codex never reached Chat, handing a pane to pi took long, and the bloom did
+// not match the swap. The rule since (lib/chat-gate.ts, ADR 0082 point 4): a NEW agent pane draws
+// Chat from the first frame, and falls back to the terminal only on an EVENT: the pane asks for
+// input, or its first turn ends with no session or no log. The handover ends when its animation
+// ends. These cases replay each harness's real order of events and record two things: every body
+// drawn, in order, and every phase the layer showed. The phases run on their timers here (jsdom
+// fires no `animationend`): covering ends at 530 ms, the rest at 910 ms, the reveal at 1700 ms. The
+// last resort is mocked out of reach (top of file), so no body below can come from a clock.
+describe("AgentChat: a new agent pane draws Chat from the first frame", () => {
+  const shell = fixtureShellPanes[0]!;
+  const layer = () => screen.queryByRole("status", { name: /^Handed to / });
+
+  // What the chat route answers. `no-log` is pi before its first reply; `live` is the fixture window.
+  let chatAnswer: "live" | "no-log" = "live";
+  beforeEach(() => {
+    vi.useFakeTimers();
+    chatAnswer = "live";
+    server.use(
+      http.get(/\/api\/pane\/[^/]+\/chat/, () =>
+        chatAnswer === "live"
+          ? undefined // fall through to the fixture window (test/handlers.ts)
+          : HttpResponse.json({ paneId: shell.paneId, available: false, reason: "no-log" }),
+      ),
+    );
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** One recorded frame: which body is drawn, and which phase the layer is in (or none). */
+  type Frame = { body: "chat" | "terminal"; phase: string };
+  function renderShell() {
+    let setAgent: (a: AgentView) => void = () => {};
+    let revalidate: () => void = () => {};
+    function Host() {
+      const [agent, set] = useState<AgentView>(shell);
+      setAgent = set;
+      const r = useRevalidator();
+      revalidate = r.revalidate;
+      return (
+        <AgentChat
+          paneId={shell.paneId}
+          agent={agent}
+          agents={agent.kind === "shell" ? [] : [agent]}
+          shellPanes={agent.kind === "shell" ? [agent] : []}
+          tabs={[]}
+          text={paneTextWithDraft("recent pane output")}
+          onBack={vi.fn()}
+          onSelect={vi.fn()}
+        />
+      );
+    }
+    // A loader that takes a beat, so a revalidation is a real poll: the chat window rides its
+    // loading→idle edge, and an instant loader would fold both into one render.
+    const loader = () => new Promise<null>((resolve) => setTimeout(() => resolve(null), 20));
+    const router = createMemoryRouter([{ path: "/", loader, element: withHeaderHost(<Host />) }]);
+    const { container } = render(<RouterProvider router={router} />);
+    const frames: Frame[] = [];
+    const look = () => {
+      const frame: Frame = {
+        body: container.querySelector('[data-slot="session-stream"]') ? "chat" : "terminal",
+        phase: layer()?.getAttribute("data-phase") ?? "none",
+      };
+      const last = frames.at(-1);
+      if (!last || last.body !== frame.body || last.phase !== frame.phase) frames.push(frame);
+    };
+    return {
+      container,
+      frames,
+      look,
+      set: (a: AgentView) => {
+        act(() => setAgent(a));
+        look();
+      },
+      poll: () =>
+        act(() => {
+          void revalidate();
+        }),
+    };
+  }
+
+  /**
+   * Advance in steps, each its own `act` (React holds effects until `act` exits, and a phase's timer
+   * is armed by an effect), and record the frame after every step.
+   */
+  async function advance(view: ReturnType<typeof renderShell>, ms: number) {
+    for (let left = ms; left > 0; left -= 50) {
+      await act(() => vi.advanceTimersByTimeAsync(Math.min(50, left)));
+      view.look();
+    }
+  }
+
+  const agentOf = (name: string, status: AgentStatus, hasSession: boolean): AgentView => ({
+    ...shell,
+    agent: name,
+    kind: "agent",
+    status,
+    hasSession,
+  });
+  /** The bodies drawn, in order, with repeats folded. */
+  const bodies = (frames: Frame[]) => frames.map((f) => f.body).filter((b, i, all) => i === 0 || all[i - 1] !== b);
+  /** The layer's phases, in order, with repeats folded. */
+  const phases = (frames: Frame[]) => frames.map((f) => f.phase).filter((p, i, all) => i === 0 || all[i - 1] !== p);
+  /** The body may change only where the cover allows it: never while covering or revealing. */
+  function swapsOnlyUnderCover(frames: Frame[]) {
+    for (let i = 1; i < frames.length; i += 1) {
+      if (frames[i]!.body !== frames[i - 1]!.body) {
+        expect(["none", "covered"]).toContain(frames[i]!.phase);
+      }
+    }
+  }
+  const startLine = () => screen.queryByText("Send a message to start.");
+
+  async function handOver(view: ReturnType<typeof renderShell>, agent: AgentView) {
+    await advance(view, 50); // the capability read lands
+    view.set(agent);
+    expect(layer()).toHaveAttribute("data-phase", "covering");
+    // The cover is gone at 1700 ms, the length of the animation and not one beat more.
+    await advance(view, 1650);
+    expect(layer()).not.toBeNull();
+    await advance(view, 100);
+    expect(layer()).toBeNull();
+    // It lifted exactly once: one covering, one rest, one reveal, then nothing.
+    expect(phases(view.frames)).toEqual(["none", "covering", "covered", "revealing", "none"]);
+  }
+
+  it("(a) Codex: Chat from the first frame, through the first prompt, to the session two seconds later", async () => {
+    const view = renderShell();
+    await handOver(view, agentOf("codex", "idle", false));
+    expect(startLine()).toBeInTheDocument();
+    expect(screen.queryByText(/first message/)).toBeNull(); // no "reports its session" note
+
+    view.set(agentOf("codex", "working", false)); // the first prompt
+    await advance(view, 2000);
+    expect(screen.getByText("Still working…")).toBeInTheDocument();
+    view.set(agentOf("codex", "working", true)); // the hook reports the session
+    await advance(view, 200);
+    expect(screen.getByText("what changed today?")).toBeInTheDocument();
+
+    // The turn ends with the session read: Chat stays.
+    view.set(agentOf("codex", "done", true));
+    view.poll();
+    await advance(view, 200);
+    expect(screen.getByText("what changed today?")).toBeInTheDocument();
+
+    expect(bodies(view.frames)).toEqual(["terminal", "chat"]);
+    swapsOnlyUnderCover(view.frames);
+  });
+
+  it("(b) pi: the session at start, no log until the first reply, and no 'no transcript' notice", async () => {
+    chatAnswer = "no-log";
+    const view = renderShell();
+    await handOver(view, agentOf("pi", "idle", true));
+    expect(startLine()).toBeInTheDocument();
+    expect(screen.queryByText(/No transcript file/)).toBeNull();
+
+    view.set(agentOf("pi", "working", true));
+    await advance(view, 3000);
+    view.poll();
+    await advance(view, 100);
+    expect(screen.getByText("Still working…")).toBeInTheDocument();
+    expect(screen.queryByText(/No transcript file/)).toBeNull();
+
+    chatAnswer = "live"; // the first reply wrote the log
+    view.poll();
+    await advance(view, 200);
+    expect(screen.getByText("what changed today?")).toBeInTheDocument();
+
+    expect(bodies(view.frames)).toEqual(["terminal", "chat"]);
+    swapsOnlyUnderCover(view.frames);
+  });
+
+  it("(c) pi with its session report one poll late: still one swap, under the cover", async () => {
+    chatAnswer = "no-log";
+    const view = renderShell();
+    await handOver(view, agentOf("pi", "idle", false));
+    expect(startLine()).toBeInTheDocument();
+
+    view.set(agentOf("pi", "idle", true)); // the report lands on the next poll
+    await advance(view, 200);
+    expect(startLine()).toBeInTheDocument();
+    expect(screen.queryByText(/No transcript file/)).toBeNull();
+
+    view.set(agentOf("pi", "working", true));
+    await advance(view, 2000);
+    chatAnswer = "live";
+    view.poll();
+    await advance(view, 200);
+    expect(screen.getByText("what changed today?")).toBeInTheDocument();
+
+    expect(bodies(view.frames)).toEqual(["terminal", "chat"]);
+    swapsOnlyUnderCover(view.frames);
+  });
+
+  it("(d) no hook installed: Chat for as long as the first turn runs, the terminal and its hint when it ends", async () => {
+    const view = renderShell();
+    await handOver(view, agentOf("claude", "idle", false));
+    expect(startLine()).toBeInTheDocument();
+
+    // A long first turn with nothing to read: no clock takes Chat away while it works.
+    view.set(agentOf("claude", "working", false));
+    await advance(view, 120_000);
+    expect(view.container.querySelector('[data-slot="session-stream"]')).not.toBeNull();
+    expect(screen.getByText("Still working…")).toBeInTheDocument();
+
+    // The EVENT: the snapshot that reports the turn's end names no session. The fallback is in that
+    // same render: the terminal, with the line that names the missing hook.
+    view.set(agentOf("claude", "done", false));
+    expect(screen.getByText(/recent pane output/)).toBeInTheDocument();
+    expect(screen.getByText(/has not reported a session to Hangar/i)).toBeInTheDocument();
+
+    // A session that arrives after all takes the pane back to Chat, in one more quiet swap.
+    view.set(agentOf("claude", "done", true));
+    await advance(view, 300);
+    expect(screen.getByText("what changed today?")).toBeInTheDocument();
+
+    expect(bodies(view.frames)).toEqual(["terminal", "chat", "terminal", "chat"]);
+    swapsOnlyUnderCover(view.frames);
+  });
+
+  it("(d) a log that never appears: the terminal says so after the read that follows the turn's end", async () => {
+    chatAnswer = "no-log";
+    const view = renderShell();
+    await handOver(view, agentOf("pi", "idle", true));
+    view.set(agentOf("pi", "working", true));
+    await advance(view, 120_000);
+    view.poll();
+    await advance(view, 100);
+    expect(screen.getByText("Still working…")).toBeInTheDocument();
+
+    // The turn ends. The snapshot that says so has a session, so the gate waits for the journal
+    // read STARTED AFTER it: every answer so far came from a read that began before the end.
+    view.set(agentOf("pi", "done", true));
+    await advance(view, 60_000); // no poll, so no new read: Chat holds, whatever the clock says
+    expect(view.container.querySelector('[data-slot="session-stream"]')).not.toBeNull();
+    view.poll(); // the next poll's read answers no-log: now the fallback
+    await advance(view, 100);
+    expect(screen.getByText(/recent pane output/)).toBeInTheDocument();
+    expect(screen.getByText("No transcript file was found for this pane's session yet.")).toBeInTheDocument();
+
+    chatAnswer = "live";
+    view.poll();
+    await advance(view, 300);
+    expect(screen.getByText("what changed today?")).toBeInTheDocument();
+    expect(bodies(view.frames)).toEqual(["terminal", "chat", "terminal", "chat"]);
+    swapsOnlyUnderCover(view.frames);
+  });
+
+  // The server cannot read at all: reading is switched off (`disabled`, ISSANCE_TRANSCRIPT=0), or a
+  // member's issance predates the chat route (404). Chat would stay empty for good, so the terminal.
+  it.each([
+    ["disabled", () => HttpResponse.json({ paneId: shell.paneId, available: false, reason: "disabled" })],
+    ["a 404 from an older member", () => new HttpResponse(null, { status: 404 })],
+  ])("(g) a server that cannot read (%s) draws the terminal, not an empty Chat", async (_name, answer) => {
+    server.use(http.get(/\/api\/pane\/[^/]+\/chat/, answer));
+    const view = renderShell();
+    await handOver(view, agentOf("claude", "idle", true));
+    await advance(view, 500);
+    view.poll();
+    await advance(view, 300);
+    expect(view.container.querySelector('[data-slot="session-stream"]')).toBeNull();
+    expect(screen.getByText(/recent pane output/)).toBeInTheDocument();
+    expect(startLine()).toBeNull();
+  });
+
+  it("(f) a question with nothing to read: the terminal at once, so the dialog is on screen", async () => {
+    const view = renderShell();
+    await handOver(view, agentOf("codex", "idle", false));
+    view.set(agentOf("codex", "working", false));
+    await advance(view, 500);
+    expect(view.container.querySelector('[data-slot="session-stream"]')).not.toBeNull();
+    view.set(agentOf("codex", "blocked", false)); // the EVENT, and the fallback in the same render
+    expect(view.container.querySelector('[data-slot="session-stream"]')).toBeNull();
+    expect(screen.getByText(/recent pane output/)).toBeInTheDocument();
+    expect(bodies(view.frames)).toEqual(["terminal", "chat", "terminal"]);
+    swapsOnlyUnderCover(view.frames);
+  });
+
+  it("(e) a device on the terminal sees the terminal throughout, and the cover still lifts once", async () => {
+    localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ paneView: "terminal" }));
+    const view = renderShell();
+    await handOver(view, agentOf("codex", "idle", false));
+    expect(screen.getByText(/reports its session to Hangar only after its first message/i)).toBeInTheDocument();
+    view.set(agentOf("codex", "working", false));
+    await advance(view, 16_000);
+    view.set(agentOf("codex", "done", false));
+    view.set(agentOf("codex", "working", true));
+    await advance(view, 300);
+    expect(screen.getByText(/recent pane output/)).toBeInTheDocument();
+    expect(bodies(view.frames)).toEqual(["terminal"]);
+  });
+
+  it("(e) on the terminal, a harness with its session at start is not drawn as Chat either", async () => {
+    localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ paneView: "terminal" }));
+    const view = renderShell();
+    await handOver(view, agentOf("claude", "working", true));
+    expect(bodies(view.frames)).toEqual(["terminal"]);
+  });
+
+  it("a pane first opened already working with no session keeps the terminal at once, as before", async () => {
+    const agent = agentOf("claude", "working", false);
+    const router = createMemoryRouter([
+      {
+        path: "/",
+        element: withHeaderHost(
+          <AgentChat
+            paneId={agent.paneId}
+            agent={agent}
+            agents={[agent]}
+            shellPanes={[]}
+            tabs={[]}
+            text={paneTextWithDraft("recent pane output")}
+            onBack={vi.fn()}
+            onSelect={vi.fn()}
+          />,
+        ),
+      },
+    ]);
+    const { container } = render(<RouterProvider router={router} />);
+    await act(() => vi.advanceTimersByTimeAsync(100));
+    expect(container.querySelector('[data-slot="session-stream"]')).toBeNull();
+    expect(screen.getByText(/has not reported a session to Hangar/i)).toBeInTheDocument();
+  });
+});
+
+// ── A FAILED POLL NEVER BLANKS THE CHAT (M46 pass 3, 2026-10-07) ────────────────────────────────────
+// Altan, airplane mode with Tailscale up, a pane open in Chat: the body went blank under a strip that
+// said "showing what was saved". The rule now: what the Chat body holds stays on screen through any
+// failed poll, and it is marked as the saved copy (the dated line above the body) on the read that
+// proves the outage: at once for a read that got no answer, on the second 5xx in a row. The line stays
+// until a live answer.
+describe("AgentChat — a failed poll keeps the Chat on screen", () => {
+  const journalAgent = () => ({ ...fixtureAgents[0]!, hasSession: true });
+  type ChatMode = "live" | "drop" | "502";
+  let mode: ChatMode = "live";
+
+  beforeEach(() => {
+    mode = "live";
+    localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ paneView: "chat", showToolCalls: true }));
+    server.use(
+      http.get(/\/api\/pane\/[^/]+\/chat/, () => {
+        if (mode === "drop") return HttpResponse.error();
+        if (mode === "502") return new HttpResponse("bad gateway", { status: 502 });
+        return undefined; // the fixture window (test/handlers.ts)
+      }),
+    );
+  });
+
+  function renderPolled() {
+    let revalidate: () => void = () => {};
+    function Host() {
+      revalidate = useRevalidator().revalidate;
+      const agent = journalAgent();
+      return (
+        <AgentChat
+          paneId={agent.paneId}
+          agent={agent}
+          agents={[agent]}
+          shellPanes={[]}
+          tabs={[]}
+          text={paneTextWithDraft("recent pane output")}
+          onBack={vi.fn()}
+          onSelect={vi.fn()}
+        />
+      );
+    }
+    // A loader that takes a beat, so a revalidation is a real poll with a loading→idle edge.
+    const loader = () => new Promise<null>((resolve) => setTimeout(() => resolve(null), 20));
+    const router = createMemoryRouter([{ path: "/", loader, element: withHeaderHost(<Host />) }]);
+    const { container } = render(<RouterProvider router={router} />);
+    const blocks = () => container.querySelectorAll('[data-slot="session-stream"] [data-block]').length;
+    const poll = async () => {
+      await act(async () => {
+        void revalidate();
+      });
+      // Let the loader's beat pass and the Chat read that rides its idle edge come back.
+      await act(() => new Promise((resolve) => setTimeout(resolve, 80)));
+    };
+    return { blocks, poll };
+  }
+
+  const savedLine = () => screen.queryByText(/^Saved copy from .+\. Older text is on the bridge\.$/);
+
+  it("online, content shown, then a poll that gets no answer: the blocks stay and the saved line appears", async () => {
+    const view = renderPolled();
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+    const shown = view.blocks();
+    expect(shown).toBeGreaterThan(0);
+    expect(savedLine()).toBeNull();
+
+    mode = "drop";
+    await view.poll();
+    await waitFor(() => expect(savedLine()).toBeInTheDocument());
+    expect(view.blocks()).toBe(shown);
+    expect(screen.getByText("what changed today?")).toBeInTheDocument();
+    expect(screen.getByText("One commit: abc1234.")).toBeInTheDocument();
+
+    // It stays through further failures, once, and goes with the first live answer.
+    await view.poll();
+    expect(screen.getAllByText(/^Saved copy from/)).toHaveLength(1);
+    expect(view.blocks()).toBe(shown);
+    mode = "live";
+    await view.poll();
+    await waitFor(() => expect(savedLine()).toBeNull());
+    expect(view.blocks()).toBe(shown);
+  });
+
+  it("the two-failure rule: one 5xx keeps the Chat unmarked, the second in a row marks it", async () => {
+    const view = renderPolled();
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+    const shown = view.blocks();
+
+    mode = "502";
+    await view.poll();
+    expect(savedLine()).toBeNull();
+    expect(view.blocks()).toBe(shown);
+
+    await view.poll();
+    await waitFor(() => expect(savedLine()).toBeInTheDocument());
+    expect(view.blocks()).toBe(shown);
+  });
+
+  // 2026-10-07, Altan: the dated line was a bar of its own under the pane strip. It is the top of the
+  // transcript now, where "Start of the conversation" and "Load older" stand, and it replaces both.
+  it("the saved line takes the transcript's top slot, and the live slot comes back with the bridge", async () => {
+    const view = renderPolled();
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+    expect(screen.getByText("Start of the conversation")).toBeInTheDocument();
+    expect(document.querySelector('[data-slot="saved-copy"]')).toBeNull();
+
+    mode = "drop";
+    await view.poll();
+    await waitFor(() => expect(savedLine()).toBeInTheDocument());
+    const stream = document.querySelector('[data-slot="session-stream"]')!;
+    const slot = stream.firstElementChild!;
+    expect(slot).toHaveAttribute("data-slot", "saved-copy");
+    expect(slot).toContainElement(savedLine());
+    expect(screen.queryByText("Start of the conversation")).toBeNull();
+    expect(screen.queryByRole("button", { name: /load older/i })).toBeNull();
+    // No bar above the body any more: the line is the only one, and it lives in the scroller.
+    expect(document.querySelector('[data-slot="notice"]')).toBeNull();
+    expect(screen.getAllByText(/^Saved copy from/)).toHaveLength(1);
+
+    mode = "live";
+    await view.poll();
+    await waitFor(() => expect(savedLine()).toBeNull());
+    expect(document.querySelector('[data-slot="saved-copy"]')).toBeNull();
+    expect(screen.getByText("Start of the conversation")).toBeInTheDocument();
+  });
+});
+
+// The branch the pane's folder is on rides line 2, after the workspace, in the line's own 12px box.
+describe("AgentChat header — the branch on the path line", () => {
+  const pathLine = (c: HTMLElement) => c.querySelector<HTMLElement>('[data-slot="pane-place"]')!.parentElement!;
+
+  it("follows the workspace with the branch, before the meta, without changing the line's height", () => {
+    const agent: AgentView = { ...fixtureAgents[0]!, gitHead: { kind: "branch", name: "fix-login" } };
+    const { container } = renderChat({ agent, agents: [agent, ...fixtureAgents.slice(1)] });
+    const line = pathLine(container);
+    expect(line).toHaveClass("h-3");
+    const label = within(line).getByText("Branch fix-login").closest<HTMLElement>('[data-slot="branch-label"]')!;
+    expect(label.previousElementSibling).toHaveAttribute("data-slot", "pane-place");
+    expect(label.nextElementSibling).toHaveAttribute("data-slot", "pane-meta");
+    expect(label).toHaveClass("leading-3");
+  });
+
+  it("draws no branch when the pane has none", () => {
+    const { container } = renderChat();
+    expect(pathLine(container).querySelector('[data-slot="branch-label"]')).toBeNull();
+  });
+});
+
+// A durable program's subtitle takes the header's second line, in the same 12px box (WIRE.md 7.11).
+// SAFETY: the header reads the field through the JSON guard (lib/pane-marks.ts); this hands it a shape a peer could send.
+const wrongSubtitle = (value: JsonValue): AgentView["subtitle"] => value as AgentView["subtitle"];
+
+describe("AgentChat header: the subtitle of a durable pane", () => {
+  const place = (c: HTMLElement) => c.querySelector<HTMLElement>('[data-slot="pane-place"]')!;
+
+  it("shows the subtitle in the second line instead of the workspace, and keeps the line's height", () => {
+    const agent: AgentView = { ...fixtureAgents[0]!, subtitle: "a customer cannot log in" };
+    const { container } = renderChat({ agent, agents: [agent, ...fixtureAgents.slice(1)] });
+    expect(place(container)).toHaveTextContent("a customer cannot log in");
+    expect(place(container)).not.toHaveTextContent(agent.workspaceLabel);
+    expect(place(container).parentElement).toHaveClass("h-3");
+  });
+
+  it("shows the workspace when the pane has no subtitle, or one that is not text", () => {
+    const { container } = renderChat();
+    expect(place(container)).toHaveTextContent(fixtureAgents[0]!.workspaceLabel);
+    // SAFETY: a crew peer's pane arrives unchecked; the header reads the subtitle through the JSON guard.
+    const wrong: AgentView["subtitle"] = wrongSubtitle(7);
+    const odd: AgentView = { ...fixtureAgents[0]!, subtitle: wrong };
+    const again = renderChat({ agent: odd, agents: [odd, ...fixtureAgents.slice(1)] });
+    expect(place(again.container)).toHaveTextContent(fixtureAgents[0]!.workspaceLabel);
+  });
+});
+
+// The pane's model floats on the mirror's bottom-right corner, in the box the draft notice pins to.
+describe("AgentChat — the model above the belt", () => {
+  it("draws the pane's model on the mirror box, under the draft-notice slot", () => {
+    const agent: AgentView = { ...fixtureAgents[0]!, model: "claude-fable-5-1" };
+    const { container } = renderChat({ agent, agents: [agent, ...fixtureAgents.slice(1)] });
+    const tag = container.querySelector<HTMLElement>('[data-slot="model-tag"]')!;
+    expect(tag.textContent).toContain("Fable 5.1");
+    expect(tag.querySelector(".sr-only")?.textContent).toBe("Model Fable 5.1");
+    expect(tag.previousElementSibling).toHaveAttribute("data-slot", "draft-notice-slot");
+  });
+
+  it("draws the pane's effort after its model", () => {
+    const agent: AgentView = { ...fixtureAgents[0]!, model: "anthropic:claude-opus-5-5", effort: "high" };
+    const { container } = renderChat({ agent, agents: [agent, ...fixtureAgents.slice(1)] });
+    const tag = container.querySelector<HTMLElement>('[data-slot="model-tag"]')!;
+    expect(tag.querySelector("[aria-hidden]")?.textContent).toBe("Opus 5.5 · high");
+  });
+
+  it("draws no model when the pane names none", () => {
+    const { container } = renderChat();
+    expect(container.querySelector('[data-slot="model-tag"]')).toBeNull();
+  });
+});
+
+// THE LABEL STANDS DOWN WHILE THE SCREEN NAMES THE MODEL. Each case is a harness's own footer, from the
+// fixture corpus (hand-typed for pi, which no fixture names a model in), against the model the bridge
+// would send for it. A footer that does not name the model leaves the label where it is.
+describe("AgentChat — the model label and a footer that already names it", () => {
+  const pane = (name: string) => readFileSync(join(import.meta.dirname, "..", "fixtures", "panes", name), "utf8");
+  const tag = (container: HTMLElement) => container.querySelector('[data-slot="model-tag"]');
+  const on = (agent: string, model: string, extra: Partial<AgentView> = {}): AgentView => ({
+    ...fixtureAgents[0]!,
+    agent,
+    model,
+    ...extra,
+  });
+  const terminal = () => localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ paneView: "terminal" }));
+  const chat = () =>
+    localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ paneView: "chat", showToolCalls: true }));
+
+  it("Claude Code: a statusline that prints the model hides the label, and one that does not keeps it", () => {
+    terminal();
+    const named = renderChat({ text: STATUS_TEXT, agent: on("claude", "claude-opus-4-8", { effort: "high" }) });
+    expect(screen.getByText("[Opus 4.8] ~/webapp · main")).toBeInTheDocument(); // the strip is up
+    // The effort goes with the model: a screen that names the model hides the whole tag (#463).
+    expect(tag(named.container)).toBeNull();
+    cleanup();
+    const behind = renderChat({ text: STATUS_TEXT, agent: on("claude", "Fable 5.1") });
+    expect(tag(behind.container)?.textContent).toContain("Fable 5.1");
+  });
+
+  it("Claude Code, a real capture: the statusline of claude--done.txt names Opus 4.8", () => {
+    terminal();
+    const { container } = renderChat({ text: pane("claude--done.txt"), agent: on("claude", "claude-opus-4-8") });
+    expect(tag(container)).toBeNull();
+  });
+
+  it("Codex: the footer row names the model, so the label stays away", () => {
+    terminal();
+    const { container } = renderChat({ text: pane("codex--v0157-idle.txt"), agent: on("codex", "gpt-6-luna") });
+    expect(screen.getAllByText(/GPT-6-Luna low/).length).toBeGreaterThan(0);
+    expect(tag(container)).toBeNull();
+  });
+
+  it("Codex: another model than the footer says keeps the label", () => {
+    terminal();
+    const { container } = renderChat({ text: pane("codex--v0157-idle.txt"), agent: on("codex", "gpt-5.6-sol") });
+    expect(tag(container)?.textContent).toContain("gpt-5.6-sol");
+  });
+
+  it("opencode: its strip never carries the model, so the label stays", () => {
+    terminal();
+    const { container } = renderChat({
+      text: pane("oc--done--tool-run.txt"),
+      agent: on("opencode", "openrouter:openai/gpt-5.6-sol"),
+    });
+    expect(tag(container)?.textContent).toContain("gpt-5.6-sol");
+  });
+
+  it("OmO reported as pi: its captured status strip names the model", () => {
+    terminal();
+    const footer = pane("pi--omo-v5130-idle.txt");
+    const named = renderChat({ text: footer, agent: on("pi", "openai:gpt-6.1-sol") });
+    expect(tag(named.container)).toBeNull();
+    cleanup();
+    const other = renderChat({ text: footer, agent: on("pi", "anthropic:claude-opus-5-5") });
+    expect(tag(other.container)?.textContent).toContain("Opus 5.5");
+  });
+
+  it("Chat body, a harness with a strip: the strip still stands below it, so the label stays hidden", async () => {
+    chat();
+    const { container } = renderChat({
+      text: STATUS_TEXT,
+      agent: on("claude", "claude-opus-4-8", { hasSession: true }),
+    });
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+    expect(screen.getByText("[Opus 4.8] ~/webapp · main")).toBeInTheDocument();
+    expect(tag(container)).toBeNull();
+  });
+
+  it("Chat body, a harness without a lifted footer: nothing on screen names the model, so the label stays", async () => {
+    chat();
+    const footer = "~/webapp (main)\n(anthropic) claude-sonnet-4-5 • medium";
+    const { container } = renderChat({
+      text: footer,
+      agent: on("pi", "anthropic:claude-sonnet-4-5", { hasSession: true }),
+    });
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+    expect(tag(container)?.textContent).toContain("Sonnet 4.5");
+  });
+});
+
+// Settings → Harness configurations. The switch is per harness and only DRAWS less: the strip, and for
+// Claude Code the background-agents block, leave the Chat view, and the model label comes back above
+// the belt because nothing on screen names the model any more.
+describe("AgentChat — the status line switch of Harness configurations", () => {
+  const pane = (name: string) => readFileSync(join(import.meta.dirname, "..", "fixtures", "panes", name), "utf8");
+  const tag = (container: HTMLElement) => container.querySelector('[data-slot="model-tag"]');
+  const on = (agent: string, model: string, extra: Partial<AgentView> = {}): AgentView => ({
+    ...fixtureAgents[0]!,
+    agent,
+    model,
+    ...extra,
+  });
+  const strip = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll("div")).find((el) => el.className.includes("max-h-[18dvh]"));
+  const chat = () =>
+    localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ paneView: "chat", showToolCalls: true }));
+
+  it("on (the default): the strip is drawn and the label stands down", async () => {
+    chat();
+    const { container } = renderChat({
+      text: STATUS_TEXT,
+      agent: on("claude", "claude-opus-4-8", { hasSession: true }),
+    });
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+    expect(screen.getByText("[Opus 4.8] ~/webapp · main")).toBeInTheDocument();
+    expect(strip(container)).toBeDefined();
+    expect(tag(container)).toBeNull();
+  });
+
+  it("off for the pane's harness: no strip, and the model label returns", async () => {
+    chat();
+    setHarnessStatusLineShown("claude", false);
+    const { container } = renderChat({
+      text: STATUS_TEXT,
+      agent: on("claude", "claude-opus-4-8", { hasSession: true }),
+    });
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+    expect(screen.queryByText("[Opus 4.8] ~/webapp · main")).toBeNull();
+    expect(strip(container)).toBeUndefined();
+    expect(tag(container)?.textContent).toContain("Opus 4.8");
+  });
+
+  it("off for another harness: this pane's strip stays", async () => {
+    chat();
+    setHarnessStatusLineShown("codex", false);
+    const { container } = renderChat({
+      text: STATUS_TEXT,
+      agent: on("claude", "claude-opus-4-8", { hasSession: true }),
+    });
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+    expect(screen.getByText("[Opus 4.8] ~/webapp · main")).toBeInTheDocument();
+    expect(tag(container)).toBeNull();
+  });
+
+  it("off: Claude Code's background-agents block stays out, on: it is drawn", async () => {
+    chat();
+    const text = pane("claude--draft-footer-single.txt");
+    renderChat({ text, agent: on("claude", "claude-opus-4-8", { hasSession: true }) });
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+    expect(screen.getByText(/worker:scout/)).toBeInTheDocument();
+    cleanup();
+    setHarnessStatusLineShown("claude", false);
+    renderChat({ text, agent: on("claude", "claude-opus-4-8", { hasSession: true }) });
+    expect(await screen.findByText("what changed today?")).toBeInTheDocument();
+    expect(screen.queryByText(/worker:scout/)).toBeNull();
+  });
+
+  it.each(["agy", "antigravity"])(
+    "the Antigravity row turns the strip off for a pane whose agent is %s",
+    async (agentString) => {
+      localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ paneView: "terminal" }));
+      const text = pane("agy--done.txt");
+      const before = renderChat({ text, agent: on(agentString, "gemini-3") });
+      expect(strip(before.container)).toBeDefined();
+      cleanup();
+
+      render(<HarnessPrefsControl />);
+      await userEvent.click(screen.getByRole("switch", { name: /Antigravity/ }));
+      cleanup();
+
+      const after = renderChat({ text, agent: on(agentString, "gemini-3") });
+      expect(strip(after.container)).toBeUndefined();
+    },
+  );
+
+  it("off: the Terminal body still shows the real rows", () => {
+    localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ paneView: "terminal" }));
+    setHarnessStatusLineShown("claude", false);
+    const { container } = renderChat({ text: STATUS_TEXT, agent: on("claude", "claude-opus-4-8") });
+    expect(strip(container)).toBeUndefined();
+    expect(tag(container)?.textContent).toContain("Opus 4.8");
+  });
+});
+
+describe("AgentChat: the header line of a durable pane (M53 spec 12)", () => {
+  const place = (c: HTMLElement) => c.querySelector<HTMLElement>('[data-slot="pane-place"]')!;
+  const durable = (over: Partial<AgentView>): AgentView => ({ ...fixtureAgents[0]!, ...over });
+  const steps: AgentView["progress"] = {
+    kind: "steps",
+    steps: [
+      { label: "read the ticket", state: "done" },
+      { label: "write a note", state: "running" },
+      { label: "reply", state: "todo" },
+    ],
+  };
+
+  it("header line: the running step leads, over the subtitle, and no bar is drawn under the header", () => {
+    const agent = durable({ status: "working", subtitle: "a customer cannot log in", progress: steps });
+    const { container } = renderChat({ agent, agents: [agent, ...fixtureAgents.slice(1)] });
+    expect(place(container)).toHaveTextContent("Step 2 of 3: write a note");
+    expect(place(container)).not.toHaveTextContent("a customer cannot log in");
+    expect(container.querySelector('[role="progressbar"]')).toBeNull();
+    expect(container.querySelector('[data-slot="pane-progress"]')).toBeNull();
+  });
+
+  it("header line: a percent reads as the number and its label, or the number alone", () => {
+    const labelled = durable({ status: "blocked", subtitle: "x", progress: { kind: "percent", value: 41.6, label: "uploading" } });
+    const first = renderChat({ agent: labelled, agents: [labelled, ...fixtureAgents.slice(1)] });
+    expect(place(first.container)).toHaveTextContent("42%: uploading");
+    cleanup();
+    const bare = durable({ status: "working", progress: { kind: "percent", value: 40 } });
+    const second = renderChat({ agent: bare, agents: [bare, ...fixtureAgents.slice(1)] });
+    expect(place(second.container).textContent).toBe("40%");
+  });
+
+  it("header line: the subtitle when there is no progress, or the pane is idle; the line keeps its height", () => {
+    const idle = durable({ status: "idle", subtitle: "a customer cannot log in", progress: steps });
+    const { container } = renderChat({ agent: idle, agents: [idle, ...fixtureAgents.slice(1)] });
+    expect(place(container)).toHaveTextContent("a customer cannot log in");
+    expect(place(container).parentElement).toHaveClass("h-3");
+    // Two lines and only two: the name, and this one.
+    const lines = container.querySelector('[data-slot="pane-lines"]')!;
+    expect(lines.children).toHaveLength(2);
+  });
+});
+
+
+// M53 spec 12: the prompt pin (PR 406) under the two-line header. The pin is an overlay hung from the top
+// edge of the thread's own scrollport, so with the progress row and both strips gone on a durable pane it
+// sits right under the header's rule: inside the thread's box, never in the header, and over nothing but the
+// thread. jsdom lays nothing out, so each block gets a 100px row and the reader has scrolled 150px.
+describe("AgentChat: the prompt pin under a durable pane's header line", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("header line: the pin hangs from the thread's top edge, under the header, with no strip or progress row between", async () => {
+    server.use(
+      http.get("/api/config", () =>
+        HttpResponse.json({
+          push: false,
+          vapidPublicKey: "",
+          mux: { name: "reference", capabilities: { paneGrid: false }, unsupportedKeys: [], notes: {} },
+        }),
+      ),
+    );
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (!this.hasAttribute("data-block")) return DOMRect.fromRect({ x: 0, y: 0, width: 390, height: 600 });
+      const index = [...(this.parentElement?.querySelectorAll(":scope > [data-block]") ?? [])].indexOf(this);
+      return DOMRect.fromRect({ x: 0, y: index * 100 - 150, width: 390, height: 100 });
+    });
+    const agent: AgentView = {
+      ...fixtureAgents[0]!,
+      hasSession: true,
+      status: "working",
+      subtitle: "a customer cannot log in",
+      progress: { kind: "steps", steps: [{ label: "look it up", state: "running" }, { label: "reply", state: "todo" }] },
+    };
+    const sibling: AgentView = { ...agent, paneId: "w1:p7" };
+    const { container } = renderChat({ agent, agents: [agent, sibling], tabs: fixtureTabs });
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Panes" })).toBeNull());
+    const pin = await waitFor(() => {
+      const found = container.querySelector<HTMLElement>('[data-slot="prompt-pin"]');
+      expect(found).not.toBeNull();
+      return found!;
+    });
+    expect(pin).toHaveTextContent("what changed today?");
+    // Never in the header: the header holds the title and the one line under it.
+    const header = container.querySelector("header")!;
+    expect(header.contains(pin)).toBe(false);
+    expect(container.querySelector('[data-slot="pane-place"]')).toHaveTextContent("Step 1 of 2: look it up");
+    // Hung from the scrollport's own top edge: the overlay is the scroller's sibling, at top 0.
+    const overlay = pin.parentElement!;
+    expect(overlay).toHaveClass("absolute", "top-0");
+    expect(overlay.previousElementSibling).toHaveClass("overflow-y-auto");
+    // And nothing stands between the header and that edge: no strip, no progress row, no bar.
+    expect(screen.queryByRole("navigation", { name: "Tabs" })).toBeNull();
+    expect(container.querySelector('[data-slot="pane-progress"]')).toBeNull();
+    expect(container.querySelector('[role="progressbar"]')).toBeNull();
+  });
+});
+
+// ── A PICTURE PI SHOWS REACHES THE LIVE MIRROR (M39, #292) ──────────────────────────────────────────
+// pi draws a picture by direct placement, which leaves no placeholder cell, so the placeholder path
+// never fires for it. The mirror reads the newest finished turn's picture from the journal instead
+// and shows it as one card right after the mirror. The cadence is the hook's (use-mirror-images
+// test); what is pinned here is the card as the pane draws it.
+describe("AgentChat, the newest turn's picture on a pi pane (M39, #292)", () => {
+  // pi's screen: scrollback, the tool row, the rows pi kept for the picture, the reply, pi's box.
+  const PI_SCREEN = [
+    ...Array.from({ length: 80 }, (_, i) => `earlier output, line ${i + 1}`),
+    " read ./dot.png",
+    ...Array.from({ length: 20 }, () => ""),
+    " Here is the screen.",
+    "",
+    "─".repeat(40),
+    "",
+    "─".repeat(40),
+    "/home/you/webapp",
+  ].join("\n");
+  const piAgent = (status: AgentStatus): AgentView => ({
+    ...fixtureAgents[0]!,
+    agent: "pi",
+    hasSession: true,
+    status,
+    lastActiveAt: 1_758_900_000_000,
+  });
+
+  beforeEach(() => {
+    localStorage.setItem("issance:dash-prefs:v1", JSON.stringify({ paneView: "terminal" }));
+    server.use(
+      http.get(/\/api\/pane\/[^/]+\/history/, () =>
+        HttpResponse.json({
+          paneId: "w1:p1",
+          available: true,
+          entries: fixtureTranscriptWithImage,
+          hasMore: false,
+          total: fixtureTranscriptWithImage.length,
+          fileTruncated: false,
+        }),
+      ),
+    );
+  });
+
+  it("shows a finished turn's picture after the mirror, captioned as the agent's own, not matched by order", async () => {
+    const agent = piAgent("done");
+    renderChat({ agent, agents: [agent], text: PI_SCREEN });
+
+    const picture = await screen.findByRole("img", { name: "Terminal graphics" });
+    expect(picture.getAttribute("src")).toMatch(/^blob:/);
+    expect(screen.getByText("the agent's newest picture, from its log")).toBeInTheDocument();
+    // Not the placeholder path's card: no hedge about order, no [Image] badge.
+    expect(screen.queryByText(/matched by order/)).toBeNull();
+    expect(screen.queryByText("[Image]")).toBeNull();
+    // After the mirror, not above it: the reply's row comes first in the document.
+    const reply = screen.getAllByText(/Here is the screen\./)[0]!;
+    expect(reply.compareDocumentPosition(picture) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("shows no picture card while pi works on a turn", async () => {
+    const agent = piAgent("working");
+    renderChat({ agent, agents: [agent], text: PI_SCREEN });
+
+    expect((await screen.findAllByText(/Here is the screen\./)).length).toBeGreaterThan(0);
+    // Give a (wrong) journal read every chance to land before asserting nothing is drawn.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+    expect(screen.queryByText("the agent's newest picture, from its log")).toBeNull();
+    expect(screen.queryByRole("img", { name: "Terminal graphics" })).toBeNull();
+  });
+});

@@ -1,0 +1,86 @@
+// Shared Unicode rule-glyph classes. Claude's grammar intentionally retains its established broad
+// box-drawing contract; visual clipping narrows that to glyphs that are themselves horizontal, so
+// a repeated corner/junction can never be mistaken for a terminal-width border.
+//
+// THIS FILE IS THE WHOLE SHARED SURFACE, AND IT IS MEANT TO STAY THAT WAY. Several tests in this
+// codebase decide whether a line is a border; four of them share this file, and the obvious
+// tidy-up — one predicate, one threshold — is the change to refuse:
+//
+//   · `markers.ts` (isBoxBorder / isInputBoxTopBorder) asks whether this is CLAUDE'S INPUT BOX, to
+//     decide whether the reply guard may press Enter. Its false positive types a message into a
+//     screen that is not the input box. It is therefore the narrowest possible test — U+2500 only,
+//     floored in display cells — and not one of these constants.
+//   · `blocks.ts` (PURE_HORIZONTAL_BORDER / LABELLED_RULE_ROW) asks whether this whole structural
+//     row is TOO WIDE TO WRAP NICELY, setting shared StyledLine.noWrap for the renderer to clip
+//     only while wrapping. Its labelled-row match also identifies its exact decorative rule runs.
+//     Its false positive crops a short rule or mutes decorative-looking glyphs, so it can afford a
+//     broad glyph set only with each row shape's own bounds.
+//   · `blocks.ts` (FRAME_ROW) asks whether this row is FRAMED, a boxed menu or a panel, for the same
+//     clipping decision. Its false positive clips a line of prose that opens and closes on a
+//     vertical stroke. Its alphabet is FRAME_EDGE_GLYPH_CLASS at the foot of this file.
+//   · `table-run.ts` (tableRuns) asks whether this row belongs to a TABLE, to decide whether to pan
+//     it instead of wrapping it. Its false positive pans readable prose, or worse, a menu. It reads
+//     the three classes at the foot of this file plus BOX_DRAWING_RULE_GLYPH_CLASS above, and its
+//     predicates and counts are its own.
+//
+// Same word, different question, and the costs of being wrong are not comparable. markers.ts:86–103
+// records what happened the last time one of these tests was reused for the other job — a spaced-out
+// prose separator read as an input-box border and defeated the structural guard from the inside.
+// Share the alphabet here; never share a predicate or a threshold.
+
+/** All box-drawing glyphs accepted by the existing Claude horizontal-rule grammar. */
+export const BOX_DRAWING_RULE_GLYPH_CLASS = "─-╿";
+/** Block eighths used by terminal separators. */
+export const BLOCK_EIGHTH_RULE_GLYPH_CLASS = "▁-▔";
+/** Figure, en, em, and horizontal-bar dashes. ASCII hyphen remains deliberately excluded. */
+export const UNICODE_DASH_RULE_GLYPH_CLASS = "‒-―";
+
+/** The established Claude horizontal-rule contract. */
+export const CLAUDE_RULE_GLYPH_CLASS =
+  BOX_DRAWING_RULE_GLYPH_CLASS + BLOCK_EIGHTH_RULE_GLYPH_CLASS + UNICODE_DASH_RULE_GLYPH_CLASS;
+
+// Horizontal-only members of the box-drawing range: solid, dashed, and double horizontal rules.
+// Corners, junctions, and vertical strokes stay out even when repeated.
+const HORIZONTAL_BOX_RULE_GLYPH_CLASS = "─━┄┅┈┉╌╍═╴╶╸╺╼╾";
+
+/** Glyphs safe to classify as a repeated, standalone horizontal terminal border. */
+export const PURE_HORIZONTAL_RULE_GLYPH_CLASS =
+  HORIZONTAL_BOX_RULE_GLYPH_CLASS + BLOCK_EIGHTH_RULE_GLYPH_CLASS + UNICODE_DASH_RULE_GLYPH_CLASS;
+
+// The glyphs that stand at the left and right edge of a boxed row (a TUI menu, a panel): verticals,
+// corners, and the TEES an inner separator row hangs off — light, heavy and double in each. Never a
+// horizontal rule glyph: this alphabet answers "is this row framed?", not "is this row a rule".
+// blocks.ts is its only consumer (FRAME_ROW), for the same clipping question
+// PURE_HORIZONTAL_RULE_GLYPH_CLASS answers for a bare rule; markers.ts must not borrow it (see the
+// note at the top of this file).
+export const FRAME_EDGE_GLYPH_CLASS = "│┌└├┏┗┣╔╚╠╟╞┐┘┤┓┛┫╗╝╣╢╡";
+
+// A FOURTH question, asked by table-run.ts: is this row part of a TABLE, so the mirror should pan it
+// instead of wrapping it? Its false positive pans prose, or worse a menu, but it never types
+// anything — which is exactly why it must not borrow any predicate above. It shares only these
+// alphabets, and BOX_DRAWING_RULE_GLYPH_CLASS at the head of the file.
+//
+// It overlaps FRAME_EDGE_GLYPH_CLASS on purpose and the two answers are ordered, not merged: a box
+// table's rows satisfy FRAME_ROW as well, and the renderer lets the table run win, because clipping
+// each row on its own would leave the run with nothing to pan (components/ansi-output.tsx).
+
+/** Every junction that carries a COLUMN boundary: the crosses (`┼ ╋ ╪ ╬`) and the vertical tees
+ *  (`┬ ┳ ╤ ╦`, `┴ ┻ ╧ ╩`). It reads a frame row's column offsets off the anchor, recognises one on a
+ *  member row, and since ADR 0072 it also decides that a run exists at all. `├ ┤ ╞ ╡` stay out — they
+ *  end a frame row without dividing it, so a single-column chrome box has no column boundary anywhere.
+ *
+ *  A CROSS-ONLY class stood here until 2026-09-30, and what it was really excluding is worth keeping.
+ *  A `┬` sits wherever any two-pane box's divider meets its lid and a `┴` where it meets its floor, so
+ *  a tee anchor claims every two-pane box there is, chrome included. That was read as a fault and it
+ *  is the feature: `FRAME_ROW` in blocks.ts CLIPS a `│ … │` row rather than wrapping it, so refusing
+ *  the tee did not make those boxes wrap, it made their second pane unreachable on a phone. ADR 0072
+ *  has the measurement and the trade. */
+export const BOX_COLUMN_JUNCTION_GLYPH_CLASS = "┬-╋╤-╬";
+
+/** Crosses only (`┼ ╋ ╪ ╬`). The reply probe reorders a wrapped Markdown table by these, and a tee
+ *  is a two-pane box rather than that table (ADR 0072 keeps the wider class above for panning). */
+export const BOX_CROSS_GLYPH_CLASS = "┼-╋╪-╬";
+
+/** Vertical strokes that can stand at a column boundary on a content row: solid, heavy, both
+ *  dashed weights of each, and double. */
+export const BOX_VERTICAL_GLYPH_CLASS = "│┃┆┇┊┋╎╏║";

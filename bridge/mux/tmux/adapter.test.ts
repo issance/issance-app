@@ -1,0 +1,497 @@
+import { describe, expect, test } from "bun:test";
+
+import { TmuxMux } from "./adapter.ts";
+import type { TmuxControlClient, TmuxExec, TmuxRunResult } from "./exec.ts";
+import { FakeTmux } from "./fixture.ts";
+
+// THE THINGS CONFORMANCE CANNOT ASK FOR, pinned here on the real adapter over the real fake.
+//
+// Conformance (../conformance.test.ts) drives every capability of this adapter already — including
+// the contract's *Pane naming* rule, which the world contract CAN express (a program printing a
+// title is a perturbation). What it has no vocabulary for is what that rule costs on tmux
+// specifically — a title outliving its program, and a label outliving the process that remembers it
+// — plus a hazard that belongs to ONE multiplexer's binary and a transport that dies mid-call:
+//
+//  • **The #4849 spawn guard.** tmux ≤ 3.6b segfaults its whole SERVER when it spawns a window while
+//    the global `window-size` is `manual` — so the interesting assertion is that the argv was never
+//    issued, which is a question about tmux's own option and no other adapter's.
+//  • **Transport death.** The contract owns the rule (`unreachable`, never `refused` —
+//    MUX_CONTRACT.md § Contract-owned rules), but the WORLD contract has no perturbation for it:
+//    `reconnect()` models a socket that was already gone, and teaching every fixture in the registry
+//    to kill a live transport mid-call would push a tmux-shaped fault onto Hangar and zellij, whose
+//    transports fail in their own words. So it is pinned here, per-adapter, and the rule lives in the
+//    contract for the next adapter to meet the same way.
+
+/** The one sentence the operator sees, and it ends in the command that clears it. */
+const REFUSAL =
+  "tmux 3.6b crashes when it spawns a window while window-size is manual (tmux #4849, fixed in 3.7) — run: tmux set -g window-size latest";
+
+/** Whether the fake was ever asked to spawn anything. The assertion the whole guard exists for. */
+function spawned(fake: FakeTmux): boolean {
+  return fake.invocations().some((group) => group.at(0) === "new-window" || group.at(0) === "new-session");
+}
+
+/** The pane the seeded world gives a title to, and the title it carries. */
+const TITLED_PANE = "%3";
+
+/** One pane out of a fresh snapshot. */
+async function paneOf(adapter: TmuxMux, paneId: string) {
+  const pane = (await adapter.snapshot()).panes.find((candidate) => candidate.paneId === paneId);
+  if (pane === undefined) throw new Error(`the fake lost pane ${paneId}`);
+  return pane;
+}
+
+describe("tmux's one title slot", () => {
+  test("a title the pane printed is a terminalTitle — never the operator's label", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    await fake.setProgramTitle(TITLED_PANE, "✳ waiting for soak time - server performance");
+
+    const pane = await paneOf(adapter, TITLED_PANE);
+    expect(pane.paneLabel).toBeUndefined();
+    // Verbatim, glyph included: it is the program's own text, and issance does not edit it.
+    expect(pane.terminalTitle).toBe("✳ waiting for soak time - server performance");
+  });
+
+  test("a label set THROUGH issance is the operator's, and clearing it hands the slot back", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+
+    await adapter.renamePane(TITLED_PANE, "deploy");
+    const labelled = await paneOf(adapter, TITLED_PANE);
+    expect(labelled.paneLabel).toBe("deploy");
+    // One slot, one string: the label is not ALSO reported as something the program said.
+    expect(labelled.terminalTitle).toBeUndefined();
+
+    await adapter.renamePane(TITLED_PANE, null);
+    await fake.setProgramTitle(TITLED_PANE, "✳ back to being the program's");
+    const cleared = await paneOf(adapter, TITLED_PANE);
+    expect(cleared.paneLabel).toBeUndefined();
+    expect(cleared.terminalTitle).toBe("✳ back to being the program's");
+  });
+
+  test("a program that overwrites the operator's label takes the slot back with it", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    await adapter.renamePane(TITLED_PANE, "deploy");
+    await fake.setProgramTitle(TITLED_PANE, "✳ Reticulating splines");
+
+    const pane = await paneOf(adapter, TITLED_PANE);
+    expect(pane.paneLabel).toBeUndefined();
+    expect(pane.terminalTitle).toBe("✳ Reticulating splines");
+  });
+
+  test("the memory is this process's: a fresh adapter reads its own earlier label as a title", async () => {
+    const fake = new FakeTmux();
+    await new TmuxMux(fake).renamePane(TITLED_PANE, "deploy");
+
+    // What a `systemctl restart issance` looks like from tmux's side: the slot still holds the label,
+    // and nothing alive remembers setting it. It degrades to a title — visible, never a false claim.
+    const pane = await paneOf(new TmuxMux(fake), TITLED_PANE);
+    expect(pane.paneLabel).toBeUndefined();
+    expect(pane.terminalTitle).toBe("deploy");
+  });
+
+  // A pane that goes away drops its remembered label (`forgetGonePanes`), and that is memory hygiene
+  // rather than behaviour: tmux never recycles a pane id (identity rule 4, pinned by conformance), so
+  // no snapshot can ever be made to show the difference. There is nothing here to assert without
+  // reaching into the adapter's private map, which would pin the mechanism instead of the rule.
+
+  test("an exited program leaves `bash` in the foreground and its title behind", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    await fake.setProgramTitle(TITLED_PANE, "✳ waiting for soak time - server performance");
+    await fake.exitProgram(TITLED_PANE);
+
+    const pane = await paneOf(adapter, TITLED_PANE);
+    // Both raw facts, reported as raw facts. Reading them TOGETHER as a stale title is the bridge's
+    // job (state-engine.ts) — the adapter neither drops the title nor explains it.
+    expect(pane.foregroundCommand).toBe("bash");
+    expect(pane.terminalTitle).toBe("✳ waiting for soak time - server performance");
+    expect(pane.paneLabel).toBeUndefined();
+    expect(pane.agent).toBe("shell");
+  });
+});
+
+describe("an auto-named window shows its folder, not its program", () => {
+  /** The window and pane of a freshly created tab, plus a re-read of both after the fixture moves. */
+  async function tabAndPane(adapter: TmuxMux, tabId: string, paneId: string) {
+    const snapshot = await adapter.snapshot();
+    const tab = snapshot.tabs.find((candidate) => candidate.tabId === tabId);
+    const pane = snapshot.panes.find((candidate) => candidate.paneId === paneId);
+    if (tab === undefined || pane === undefined) throw new Error(`the fake lost ${tabId} or ${paneId}`);
+    return { tab, pane };
+  }
+
+  test("a window the operator named keeps that name", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    const created = await adapter.createTab({ spaceId: "$1", cwd: "/var/home/altan/playground/herdr-pouch" });
+    if (!created.ok) throw new Error("unreachable");
+    const renamed = await adapter.renameTab(created.value.tabId, "notes");
+    expect(renamed.ok).toBe(true);
+
+    const { tab, pane } = await tabAndPane(adapter, created.value.tabId, created.value.paneId);
+    // A deliberate choice, so the folder rule never runs — even though the cwd would say otherwise.
+    expect(tab.label).toBe("notes");
+    expect(pane.tabLabel).toBe("notes");
+    // A window the operator named is a name, so it may name a pane that is alone in it.
+    expect(pane.tabNamed).toBe(true);
+  });
+
+  test("an auto-named window with a known path shows its active pane's last folder", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    // No `-n`, so tmux keeps `automatic-rename` on and names the window after the shell it opened.
+    const created = await adapter.createTab({ spaceId: "$1", cwd: "/var/home/altan/playground/herdr-pouch" });
+    if (!created.ok) throw new Error("unreachable");
+
+    const { tab, pane } = await tabAndPane(adapter, created.value.tabId, created.value.paneId);
+    expect(tab.label).toBe("herdr-pouch");
+    expect(pane.tabLabel).toBe("herdr-pouch");
+    // The folder stands in for tmux's automatic name; nobody chose it, so it never names the pane.
+    expect(pane.tabNamed).toBeUndefined();
+  });
+
+  test("root is its own last folder", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    const created = await adapter.createTab({ spaceId: "$1", cwd: "/" });
+    if (!created.ok) throw new Error("unreachable");
+
+    const { tab } = await tabAndPane(adapter, created.value.tabId, created.value.paneId);
+    expect(tab.label).toBe("/");
+  });
+
+  test("an auto-named window with no known path falls back to its bare index", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    const created = await adapter.createTab({ spaceId: "$1", cwd: "/var/home/altan/playground/herdr-pouch" });
+    if (!created.ok) throw new Error("unreachable");
+    await fake.blankPaneCwd(created.value.paneId);
+
+    const { tab, pane } = await tabAndPane(adapter, created.value.tabId, created.value.paneId);
+    // A bare number, positional — the tab strip's own read of `isUnnamedTab` renders it `tab N`.
+    // The seeded session already has window index 0 ("agents"), so this one is index 1.
+    expect(tab.number).toBe(1);
+    expect(tab.label).toBe("1");
+    // The pane's own `tabLabel` stays ABSENT for a positional default (`MuxPane.tabLabel`'s contract)
+    // — the bare number is the raw slot's business, not a name this pane carries.
+    expect(pane.tabLabel).toBeUndefined();
+  });
+
+  test("a purely numeric name — the operator's own, or tmux's — passes through as the number", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    // `-n 42` turns `automatic-rename` off (tmux's own behaviour), so this is the operator's choice —
+    // and the rule still reads a bare digit string as positional, never as a name to keep verbatim.
+    const created = await adapter.createTab({ spaceId: "$1", label: "42", cwd: "/var/home/altan/playground/herdr-pouch" });
+    if (!created.ok) throw new Error("unreachable");
+
+    const { tab, pane } = await tabAndPane(adapter, created.value.tabId, created.value.paneId);
+    expect(tab.label).toBe("42");
+    expect(pane.tabLabel).toBeUndefined();
+  });
+});
+
+describe("the #4849 spawn guard", () => {
+  test("a create on tmux 3.6b under `window-size manual` is refused, and NOTHING is spawned", async () => {
+    const fake = new FakeTmux();
+    fake.setWindowSize("manual");
+    fake.setVersion("3.6b");
+    const adapter = new TmuxMux(fake);
+
+    const tab = await adapter.createTab({ spaceId: "$1" });
+    expect(tab.ok).toBe(false);
+    if (tab.ok) throw new Error("unreachable");
+    expect(tab.reason).toBe("refused");
+    expect(tab.detail).toBe(REFUSAL);
+
+    const space = await adapter.createSpace({ cwd: "/tmp" });
+    expect(space.ok).toBe(false);
+    if (space.ok) throw new Error("unreachable");
+    expect(space.reason).toBe("refused");
+    expect(space.detail).toBe(REFUSAL);
+
+    // The point of the whole change: the argv that kills the operator's server never reached tmux.
+    expect(spawned(fake)).toBe(false);
+  });
+
+  test("the version is read once and then cached — a running server cannot change its binary", async () => {
+    const fake = new FakeTmux();
+    fake.setWindowSize("manual");
+    const adapter = new TmuxMux(fake);
+    await adapter.createTab({ spaceId: "$1" });
+    await adapter.createTab({ spaceId: "$1" });
+    const versionProbes = fake.invocations().filter((group) => group.at(0) === "display-message");
+    expect(versionProbes.length).toBe(1);
+    // The option itself is asked EVERY time: the operator can change it between two taps.
+    expect(fake.invocations().filter((group) => group.at(0) === "show-options").length).toBe(2);
+  });
+
+  test("`manual` on tmux 3.7 spawns — the fix is in, so there is nothing to guard", async () => {
+    const fake = new FakeTmux();
+    fake.setWindowSize("manual");
+    fake.setVersion("3.7");
+    const created = await new TmuxMux(fake).createTab({ spaceId: "$1" });
+    expect(created.ok).toBe(true);
+    expect(spawned(fake)).toBe(true);
+  });
+
+  test("`window-size latest` on tmux 3.6b spawns — the hazard is the option, not the version", async () => {
+    const fake = new FakeTmux();
+    fake.setVersion("3.6b");
+    const created = await new TmuxMux(fake).createTab({ spaceId: "$1" });
+    expect(created.ok).toBe(true);
+    expect(spawned(fake)).toBe(true);
+  });
+
+  test("a version tmux does not report reads as unsafe, and the sentence still says what to run", async () => {
+    const fake = new FakeTmux();
+    fake.setWindowSize("manual");
+    fake.setVersion("");
+    const created = await new TmuxMux(fake).createTab({ spaceId: "$1" });
+    expect(created.ok).toBe(false);
+    if (created.ok) throw new Error("unreachable");
+    expect(created.detail).toContain("this tmux crashes when it spawns a window");
+    expect(created.detail).toContain("tmux set -g window-size latest");
+    expect(spawned(fake)).toBe(false);
+  });
+});
+
+describe("a transport that dies during the call", () => {
+  test("`server exited unexpectedly` is `unreachable`, never `refused`", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    fake.killServerMidCall();
+
+    const created = await adapter.createTab({ spaceId: "$1" });
+    expect(created.ok).toBe(false);
+    if (created.ok) throw new Error("unreachable");
+    expect(created.reason).toBe("unreachable");
+
+    // Not a create-only rule: every write answers the same way, which is what raises one banner
+    // instead of a red refusal per tap.
+    const typed = await adapter.typeText("%3", "hello");
+    expect(typed.ok).toBe(false);
+    if (typed.ok) throw new Error("unreachable");
+    expect(typed.reason).toBe("unreachable");
+  });
+});
+
+// WHICH SESSION THE OPERATOR IS LOOKING AT — a question only tmux poses this way, because only tmux
+// lets this adapter attach clients of its own. Conformance asks whether focus is reported and whether
+// `setFocus` moves it; it has no vocabulary for "and issance's own control client is not a person",
+// which is the mistake the old activity-only heuristic was written around rather than fixed.
+describe("focus follows a real terminal, not this adapter's own watch", () => {
+  test("a session with a non-control client attached is the focused space", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    // The seeded world's SECOND session is the last-active one, so the activity fallback would pick
+    // it — which is what makes attaching a terminal to the first one a real assertion.
+    fake.attachClient("issance", { activity: 10 });
+
+    const spaces = (await adapter.snapshot()).spaces;
+    expect(spaces.find((space) => space.focused)?.label).toBe("issance");
+  });
+
+  test("a control client is nobody's screen — the fallback answers instead", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    fake.attachClient("issance", { control: true, activity: 99 });
+
+    const spaces = (await adapter.snapshot()).spaces;
+    expect(spaces.find((space) => space.focused)?.label).toBe("scratch");
+  });
+
+  test("`setFocus` moves the window and the pane in ONE invocation", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+
+    const moved = await adapter.setFocus("%4");
+    expect(moved.ok).toBe(true);
+    // `;`-joined, so the fake splits it into two commands and BOTH ran — a screen left half-moved,
+    // showing the right window and the wrong pane, is what the single invocation avoids.
+    expect(fake.invocations().some((invocation) => invocation.at(0) === "select-window")).toBe(true);
+    expect(fake.invocations().some((invocation) => invocation.at(0) === "select-pane")).toBe(true);
+    expect((await paneOf(adapter, "%4")).focused).toBe(true);
+  });
+
+  test("`setFocus` carries an attached terminal that is sitting on another session", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    // The operator's terminal is on `scratch`; the pane they tapped lives in `issance`. Selecting the
+    // window alone moves `issance`'s own current window and NOTHING on their screen.
+    fake.attachClient("scratch", { tty: "/dev/pts/7" });
+
+    const moved = await adapter.setFocus("%3");
+    expect(moved.ok).toBe(true);
+    const switched = fake.invocations().filter((invocation) => invocation.at(0) === "switch-client");
+    expect(switched).toEqual([["switch-client", "-c", "/dev/pts/7", "-t", "$1"]]);
+    expect(fake.clientSessions().get("/dev/pts/7")).toBe("issance");
+  });
+
+  test("`setFocus` switches nothing when the terminal is already on the pane's session", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    fake.attachClient("issance", { tty: "/dev/pts/7" });
+
+    const moved = await adapter.setFocus("%3");
+    expect(moved.ok).toBe(true);
+    expect(fake.invocations().some((invocation) => invocation.at(0) === "switch-client")).toBe(false);
+  });
+
+  test("`setFocus` never switches this adapter's own control client", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    fake.attachClient("scratch", { control: true, tty: "/dev/pts/9" });
+
+    const moved = await adapter.setFocus("%3");
+    expect(moved.ok).toBe(true);
+    expect(fake.invocations().some((invocation) => invocation.at(0) === "switch-client")).toBe(false);
+  });
+
+  test("`setFocus` at a pane that has gone answers `gone` and spawns nothing", async () => {
+    const fake = new FakeTmux();
+    const adapter = new TmuxMux(fake);
+    await fake.endPane("%3");
+
+    const moved = await adapter.setFocus("%3");
+    expect(moved.ok).toBe(false);
+    if (moved.ok) throw new Error("unreachable");
+    expect(moved.reason).toBe("gone");
+    expect(fake.invocations().some((invocation) => invocation.at(0) === "select-window")).toBe(false);
+  });
+});
+
+/**
+ * A tmux that answers every command with one fixed page of text, at exit code 0.
+ *
+ * The one thing FakeTmux cannot be: a tmux whose OUTPUT SHAPE this adapter does not understand.
+ * The fake speaks the adapter's own dialect by construction, so the fault below — a real herd, a
+ * clean exit, and not one parsable row — has to be staged with a transport this thin.
+ */
+class TalkativeTmux implements TmuxExec {
+  constructor(private readonly stdout: string) {}
+
+  run(): Promise<TmuxRunResult> {
+    return Promise.resolve({ code: 0, stdout: this.stdout, stderr: "" });
+  }
+
+  control(): TmuxControlClient {
+    return { kill: () => undefined };
+  }
+}
+
+describe("a tmux whose output does not parse", () => {
+  test("a listing that yields no rows is an error, never an empty herd", async () => {
+    // The tmux 3.4 fault in one assertion. tmux answered, exit code 0, three sessions' worth of
+    // text — and the separator arrived vis-escaped, so every line failed the split. Returned as an
+    // empty herd it is invisible: no log line, `bridge: connected`, doctor green, the app blind.
+    const garbage = ["not a record at all", "nor this one", "or this"].join("\n");
+    await expect(new TmuxMux(new TalkativeTmux(garbage)).snapshot()).rejects.toThrow(/did not parse/u);
+  });
+
+  test("a listing whose separator was sanitized to `_` still trips the guard", async () => {
+    // The no-locale fault in one assertion (issue 358). A tmux client with no UTF-8 locale prints `_`
+    // where the U+001F separator belongs, so there is nothing to un-escape and every line fails the
+    // split. `-u` (exec.ts) keeps it from happening; this keeps it from ever being silent if it does.
+    const sanitized = ["S_$0_1_1791236795_/_x_repro", "W_$0_@0_0_1_x_1_0"].join("\n");
+    await expect(new TmuxMux(new TalkativeTmux(sanitized)).snapshot()).rejects.toThrow(/did not parse/u);
+  });
+
+  test("the error names the likely cause and the version it happened on", async () => {
+    // The version IS the diagnosis: the escaping is tmux's, not this herd's. `#{version}` is the
+    // only field this stub answers, so the sentence carries it.
+    await expect(new TmuxMux(new TalkativeTmux("3.4")).snapshot()).rejects.toThrow(
+      /unexpected separator escaping\? tmux 3\.4/u,
+    );
+  });
+
+  test("a server with no sessions at all stays an ordinary empty herd", async () => {
+    // The other half of the guard, and the reason it is not "zero rows is always a fault": tmux
+    // prints NOTHING for a server with no sessions, and that is a true answer.
+    const snapshot = await new TmuxMux(new TalkativeTmux("")).snapshot();
+    expect(snapshot.panes).toEqual([]);
+    expect(snapshot.spaces).toEqual([]);
+  });
+});
+
+// A BLANK cwd IS NOT A DIRECTORY — MUX_CONTRACT.md § Contract-owned rules, *A blank cwd*. Pinned
+// here on the argv because that is where the rule is either kept or lost: tmux takes `-c` with a
+// value, so `-c ""` is a chdir to nothing rather than "no directory asked for".
+describe("a blank cwd never becomes a `-c` flag", () => {
+  /** The argv tmux was actually handed for the one spawn in the test. */
+  function spawnArgs(fake: FakeTmux): readonly string[] {
+    const group = fake.invocations().find((g) => g.at(0) === "new-window" || g.at(0) === "new-session");
+    if (group === undefined) throw new Error("nothing was spawned");
+    return group;
+  }
+
+  test.each([
+    ["empty", ""],
+    ["blank", "   "],
+  ] as const)("createTab with a %s cwd", async (_name, cwd: string) => {
+    const fake = new FakeTmux();
+    await new TmuxMux(fake).createTab({ spaceId: "$1", cwd });
+    expect(spawnArgs(fake)).not.toContain("-c");
+  });
+
+  test("createSpace with an empty cwd", async () => {
+    const fake = new FakeTmux();
+    await new TmuxMux(fake).createSpace({ cwd: "" });
+    expect(spawnArgs(fake)).not.toContain("-c");
+  });
+
+  test("a real cwd still reaches tmux", async () => {
+    const fake = new FakeTmux();
+    await new TmuxMux(fake).createTab({ spaceId: "$1", cwd: "/home/op/repo" });
+    expect(spawnArgs(fake)).toEqual(expect.arrayContaining(["-c", "/home/op/repo"]));
+  });
+});
+
+
+// tmux 3.7 REFUSES `send-keys` THAT LANDS ON A READ-ONLY CLIENT, and the client it picks is the most
+// recently active one of the pane's session, which is issance's own watcher (always `read-only`).
+// Lab, tmux 3.7c: `send-keys -t %0 -- a` with the watcher attached exits 1 with "client is
+// read-only" and sends nothing, while paste-buffer still works. Conformance cannot express it: the
+// world contract has no read-only client, and no other multiplexer has this rule.
+describe("send-keys with this adapter's own read-only watcher attached", () => {
+  const sendKeys = (fake: FakeTmux) => fake.invocations().filter((group) => group.at(0) === "send-keys");
+
+  test("a refusal naming a read-only client is retried once with no client named, and the keys land", async () => {
+    const fake = new FakeTmux();
+    fake.attachClient("issance", { control: true, readOnly: true, activity: 99 });
+
+    const ack = await new TmuxMux(fake).writeKeys("%3", ["a", "Enter"]);
+
+    expect(ack.ok).toBe(true);
+    expect(sendKeys(fake)).toEqual([
+      ["send-keys", "-t", "%3", "--", "a", "Enter"],
+      ["send-keys", "-c", "issance-no-client", "-t", "%3", "--", "a", "Enter"],
+    ]);
+    expect(fake.writes().filter((write) => write.kind === "keys")).toEqual([
+      { paneId: "%3", kind: "keys", payload: ["a", "Enter"] },
+    ]);
+  });
+
+  test("with no read-only client picked the first attempt stands, and no second call is made", async () => {
+    const fake = new FakeTmux();
+    fake.attachClient("issance", { control: true, readOnly: true, activity: 1 });
+    fake.attachClient("issance", { activity: 50 });
+
+    const ack = await new TmuxMux(fake).writeKeys("%3", ["a"]);
+
+    expect(ack.ok).toBe(true);
+    expect(sendKeys(fake)).toEqual([["send-keys", "-t", "%3", "--", "a"]]);
+  });
+
+  test("any other refusal is returned as it is, with no retry", async () => {
+    const fake = new FakeTmux();
+
+    const ack = await new TmuxMux(fake).writeKeys("%999", ["a"]);
+
+    expect(ack.ok).toBe(false);
+    expect(sendKeys(fake)).toHaveLength(1);
+  });
+});

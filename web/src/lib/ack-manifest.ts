@@ -1,0 +1,294 @@
+// ── EVERY MUTATION NAMES THE CHANNEL THAT ACKNOWLEDGES IT ────────────────────────────────────────
+//
+// issance has FOUR acknowledgement channels and they answer four different questions. One channel per
+// question — a control that reaches for two is saying the same thing twice, and one that reaches for
+// none has told the operator nothing (DESIGN.md §11):
+//
+//   • **Haptic buzz** — "did the glass register my tap?" Owned by hooks/use-action-echo.ts and
+//     hooks/use-hold-repeat.ts, fired ON THE PRESS and never on the outcome. Not a value below: it
+//     rides the echo and is never chosen per mutation.
+//   • **`"echo"`** — "did the bridge accept MY action?" The ✓ / spinner / busy tone AT THE CONTROL.
+//   • **`"status"`** — "what happened, and why not?" lib/status.ts, the floating layer.
+//   • **`"inline"`** — the same question, answered in the control's own chrome, because the answer
+//     outlives the operator's next interaction (a §11 contextual notice).
+//   • **`"silent"`** — nothing is said, ON PURPOSE, because the screen already said it.
+//
+// The issance orbit round is the fourth channel and appears nowhere here: it announces UNATTENDED
+// events — something that happened while the operator was not acting — so by construction no entry
+// in this file can own it.
+//
+// A `channel` names how ACCEPTANCE is acknowledged. Failure is `"status"` for everything, always,
+// with the single exception of `"inline"` (which moved the failure, not deleted it) — that rule is
+// not per-mutation and so is not restated per entry. lib/mutate.ts is the wrapper that keeps a throw
+// from being swallowed where a call site has no error surface of its own.
+//
+// ── WHAT THIS FILE IS FOR, AND WHAT IT CANNOT DO ─────────────────────────────────────────────────
+//
+// It cannot verify that anything renders. No test here mounts a control, and none could: the
+// acknowledgement for `closePane` is a spinner in a bottom sheet three components away, and
+// asserting on it from a manifest would be asserting on a mock of itself.
+//
+// What it does is exactly what the crew-wire guard does for a protocol change (ADR 0025 — "the guard
+// checks that a decision was recorded; it never says which one is right"). Add a mutating export to
+// lib/api.ts next month and ack-manifest.test.ts FAILS until you write one classified line here. The
+// line is then in the diff, and it gets reviewed. The guard cannot do the work for you; it can
+// refuse to let you skip the decision. The failure mode it exists to prevent is not somebody
+// classifying wrongly — it is somebody adding `POST /api/thing`, never once framing "how does the
+// operator learn this landed?" as a question, and shipping a control that is silent on success and
+// silent on failure. That was the state of three call sites before this file existed.
+//
+// The `why` is mandatory on EVERY entry, not only on `"silent"`. `"silent"` is the entry that most
+// obviously needs defending, but "echo" and "status" are each a claim about where the operator is
+// looking when the answer arrives, and a claim with no sentence under it is the one that rots first.
+
+/** The four values an entry may take. `"silent"` is a decision, never a default. */
+export type AckChannel = "echo" | "status" | "inline" | "silent";
+
+export interface AckEntry {
+  channel: AckChannel;
+  /** One line. Why THIS channel, in terms of where the operator is looking and what they'd otherwise
+   *  be left believing. Required — see the header. */
+  why: string;
+}
+
+/**
+ * One entry per mutating export of lib/api.ts. Keyed by the exported name, because that is what
+ * ack-manifest.test.ts reads back out of the source; a rename is a manifest edit.
+ */
+export const ACK_MANIFEST = {
+  sendReply: {
+    channel: "echo",
+    why: "The composer empties and the sent text appears in the mirror; the Send button holds its busy tone until the bridge has verified the reply landed (lib/reply-action.ts).",
+  },
+  postSend: {
+    channel: "echo",
+    why: "The Send Protocol's request (M56 spec 05): the Send button holds its busy tone until the bridge answers with a receipt; a sent text empties the composer and appears in the mirror, any other outcome lands as a status line and, where it has one, an offer strip at the thumb.",
+  },
+  postProgramSend: {
+    channel: "echo",
+    why: "The Send Protocol's request for a program on this machine (M56 spec 14): the field holds Sending until the bridge answers; a sent text moves to the thread as a pending line the program's own line replaces, and any other outcome lands at the thumb as the terminal composer's notice.",
+  },
+  postWalky: {
+    channel: "inline",
+    why: "An operator message (M62): the receipt's state, in words, stands beside the composer box (or in the Crew sheet's receipt rows) until it is dismissed, because a message that was kept in the inbox or refused is something the operator must read and act on, and a status line would be gone by then.",
+  },
+  cancelHeldSend: {
+    channel: "silent",
+    why: "Cancel or Dismiss on a held send's queued row (M56 spec 15): the row leaving the composer IS the receipt, so a success says nothing more; a Cancel that came too late, and a failed call, land as a status line.",
+  },
+  postAskAnswer: {
+    channel: "echo",
+    why: "A tap on a dialog card as one Answer to the bridge's ask (M56 spec 08): a sent answer reads as Sent and the mirror shows the dialog moving on; a changed or gone dialog lands as a status line and the card redraws from the next read.",
+  },
+  sendKeys: {
+    channel: "echo",
+    // TWO paths reach this one export, and the second is the reason `"silent"` is a real value in
+    // this file. An IMMEDIATE press echoes on its own button. A STAGED press does not, and the
+    // sentence that earns it was written at components/nav-tray.tsx (`sendQueue`) before this
+    // manifest existed — it is quoted below because this is now where a claim like that is reviewed:
+    //
+    //     "`take()` empties the queue synchronously, so the chips vanishing IS the receipt (and the
+    //      strip itself unmounts unless a locked modifier holds it open) — a spinner there would
+    //      have nothing left to render on."
+    //
+    // The entry is classified `"echo"` rather than `"silent"` because the classification names the
+    // channel the EXPORT is acknowledged on, and the immediate path is the one that owns a control
+    // with a phase to show. The staged path is silent by the argument above and nothing else.
+    why: "The pressed key fills accent and takes a ✓ (components/nav-tray.tsx); the mirror is the truth about what the key DID but can be ~2s behind, which is the silence useActionEcho was built to end. The staged queue's Send stays silent — see the note above it.",
+  },
+  refreshNow: {
+    channel: "silent",
+    why: "It cannot fail in a way the operator could act on: it swallows its own throw by design (see its doc in lib/api.ts), and the revalidation that every caller runs immediately after is what reports the herd as it actually is.",
+  },
+  fetchFilesExist: {
+    channel: "silent",
+    why: "A read that POSTs only because its paths ride in the body (ADR 0088): it changes nothing, so there is nothing to acknowledge. Its whole answer is which printed paths become links, and a failure draws them as plain text.",
+  },
+  closePane: {
+    channel: "echo",
+    why: "The pane VANISHING from the strip is the outcome, so the echo carries only the acceptance — a success status would announce a fact the screen is already making, and the pane sheet closes before it could be read anyway.",
+  },
+  focusPane: {
+    channel: "status",
+    why: "The one act whose outcome lands on a screen the operator is not looking at (the terminal, ADR 0031) — nothing here can show it, so the phone has to say it.",
+  },
+  renamePane: {
+    channel: "status",
+    why: "The sheet closes on success and the new label only reaches the strip on the next poll, so at the moment of the tap there is nothing on screen that changed.",
+  },
+  renameTab: {
+    channel: "status",
+    why: "Same as renamePane, one dimension up: the sheet is gone and the tab strip has not re-rendered yet.",
+  },
+  renameSpace: {
+    channel: "status",
+    why: "Same as renameTab, one dimension up again: the sheet is gone and the space strip has not re-rendered yet.",
+  },
+  reopenDurableConversation: {
+    channel: "silent",
+    why: "Success moves the screen: the person lands on the reopened pane, or back on the list, which is the acknowledgement. A refusal says why on the status line, and the Reopen button stays pressable for another try.",
+  },
+  closeTab: {
+    channel: "echo",
+    // TWO paths reach this export and they are acknowledged differently, the same way `sendKeys`
+    // above is. Closing ANOTHER tab is the plain case the entry describes. Closing the tab you are
+    // IN also NAVIGATES you — components/agent-chat.tsx's `closeCurrentTab` lands you on a
+    // neighbouring tab of the space, or Home — and that is the `createTab` case, not this one: the
+    // eye has already left the control, so an echo on a button inside a strip that is unmounting is
+    // an acknowledgement drawn where nobody can be looking. That path therefore ALSO publishes a
+    // status, which turns the mark's orbit one round.
+    //
+    // It stays classified `"echo"` because the classification names the channel the EXPORT is
+    // acknowledged on, and the plain close is the path that owns a control with a phase to show —
+    // the same reading `sendKeys` takes. The operator found this: "when closing a tab btw the orbit
+    // is not spinning, why?"
+    why: "Same as closePane, and the blast radius makes it matter more: the tab leaving the strip is the outcome, the echo is the acceptance of a tap that kills every pane inside it. Closing the tab you are IN navigates, so that path adds a status — see the note above it.",
+  },
+  createTab: {
+    channel: "status",
+    why: "The app navigates to the new pane, so the operator's eye has already left the control that was tapped; the status line is what names WHAT was created on arrival (hooks/use-spaces.ts).",
+  },
+  createWorkspace: {
+    channel: "status",
+    why: "Same navigation, same reason — the created thing is a whole screen away from the button that asked for it.",
+  },
+  launch: {
+    channel: "status",
+    why: "A launcher creates a Space (dashboard) or a tab beside the pane you launched it from (switcher), and the app navigates straight into its pane either way, so the button that asked is already off screen; hooks/use-spaces.ts names what was created on arrival, exactly as createWorkspace does. A refusal (an unlisted row, an unknown pane, a failed send) has no control left to sit in either.",
+  },
+  startLaunch: {
+    channel: "status",
+    why: "The New page's Start creates a space and the app navigates straight into its pane, so the page is already gone; hooks/use-spaces.ts `start` names a refusal on the status line as `launch` does. An answer that never came is the page's own notice and its Try again button instead (M48, ADR 0091): the status line could only guess whether the pane exists.",
+  },
+  startRun: {
+    channel: "status",
+    why: "A one-off run creates a space and the app navigates straight into its pane, exactly as `startLaunch` does, so the page is already gone; a refusal names the switch, the device or the character the bridge refused on the status line. An answer that never came is the page's own notice and its Try again button, with the same request id (ADR 0091, ADR 0095).",
+  },
+  checkRun: {
+    channel: "inline",
+    why: "A read asked on Start for a typed line: it runs and stores nothing. Its answer (a character the bridge refuses, or whether the line skips prompts) goes straight into the New page's own refusal notice and the confirm sheet, so the person reads it beside the field they are fixing (ADR 0095, amendment).",
+  },
+  removeRecentRun: {
+    channel: "silent",
+    why: "The line leaves the history under the thumb once the bridge answers; a refusal publishes an error status through lib/mutate.ts and the history is read again (ADR 0095).",
+  },
+  clearRecentRuns: {
+    channel: "silent",
+    why: "The history empties on the page the person is looking at once the bridge answers; a refusal publishes an error status through lib/mutate.ts and the history is read again (ADR 0095).",
+  },
+  removeSent: {
+    channel: "inline",
+    why: "The row leaves the Sent sheet under the thumb once the machine answers. A refusal or a lost answer must stay readable while the person decides what to do, so the sheet says it in its own notice and keeps the row (M61).",
+  },
+  clearSent: {
+    channel: "inline",
+    why: "The Sent sheet empties and reads the list again once the machine answers. A refusal or a lost answer is said in the sheet's own notice, beside the button that asked, and the lines stay (M61).",
+  },
+  addLauncher: {
+    channel: "inline",
+    why: "The added row appears in the list the person is looking at, so the list is the acceptance. A refusal names a field (a character the bridge refuses, a line too long) or a switch the operator turned off, and the person must still read it while they fix the line, so it sits in the add form itself and not on the status line (M48, ADR 0094).",
+  },
+  removeAddedLauncher: {
+    channel: "silent",
+    why: "The row leaves the list under the thumb once the bridge answers; a refusal publishes an error status through lib/mutate.ts and the list is read again.",
+  },
+  renameAddedLauncher: {
+    channel: "silent",
+    why: "The new label replaces the old one in the row being edited once the bridge answers; a refusal publishes an error status through lib/mutate.ts and the row keeps its old label.",
+  },
+  starFolder: {
+    channel: "silent",
+    why: "The row moves between Favourites and Recent and its star fills or empties under the thumb, both on the page the operator is looking at, once the bridge answers with the new list; a refusal publishes an error status through lib/mutate.ts and the list is read again (lib/folders.ts).",
+  },
+  createWorktreeAt: {
+    channel: "status",
+    why: "A branch arrives as a whole new space and the app navigates into its pane, so the eye has already left the New page; hooks/use-spaces.ts `start` names what was created on arrival, exactly as createWorkspace does. An answer that never came is the page's own notice instead (M48, ADR 0091), because the status line cannot say whether the start happened.",
+  },
+  setSnooze: {
+    channel: "echo",
+    why: "The spinner in the card is the acceptance and the revalidated description line under the title is the outcome, both inside the control the thumb is still on.",
+  },
+  setNotifyPrefs: {
+    channel: "echo",
+    why: "The switch flips optimistically under the thumb; the server's merged view then reconciles it, and a REVERT is paired with an error status because a switch that moves back in silence misinforms anyone who has stopped looking (hooks/use-notify-prefs.ts).",
+  },
+  setMachineAlerts: {
+    channel: "inline",
+    why: "The alert card shows Saving, Saved or Could not save in its own header and keeps the last stored rules on screen after a failure, because a rule that did not land has to stay visible next to the control that tried to set it (components/machine-alerts-control.tsx).",
+  },
+  setCacheWatch: {
+    channel: "echo",
+    why: "The sheet's switch flips optimistically under the thumb and the bridge's answer reconciles it; a revert is paired with an error status, for the reason `setNotifyPrefs` states (hooks/use-cache-watch.ts).",
+  },
+  forgetCacheWatch: {
+    channel: "echo",
+    why: "The row leaves the watched list synchronously, so the row VANISHING is the receipt; the bridge's returned list then reconciles it, and a failure puts the row back with an error status (hooks/use-cache-watch-list.ts).",
+  },
+  registerPushSubscription: {
+    channel: "inline",
+    why: "Settings switches on only after the bridge acknowledges registration; setup failures stay beside the switch so the operator can read them and retry (routes/settings.tsx).",
+  },
+  checkForUpdates: {
+    channel: "inline",
+    why: "The answer — up to date, an offer, or 'the check itself failed' — is a standing fact about this install that belongs in the card that states it, and it must not fade out from under the operator (components/update-check-control.tsx).",
+  },
+  startUpdate: {
+    channel: "inline",
+    why: "The answer is the run itself — a progress state that persists in the card for the length of a restart, or a refusal (a red preflight, a run already going) the operator has to read and act on. Neither survives a floating toast, and both belong beside the button that asked for them (components/update-card.tsx).",
+  },
+  startRollback: {
+    channel: "inline",
+    why: "The answer is the rollback run itself, followed in update mode through the same steps as an update (M60 spec 01), or a refusal (no previous build, a run already going) the operator reads on the confirm screen that asked. Neither survives a floating toast.",
+  },
+  setReleaseLine: {
+    channel: "inline",
+    why: "The answer is the line this machine is on now, and what that means for it (an Edge build ahead of Stable, a Stable offer above): a standing fact the Release line card states beside the two buttons, and a refusal the operator reads there too (components/release-line-card.tsx).",
+  },
+  startGoBack: {
+    channel: "inline",
+    why: "Like startRollback: the answer is the run itself, followed in update mode, or a refusal (no Stable to go back to, a run already going) read on the confirm screen that asked (M60 spec 01).",
+  },
+  snoozeUpdate: {
+    channel: "silent",
+    why: "\"Remind me next digest\" is answered by the card's own line changing to say so, in the same tap. A second acknowledgement of a dismissal is noise about noise.",
+  },
+  dismissUpdate: {
+    channel: "silent",
+    why: "The acknowledgement is the band leaving the screen, on the same tap. A toast confirming that a band was closed would be a notice about declining a notice, and the state it records is visible in its absence.",
+  },
+  pairDevice: {
+    channel: "inline",
+    why: "A mistyped or expired code is a refusal the operator fixes IN the form, one field away, so the sentence belongs beside the field rather than floating over the page (components/paired-devices.tsx).",
+  },
+  revokeDevice: {
+    channel: "inline",
+    why: "A failed revoke leaves the row it was aimed at still on screen, and that row is the only place the message is unambiguous about WHICH device is still paired.",
+  },
+  uploadFile: {
+    channel: "status",
+    why: "Success appends a host path to the draft, which is easy to miss in a box the operator was already typing in, so the status line names what just went into it (components/composer.tsx).",
+  },
+  transcribeAudio: {
+    channel: "echo",
+    why: "The mic strip's `transcribing` phase holds while the clip is in flight and the transcript landing in the composer is the outcome; every refusal comes back as a VALUE and is spoken by the composer's onError on the status channel (hooks/use-stt-recorder.ts).",
+  },
+  startWhistleSetup: {
+    channel: "inline",
+    why: "The Whistle card swaps the button for the host's own progress bar, and a refusal is written inside that card, where the person is still looking at the button they tapped.",
+  },
+  removeWhistleModel: {
+    channel: "inline",
+    why: "The two-tap confirm sits in the Whistle card and its outcome is the card itself going back to the setup button; a refusal is written under it.",
+  },
+  setSttHost: {
+    channel: "inline",
+    why: "The Host speech provider card is the acknowledgement: the chosen row turns selected and the status line names the provider the host answered with. A refusal (another provider set up in a terminal, no model, Codex not signed in, the probe refused) is written inside that card, or inside the consent sheet while it is open, because the reason is about that one choice.",
+  },
+  answerAsk: {
+    channel: "inline",
+    why: "The ask card is the acknowledgement: a taken answer closes it, and already answered, changed, may-not-have-arrived (Try again) and refused are written in the card itself, because each is about that one question and must outlast the next tap.",
+  },
+// `satisfies`, not an annotation: the KEYS stay known to the compiler (so a typo'd name is a type
+// error at any reader, rather than a silent `undefined`), while every entry is still checked against
+// the contract above. An open `Record<string, AckEntry>` annotation would throw that evidence away.
+} satisfies Record<string, AckEntry>;

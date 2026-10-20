@@ -1,0 +1,472 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+
+import { parseAnsi, type AnsiSegment } from "./ansi";
+import { dropLeadingLines, lineText, splitLines, type StyledLine } from "./blocks";
+import { buildBlocks } from "./harness";
+import { isBoxBorder, isHorizontalRule } from "./harness/claude/markers";
+
+// Anchored on this file's directory (not `new URL(import.meta.url)`, which Vite rewrites to an asset).
+const PANES_DIR = join(import.meta.dirname, "..", "fixtures", "panes");
+const fixtureLines = (name: string): StyledLine[] =>
+  splitLines(parseAnsi(readFileSync(join(PANES_DIR, name), "utf8")));
+const blockText = (lines: StyledLine[]) =>
+  lines.map((l) => l.segments.map((s) => s.text).join("")).join("\n");
+
+// splitLines is the seam between the ANSI parse and the renderer. Its load-bearing invariant (find
+// depends on it): joining every line's text with "\n" reproduces the original visible string
+// character-for-character. These tests pin that byte-fidelity across empty lines, trailing newlines,
+// and segments that carry newlines mid-run — plus that styling survives a split.
+
+const ESC = "\x1b";
+const PI_WORKING_EDITOR = "pi--v085-working-editor.txt";
+const PI_WIDTH = 94;
+const PI_TOP = `── ⠴ Working ${"─".repeat(81)}`;
+const PI_FIXTURE_BYTES = [
+  `${ESC}[2m── ${ESC}[0m${ESC}[36m⠴ Working ${ESC}[0m${ESC}[2m${"─".repeat(81)}${ESC}[0m`,
+  `${ESC}[0m${" ".repeat(PI_WIDTH)}${ESC}[0m`,
+  `${ESC}[2m${"─".repeat(PI_WIDTH)}${ESC}[0m`,
+].join("\n");
+
+/** Minimal styled segment for constructing inputs directly (bypassing the parser). */
+const seg = (text: string, extra: Partial<AnsiSegment> = {}): AnsiSegment => ({
+  text,
+  style: {},
+  muted: false,
+  ...extra,
+});
+
+/** Reconstruct the visible string the way find's coordinate space does: lines joined by "\n". */
+const joinLines = (lines: { segments: AnsiSegment[] }[]) =>
+  lines.map((l) => l.segments.map((s) => s.text).join("")).join("\n");
+
+describe("splitLines — exact text preservation", () => {
+  it("keeps a single newline-free line intact and reuses the segment object (no clone)", () => {
+    const s = seg("hello world");
+    const lines = splitLines([s]);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.segments[0]).toBe(s); // same reference — the no-allocation fast path
+    expect(joinLines(lines)).toBe("hello world");
+  });
+
+  it("yields a single empty line for no segments", () => {
+    const lines = splitLines([]);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.segments).toEqual([]);
+    expect(joinLines(lines)).toBe("");
+  });
+
+  it("represents a trailing newline as a terminating empty line", () => {
+    // Parser emits one segment per newline-terminated run: "a\n", "b\n".
+    const lines = splitLines([seg("a\n"), seg("b\n")]);
+    expect(lines).toHaveLength(3);
+    expect(lines.map((l) => l.segments.map((s) => s.text).join(""))).toEqual(["a", "b", ""]);
+    expect(lines[2]!.segments).toEqual([]); // the trailing blank carries no segment
+    expect(joinLines(lines)).toBe("a\nb\n");
+  });
+
+  it("preserves interior empty lines (adjacent newlines)", () => {
+    const lines = splitLines(parseAnsi("a\n\nb"));
+    expect(lines).toHaveLength(3);
+    expect(lines.map((l) => l.segments.map((s) => s.text).join(""))).toEqual(["a", "", "b"]);
+    expect(lines[1]!.segments).toEqual([]);
+    expect(joinLines(lines)).toBe("a\n\nb");
+  });
+
+  it("splits a single segment that spans multiple newlines into one line each", () => {
+    const lines = splitLines([seg("foo\nbar\nbaz")]);
+    expect(lines).toHaveLength(3);
+    expect(lines.map((l) => l.segments.map((s) => s.text).join(""))).toEqual(["foo", "bar", "baz"]);
+    expect(joinLines(lines)).toBe("foo\nbar\nbaz");
+  });
+
+  it("drops empty pieces from a leading newline but still opens a blank first line", () => {
+    const lines = splitLines([seg("\nx")]);
+    expect(lines).toHaveLength(2);
+    expect(lines[0]!.segments).toEqual([]);
+    expect(lines[1]!.segments.map((s) => s.text)).toEqual(["x"]);
+    expect(joinLines(lines)).toBe("\nx");
+  });
+
+  it("keeps a styled segment's style/flags on both sides when split across a newline", () => {
+    const styled = seg("red1\nred2", {
+      fg: "var(--ansi-1)",
+      bold: true,
+      muted: false,
+      style: { color: "var(--ansi-1)", fontWeight: 600 },
+    });
+    const lines = splitLines([styled]);
+    expect(lines).toHaveLength(2);
+    const [a, b] = [lines[0]!.segments[0]!, lines[1]!.segments[0]!];
+    expect([a.text, b.text]).toEqual(["red1", "red2"]);
+    // Both halves carry the original style metadata (cloned, not the same reference).
+    for (const half of [a, b]) {
+      expect(half.fg).toBe("var(--ansi-1)");
+      expect(half.bold).toBe(true);
+      expect(half.style).toEqual({ color: "var(--ansi-1)", fontWeight: 600 });
+    }
+    expect(joinLines(lines)).toBe("red1\nred2");
+  });
+});
+
+describe("splitLines — no-wrap terminal borders", () => {
+  // This is the complete horizontal subset of the established Claude rule contract. Keep it
+  // independent from the clipping classifier so adding a Claude-accepted horizontal glyph cannot
+  // silently leave it wrapping. Corners, junctions, and vertical box drawing are deliberately absent.
+  const pureHorizontalRuleGlyphs = [
+    ..."─━┄┅┈┉╌╍═╴╶╸╺╼╾",
+    ...Array.from({ length: 0x2594 - 0x2581 + 1 }, (_, i) => String.fromCodePoint(0x2581 + i)),
+    ..."‒–—―",
+  ];
+
+  it("clips every established pure horizontal rule glyph only at the long-border threshold", () => {
+    for (const glyph of pureHorizontalRuleGlyphs) {
+      // Claude recognizes rules at three glyphs; visual clipping remains intentionally stricter.
+      expect(isHorizontalRule(glyph.repeat(3)), glyph).toBe(true);
+      expect(splitLines(parseAnsi(glyph.repeat(19)))[0]!.noWrap, glyph).toBeUndefined();
+      expect(splitLines(parseAnsi(glyph.repeat(20)))[0]!.noWrap, glyph).toBe(true);
+    }
+  });
+
+  it("marks an ANSI-segmented border", () => {
+    const border = "─".repeat(20);
+    const ansi = splitLines(parseAnsi(`${ESC}[31m${border.slice(0, 10)}${ESC}[34m${border.slice(10)}${ESC}[0m`))[0]!;
+
+    expect(ansi.noWrap).toBe(true);
+    expect(ansi.segments).toHaveLength(2);
+    expect(joinLines([ansi])).toBe(border);
+  });
+
+  it("clips at twenty glyphs and not below", () => {
+    expect(splitLines(parseAnsi("─".repeat(19)))[0]!.noWrap).toBeUndefined();
+    expect(splitLines(parseAnsi("─".repeat(20)))[0]!.noWrap).toBe(true);
+  });
+
+  // The clip rule and the input-box grammar both call a line a "border", for different consumers
+  // (see rule-glyphs.ts). A labelled border is the case where they must visibly disagree: the guard
+  // has to recognise it, and clipping it would crop the session label out of view. Pinned across
+  // both modules so a future edit to either cannot quietly align them.
+  it("never clips a labelled input-box border the guard depends on", () => {
+    const labelled = `${"─".repeat(20)} japanese technical troubleshooting ${"─".repeat(2)}`;
+    expect(isBoxBorder(labelled)).toBe(true);
+    expect(splitLines(parseAnsi(labelled))[0]!.noWrap).toBeUndefined();
+  });
+
+  it.each([
+    ["short Unicode rule", "─".repeat(19)],
+    ["ASCII rule", "-".repeat(40)],
+    ["labeled border", `${"─".repeat(20)} Pi ${"─".repeat(20)}`],
+    ["mixed rule row", "─".repeat(19) + "╌"],
+    ["mixed content", `${"─".repeat(20)}x`],
+    ["prose", "This ordinary prose should retain its normal wrapping behavior."],
+  ])("does not mark %s", (_name, text) => {
+    expect(splitLines(parseAnsi(text))[0]!.noWrap).toBeUndefined();
+  });
+});
+
+describe("splitLines — labelled terminal rules", () => {
+  const labelled = (lead: string, label: string, tail: string, outer = "") =>
+    `${outer}${lead} ${label} ${tail}${outer}`;
+
+  it("keeps the reconstructed Pi editor byte-faithful and refines only its rule runs", () => {
+    const raw = readFileSync(join(PANES_DIR, PI_WORKING_EDITOR), "utf8");
+    const lines = fixtureLines(PI_WORKING_EDITOR);
+
+    expect(raw).toBe(PI_FIXTURE_BYTES);
+    expect(lines.map((line) => line.noWrap)).toEqual([true, undefined, true]);
+    expect(lines.map(lineText)).toEqual([PI_TOP, " ".repeat(PI_WIDTH), "─".repeat(PI_WIDTH)]);
+    expect(lines.map((line) => line.segments.map((segment) => segment.text))).toEqual([
+      ["──", " ", "⠴ Working ", "─".repeat(81)],
+      [" ".repeat(PI_WIDTH)],
+      ["─".repeat(PI_WIDTH)],
+    ]);
+    expect(lines[0]!.segments.map((segment) => segment.muted)).toEqual([true, false, false, true]);
+    expect(lines[1]!.segments[0]!.muted).toBe(false); // editor padding remains untouched
+
+    // These three rows are a pi editor with no status row under it. Since PR 450 (issue 445) the
+    // reader finds that editor, so the composer owns the rows and the raw block is empty. Before it,
+    // those rows stayed in the thread as the raw block.
+    const blocks = buildBlocks(lines, { agent: "pi" });
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]!.kind).toBe("raw");
+    if (blocks[0]!.kind !== "raw") throw new Error("expected a raw block");
+    expect(blocks[0]!.lines).toEqual([]);
+  });
+
+  it("refines live-shaped ANSI boundaries without changing the coloured spinner or label", () => {
+    const purple = "rgb(209,131,232)";
+    const tail = "─".repeat(20);
+    const parsed = parseAnsi(
+      `${ESC}[0m${ESC}[38;2;209;131;232m── ⠴${ESC}[0m ${ESC}[0m${ESC}[38;2;209;131;232mWorking ${tail}${ESC}[0m`,
+    );
+    const row = splitLines(parsed)[0]!;
+
+    expect(row.noWrap).toBe(true);
+    expect(row.segments.map((segment) => segment.text)).toEqual(["──", " ⠴", " ", "Working ", tail]);
+    expect(row.segments.map((segment) => segment.muted)).toEqual([true, false, false, false, true]);
+    expect(row.segments.map((segment) => segment.fg)).toEqual([purple, purple, undefined, purple, purple]);
+    // Refinement changes only text/muted at the cut: all ANSI style objects remain those the parser made.
+    expect(row.segments[0]!.style).toBe(parsed[0]!.style);
+    expect(row.segments[1]!.style).toBe(parsed[0]!.style);
+    expect(row.segments[2]).toBe(parsed[1]);
+    expect(row.segments[3]!.style).toBe(parsed[2]!.style);
+    expect(row.segments[4]!.style).toBe(parsed[2]!.style);
+  });
+
+  it("keeps the existing Codex labelled rule clipped while preserving its dim label", () => {
+    const blocks = buildBlocks(fixtureLines("codex--submitted-fill-labelled-rule.txt"), { agent: "codex" });
+    const raw = blocks.find((block) => block.kind === "raw");
+
+    expect(raw?.kind).toBe("raw");
+    if (raw?.kind !== "raw") return;
+    const rule = raw.lines.find((line) => lineText(line).includes("Worked for 3m 12s"));
+    expect(rule?.noWrap).toBe(true);
+    expect(rule?.segments.map((segment) => segment.text)).toEqual([
+      "─",
+      " Worked for 3m 12s ",
+      "─".repeat(80),
+    ]);
+    expect(rule?.segments.map((segment) => segment.muted)).toEqual([true, false, true]);
+    expect(rule?.segments[1]!.dim).toBe(true);
+    expect(rule?.segments[1]!.style.opacity).toBe(0.6);
+  });
+
+  it.each([
+    ["one leading glyph and twenty trailing glyphs", labelled("─", "label", "─".repeat(20))],
+    [
+      "four leading glyphs, a different trailing glyph, and outer whitespace",
+      labelled("━".repeat(4), "two words", "─".repeat(20), "\t "),
+    ],
+  ])("marks %s", (_name, text) => {
+    expect(splitLines(parseAnsi(text))[0]!.noWrap).toBe(true);
+  });
+
+  it("leaves a rejected shape unsplit with its segment identity intact", () => {
+    const segments = parseAnsi(`${ESC}[38;2;209;131;232m${labelled("─".repeat(5), "label", "─".repeat(20))}${ESC}[0m`);
+    const line = splitLines(segments)[0]!;
+
+    expect(line.noWrap).toBeUndefined();
+    expect(line.segments).toHaveLength(1);
+    expect(line.segments[0]).toBe(segments[0]);
+  });
+
+  it.each([
+    ["an empty label", labelled("─", "", "─".repeat(20))],
+    ["a five-glyph leading run", labelled("─".repeat(5), "label", "─".repeat(20))],
+    ["mixed leading glyphs", labelled("─━", "label", "─".repeat(20))],
+    ["a nineteen-glyph trailing run", labelled("─", "label", "─".repeat(19))],
+    ["mixed trailing glyphs", labelled("─", "label", `${"─".repeat(19)}━`)],
+    ["a label carrying a rule glyph", labelled("─", "a ─ b", "─".repeat(20))],
+    ["a tab before the label where ASCII spaces are required", `─\tlabel ${"─".repeat(20)}`],
+    ["a tab after the label where ASCII spaces are required", `─ label\t${"─".repeat(20)}`],
+    ["ASCII hyphens", labelled("-", "label", "-".repeat(20))],
+    ["a table row with a long inner rule", `| id | ${"─".repeat(40)} | note |`],
+    ["a rule with text after it", `${"─".repeat(40)} and then some prose about it`],
+  ])("leaves %s wrapping", (_name, text) => {
+    expect(splitLines(parseAnsi(text))[0]!.noWrap).toBeUndefined();
+  });
+});
+
+// A framed ROW, not a rule: both edges are frame glyphs. Wrapping one on a ~45-column phone mirror
+// splits a desktop-width menu across two or three visual lines, which scrambles the frame and shreds
+// the inverse-video selection the operator is steering with the Keys pad (issue #156). The rule is
+// deliberately blind to length and content — a frame is a frame at any width — and needs BOTH edges,
+// which is what keeps `tree` output (a leading "│" and nothing at the end) wrapping as prose does.
+describe("splitLines — no-wrap frame rows", () => {
+  it.each([
+    ["menu row with a selection marker", "│ ▸ gpt-5  │"],
+    ["menu row, unselected", "│   gpt-5-codex                        │"],
+    ["table edge", `┌${"─".repeat(40)}┐`],
+    ["separator row", `├${"─".repeat(40)}┤`],
+    ["heavy separator row", "┣━━┫"],
+    ["heavy frame row", "┏ build ┓"],
+    ["double frame row", "╔ status ╗"],
+    ["indented frame row", "    │ nested menu entry │"],
+    ["frame row with trailing spaces", "│ entry │   "],
+    ["corner row", "┌".repeat(40)],
+    ["vertical row", "│".repeat(40)],
+  ])("marks %s", (_name, text) => {
+    expect(splitLines(parseAnsi(text))[0]!.noWrap).toBe(true);
+  });
+
+  it.each([
+    ["tree branch (leading edge only)", "│   ├── use-polling.ts"],
+    ["tree trunk (leading edge only)", "│"],
+    ["prose", "This ordinary prose should retain its normal wrapping behavior."],
+    ["prose that merely mentions a pipe", "the pipe │ is in the middle of this sentence"],
+    ["trailing edge only", "some text ending in a corner ┘"],
+  ])("does not mark %s", (_name, text) => {
+    expect(splitLines(parseAnsi(text))[0]!.noWrap).toBeUndefined();
+  });
+
+  it("marks a frame row split across ANSI segments (the inverse-video selection)", () => {
+    const row = splitLines(parseAnsi(`│ ${ESC}[7m▸ gpt-5${ESC}[0m  │`))[0]!;
+
+    expect(row.noWrap).toBe(true);
+    expect(joinLines([row])).toBe("│ ▸ gpt-5  │");
+  });
+});
+
+describe("splitLines — round-trips the parser's visible text (find coordinate space)", () => {
+  const cases = [
+    "hello world",
+    "line1\nline2\nline3",
+    "a\n\nb", // interior blank
+    "done\n", // trailing newline
+    "\nleading", // leading newline
+    `${ESC}[31mred\nstill red${ESC}[0m\nplain`, // styling across newlines
+    "line one\r\nline two\r\n", // CRLF (parser normalises the \r away)
+  ];
+  for (const input of cases) {
+    it(`join(splitLines) === visible text for ${JSON.stringify(input)}`, () => {
+      const segments = parseAnsi(input);
+      const visible = segments.map((s) => s.text).join("");
+      expect(joinLines(splitLines(segments))).toBe(visible);
+    });
+  }
+});
+
+describe("buildBlocks", () => {
+  it("wraps all lines in a single raw block spanning the full range", () => {
+    const lines = splitLines(parseAnsi("a\nb\nc"));
+    const blocks = buildBlocks(lines);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]!.kind).toBe("raw");
+    expect(blocks[0]!.lines).toBe(lines); // the same line array — covers every line
+    expect(blocks[0]!.lines).toHaveLength(3);
+  });
+
+  it("still emits one raw block (with one empty line) for empty input", () => {
+    const blocks = buildBlocks(splitLines(parseAnsi("")));
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]!.kind).toBe("raw");
+    expect(blocks[0]!.lines).toEqual([{ segments: [] }]);
+  });
+});
+
+describe("buildBlocks — Claude grammars (ctx.agent === 'claude')", () => {
+  it("splits a tail menu into [raw before, prompt-select], the whole dialog inside the card's region", () => {
+    const lines = fixtureLines("claude--select-menu.txt");
+    const blocks = buildBlocks(lines, { agent: "claude" });
+    expect(blocks.map((b) => b.kind)).toEqual(["raw", "prompt-select"]);
+
+    const raw = blocks[0]!;
+    const prompt = blocks[1]!;
+    if (raw.kind !== "raw" || prompt.kind !== "prompt-select") throw new Error("unexpected block kinds");
+    // The region starts at the dialog's own top edge, so the question is in the card's region, which
+    // the card shows as text, and not in the raw block above it: shown once, not twice. It used to
+    // stay raw, which the docked card (ADR 0059) and the Chat view no longer show.
+    expect(blockText(raw.lines)).not.toContain("Which color theme should the dashboard use?");
+    expect(blockText(prompt.lines)).toContain("Which color theme should the dashboard use?");
+    expect(prompt.prompt.question).toBe("Which color theme should the dashboard use?");
+    // The typed payload carries the detected model + the raw region it replaced.
+    expect(prompt.prompt.family).toBe("select");
+    expect(prompt.prompt.options.map((o) => o.label)).toEqual(["Red", "Green", "Blue", "Chat about this"]);
+    expect(blockText(prompt.lines)).toContain("Enter to select"); // the replaced footer lives here
+  });
+
+  it("keeps the plan fixture's long dashed separators as clipped raw rows", () => {
+    const blocks = buildBlocks(fixtureLines("claude--plan-approval.txt"), { agent: "claude" });
+    const raw = blocks[0]!;
+    if (raw.kind !== "raw") throw new Error("expected raw scrollback before the plan prompt");
+
+    const dashedRules = raw.lines.filter((line) => lineText(line).trim().startsWith("╌"));
+    expect(dashedRules).toHaveLength(2);
+    expect(dashedRules.every((line) => line.noWrap)).toBe(true);
+  });
+
+  it("strips trailing input-box chrome when there is no menu (single raw block)", () => {
+    const lines = fixtureLines("claude--fresh-idle.txt");
+    const blocks = buildBlocks(lines, { agent: "claude" });
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]!.kind).toBe("raw");
+    const kept = blockText(blocks[0]!.lines);
+    expect(kept).toContain("Welcome back Altan!");
+    expect(kept).not.toContain("← for agents"); // the input-box statusline/hint is gone
+    expect(blocks[0]!.lines.length).toBeLessThan(lines.length);
+  });
+
+  // "No adapter", not "non-Claude": omp is a non-Claude agent that DOES have one (it just up-levels
+  // nothing). What gates these grammars is the registry lookup, not the string "claude".
+  it("leaves an agent with no adapter as a single untouched raw block (conservative gating)", () => {
+    const lines = fixtureLines("claude--select-menu.txt");
+    // opencode: a real agent kind with NO adapter (codex graduated to one and no longer works here).
+    const blocks = buildBlocks(lines, { agent: "opencode" });
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]!.kind).toBe("raw");
+    expect(blocks.some((b) => b.kind === "prompt-select")).toBe(false); // NO menu lifting without an adapter
+    // opencode is not a native mirror, so no display pass runs here either: the lines come
+    // back exactly as they went in, and the light-theme inversion does the work downstream.
+    expect(blocks[0]!.lines.map(lineText)).toEqual(lines.map(lineText));
+  });
+
+  // The hasBlockGrammar gate is provably per-adapter: the SAME menu-shaped buffer that Claude lifts
+  // into a prompt-select stays a single raw block for a codex agent (above) AND for an unknown/absent
+  // agent (below) — the universal fallback. No Claude-tuned matcher ever runs on them.
+  it("leaves a menu-shaped buffer raw for an unknown/absent agent (universal fallback)", () => {
+    const lines = fixtureLines("claude--select-menu.txt");
+    const blocks = buildBlocks(lines, { agent: undefined });
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]!.kind).toBe("raw");
+    expect(blocks.some((b) => b.kind === "prompt-select")).toBe(false);
+    expect(blocks[0]!.lines).toBe(lines); // untouched — same reference
+  });
+
+  it("splits a multi-question wizard tail into [raw before, wizard] at the stepper header", () => {
+    const lines = fixtureLines("claude--wizard-q2.txt");
+    const blocks = buildBlocks(lines, { agent: "claude" });
+    expect(blocks.map((b) => b.kind)).toEqual(["raw", "wizard"]);
+
+    const raw = blocks[0]!;
+    const wizard = blocks[1]!;
+    if (raw.kind !== "raw" || wizard.kind !== "wizard") throw new Error("unexpected block kinds");
+    // Everything from the stepper down is consumed into the wizard block; scrollback stays raw.
+    expect(blockText(raw.lines)).not.toContain("What scope should this work have?");
+    expect(wizard.wizard.phase).toBe("question");
+    expect(blockText(wizard.lines)).toContain("Enter to select"); // the replaced footer lives here
+  });
+
+  it("lifts the Submit review step (which has no footer) into a wizard block too", () => {
+    const blocks = buildBlocks(fixtureLines("claude--wizard-submit.txt"), { agent: "claude" });
+    const wizard = blocks[blocks.length - 1]!;
+    if (wizard.kind !== "wizard") throw new Error("expected a wizard tail block");
+    expect(wizard.wizard.phase).toBe("review");
+  });
+
+  it("lifts no wizard from a Claude buffer for a non-Claude agent", () => {
+    const lines = fixtureLines("claude--wizard-q1.txt");
+    const blocks = buildBlocks(lines, { agent: "codex" });
+    expect(blocks).toHaveLength(1);
+    // Not `raw`: since M34 an adapter that reads nothing on a screen its own `composerReady` says it
+    // cannot type into gets the unread-dialog card over it (.adr/0053). That is not a lift — the
+    // card parses nothing and carries the region through by reference — and the fail-closed claim
+    // here is that codex's grammars still found no dialog.
+    expect(blocks[0]!.kind).toBe("unread-dialog");
+    expect(blocks[0]!.lines).toEqual(lines);
+  });
+});
+
+// The render-only subtraction behind the "Full reply" card: the message is being drawn from the
+// journal, so the terminal rows it covers come off the top of the mirror rather than printing twice.
+describe("dropLeadingLines", () => {
+  const raw = (...texts: string[]) => ({ kind: "raw" as const, lines: texts.map((t) => ({ segments: [seg(t)] })) });
+  const texts = (blocks: ReturnType<typeof raw>[]) => blocks.map((b) => b.lines.map(lineText));
+
+  it("drops rows off the top of the leading block", () => {
+    expect(texts(dropLeadingLines([raw("a", "b", "c", "d")], 2))).toEqual([["c", "d"]]);
+  });
+
+  it("keeps counting across blocks once one is used up", () => {
+    expect(texts(dropLeadingLines([raw("a", "b"), raw("c", "d")], 3))).toEqual([["d"]]);
+  });
+
+  it("leaves nothing behind when the count covers everything — the <pre> then renders not at all", () => {
+    expect(dropLeadingLines([raw("a", "b")], 5)).toEqual([]);
+  });
+
+  it("is the identity for a count of zero, reference and all", () => {
+    const blocks = [raw("a", "b")];
+    expect(dropLeadingLines(blocks, 0)).toBe(blocks);
+  });
+});

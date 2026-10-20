@@ -1,0 +1,582 @@
+import { join } from "node:path";
+
+import { HOST, type Host } from "../host.ts";
+import type { JsonValue } from "../json.ts";
+import { hasHiddenLabelChar } from "../pairing.ts";
+import { diskIo, type OperatorFileIo } from "../operator-file.ts";
+import { jsonRecord, jsonStringField } from "./json.ts";
+
+// ── WHERE THE SPEECH-TO-TEXT SETTINGS COME FROM ──────────────────────────────────────────────
+//
+// Two sources, in one fixed order: `<stateDir>/stt.json`, then the environment on top of it,
+// field by field. The environment wins because it is the deployment's own statement — a systemd
+// drop-in or a Hangar plugin setting has to be able to point a checkout at a different endpoint
+// without editing state the CLI owns.
+//
+// The file lives in the STATE dir rather than beside the operator's `.env`, for the reason pairing
+// does: it can hold a credential, so it is written 0600 into a 0700 directory by `issance stt setup`
+// and is never an operator-authored TOML anyone is invited to hand-edit. Nothing here writes it —
+// this module only ever reads.
+//
+// It is re-read at request time behind an mtime check, exactly like `commands.toml` (and through
+// the very same {@link OperatorFileIo} seam), so `issance stt setup` goes live with no restart. The
+// path is derived from the state dir at startup and is NEVER client-supplied.
+//
+// A malformed file is a HOLD, never a 500: the last good settings keep serving, warned once per
+// change rather than once per request. Feature-on is not a switch — it is "a provider resolved".
+
+/** The file under the state dir holding the speech-to-text settings. */
+export const STT_FILENAME = "stt.json";
+
+/**
+ * issance's default model once an OpenAI-compatible endpoint is configured.
+ *
+ * It is a DEFAULT, not a pin: `issance stt setup` writes the model into `stt.json` only when the
+ * operator named one, so an install that took the default follows this constant when it moves. That
+ * is deliberate — it is how a bridge update carries a better model to somebody who never expressed
+ * a preference — and it is why the value here has to stay one an arbitrary OpenAI-compatible
+ * endpoint might not know. It is only ever reached by an endpoint the operator chose.
+ *
+ * `gpt-4o-transcribe` held this name until 2026-08-28. Its successor is cheaper, scores better, and
+ * takes the same request, so there was nothing to weigh.
+ */
+export const DEFAULT_STT_MODEL = "gpt-transcribe";
+
+/** The provider names this bridge can build. */
+export const STT_PROVIDERS = ["openai-compatible", "codex", "local-cli", "whistle"] as const;
+export type SttProviderName = (typeof STT_PROVIDERS)[number];
+
+/** The binary the codex provider borrows its auth from, when the operator names no other. */
+export const DEFAULT_CODEX_BIN = "codex";
+
+/**
+ * Which identity the codex provider wears on the wire (ADR 0029).
+ *
+ *  - `honest`   — `User-Agent: issance/<version>` and NO `originator` header. Always tried first.
+ *  - `codex-cli` — the Codex CLI's own headers, verbatim. Only ever reached because
+ *    `issance stt setup` probed the endpoint, found `honest` refused, and WROTE this word into
+ *    `stt.json` where the operator can read it back. It is never a default and never inferred at
+ *    request time — the whole difference between this provider and the one that was declined is
+ *    that the impersonation is a recorded, readable choice.
+ */
+export const STT_WIRE_IDENTITIES = ["honest", "codex-cli"] as const;
+export type SttWireIdentity = (typeof STT_WIRE_IDENTITIES)[number];
+
+/** One configured OpenAI-compatible endpoint. */
+export interface OpenAiSttSettings {
+  provider: "openai-compatible";
+  /**
+   * The API base INCLUDING its version prefix (`https://api.openai.com/v1`), with no trailing
+   * slash — the provider appends `/audio/transcriptions` itself.
+   */
+  baseUrl: string;
+  /** The model the endpoint understands. Always resolved; {@link DEFAULT_STT_MODEL} when unstated. */
+  model: string;
+  /**
+   * The bearer credential, when there is one. ABSENT is a supported mode, not a mistake: a
+   * self-hosted endpoint on the tailnet may take no authentication at all, and the provider then
+   * sends no `Authorization` header rather than an empty one.
+   */
+  apiKey?: string;
+  /**
+   * The language the operator speaks, as ISO-639-1 (`en`, `de`, `tr`), or ABSENT for auto-detect.
+   *
+   * Absent is the default and stays the default: a transcription model detects the language itself,
+   * and somebody who mixes two languages in one sentence needs it to keep doing that. It is worth
+   * setting only for the failure this field exists for — a SHORT clip in an accented voice, where
+   * there is too little audio to detect from and the model answers in the wrong language entirely.
+   */
+  language?: string;
+}
+
+/**
+ * The codex provider, configured.
+ *
+ * It holds NO credential of its own — that is the point of it. Everything here is about which
+ * binary to borrow the operator's ChatGPT session from and what to say about ourselves while using
+ * it; the token is fetched per use, lives in memory, and is never written anywhere.
+ */
+export interface CodexSttSettings {
+  provider: "codex";
+  /**
+   * The `codex` binary to spawn `app-server` from. Always resolved; {@link DEFAULT_CODEX_BIN} when
+   * unstated, which is a bare name and therefore resolved from the service's own `PATH`.
+   */
+  codexBin: string;
+  /** Always resolved; `honest` when unstated. See {@link STT_WIRE_IDENTITIES}. */
+  wireIdentity: SttWireIdentity;
+}
+
+/**
+ * The most arguments `local-cli` will put in front of the recording's path. A transcription command
+ * needs a verb and a few flags; a list longer than this is a hand-edit gone wrong, not a use case.
+ */
+export const MAX_LOCAL_CLI_ARGS = 32;
+
+/**
+ * The `local-cli` provider, configured (#227).
+ *
+ * issance runs `command`, then each of `args`, then the path of a temporary file it named itself,
+ * as an argv array and never through a shell. Both fields come from `stt.json` (0600, written by
+ * `issance stt setup`) or the deployment's own environment; nothing a request carries reaches them.
+ */
+export interface LocalCliSttSettings {
+  provider: "local-cli";
+  /**
+   * The program to run: an absolute path, or a bare name resolved from the service's own `PATH`.
+   * `issance stt setup` writes the absolute path it found, because a systemd user unit's `PATH` is
+   * minimal. A relative path with a slash is refused: it would mean whatever the bridge's cwd says.
+   */
+  command: string;
+  /** The arguments before the recording's path. Empty when the command takes the path alone. */
+  args: string[];
+}
+
+/**
+ * The `whistle` provider, configured (ADR 0096 Decision 4). Naming it is the whole configuration:
+ * the engine is issance's own vendored code, the model sits at a fixed path in the state dir, and the
+ * child is issance's own binary with arguments issance wrote. There is nothing for an operator to set.
+ */
+export interface WhistleSttSettings {
+  provider: "whistle";
+}
+
+/** Everything a resolved provider can be. */
+export type SttSettings = OpenAiSttSettings | CodexSttSettings | LocalCliSttSettings | WhistleSttSettings;
+
+/** The environment keys this module reads. Named once so the CLI and the docs can cite them. */
+export const STT_ENV_KEYS = {
+  provider: "ISSANCE_STT_PROVIDER",
+  url: "ISSANCE_STT_URL",
+  model: "ISSANCE_STT_MODEL",
+  key: "ISSANCE_STT_KEY",
+  language: "ISSANCE_STT_LANG",
+  codexBin: "ISSANCE_CODEX_BIN",
+  wireIdentity: "ISSANCE_STT_WIRE_IDENTITY",
+  command: "ISSANCE_STT_COMMAND",
+} as const;
+
+/** The path `stt.json` sits at, given the bridge's state dir. */
+export function sttSettingsPath(stateDir: string): string {
+  return join(stateDir, STT_FILENAME);
+}
+
+/**
+ * The settings as `stt.json` holds them: the same fields, before anything is believed about them.
+ * An unset field is absent from the written file, because `JSON.stringify` drops `undefined`.
+ */
+export type SttSettingsDocument = RawSettings;
+
+/** A field of the settings as it arrived, before anything is believed about it. */
+interface RawSettings {
+  provider?: string;
+  baseUrl?: string;
+  model?: string;
+  apiKey?: string;
+  language?: string;
+  codexBin?: string;
+  wireIdentity?: string;
+  command?: string;
+  /**
+   * The `local-cli` arguments. `null` means PRESENT BUT UNREADABLE — not an array, or an array
+   * holding something other than strings — which the resolve refuses rather than reads as "no
+   * arguments": running the command without the flags the operator wrote is a different command.
+   * File only; there is no environment spelling of a list.
+   */
+  args?: string[] | null;
+}
+
+/** The `local-cli` argument list as it arrived, narrowed. See {@link RawSettings.args}. */
+function argList(value: JsonValue | undefined): string[] | null | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) return null;
+  const out: string[] = [];
+  for (const item of value) {
+    const text = jsonStringField(item);
+    if (text === null) return null;
+    out.push(text);
+  }
+  return out;
+}
+
+/** A trimmed string, or undefined when the value is absent, not a string, or blank. */
+function optionalString(value: JsonValue | undefined): string | undefined {
+  const raw = jsonStringField(value);
+  if (raw === null) return undefined;
+  const trimmed = raw.trim();
+  return trimmed === "" ? undefined : trimmed;
+}
+
+/**
+ * Coerce the parsed file into the fields this module knows, dropping anything else. A hand-edited
+ * file with a number where a string belongs degrades to "that field was not set", which then either
+ * falls through to the environment or fails the resolve below — never to a URL of `[object Object]`.
+ */
+export function coerceSttFile(raw: JsonValue | undefined): RawSettings {
+  const o = jsonRecord(raw);
+  if (o === null) return {};
+  return {
+    provider: optionalString(o.provider),
+    baseUrl: optionalString(o.baseUrl),
+    model: optionalString(o.model),
+    apiKey: optionalString(o.apiKey),
+    language: optionalString(o.language),
+    codexBin: optionalString(o.codexBin),
+    wireIdentity: optionalString(o.wireIdentity),
+    command: optionalString(o.command),
+    args: argList(o.args),
+  };
+}
+
+/** The environment's half of the settings — the same fields, none of them required. */
+export function sttEnvSettings(env: Record<string, string | undefined>): RawSettings {
+  return {
+    provider: optionalString(env[STT_ENV_KEYS.provider]),
+    baseUrl: optionalString(env[STT_ENV_KEYS.url]),
+    model: optionalString(env[STT_ENV_KEYS.model]),
+    apiKey: optionalString(env[STT_ENV_KEYS.key]),
+    language: optionalString(env[STT_ENV_KEYS.language]),
+    codexBin: optionalString(env[STT_ENV_KEYS.codexBin]),
+    wireIdentity: optionalString(env[STT_ENV_KEYS.wireIdentity]),
+    command: optionalString(env[STT_ENV_KEYS.command]),
+  };
+}
+
+/**
+ * Canonicalise an API base, or null when it is not one issance will dial.
+ *
+ * http(s) only — a `file:` or `data:` base would turn a settings typo into a local read — and the
+ * trailing slash is stripped so `<base>/audio/transcriptions` is one shape whatever the operator
+ * typed.
+ */
+function canonicalBase(raw: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  return url.toString().replace(/\/+$/, "");
+}
+
+/**
+ * A spoken language as the transcription APIs want it — ISO-639-1, two letters, lower case — or null
+ * when the operator typed something that is not one.
+ *
+ * A regional tag is accepted and NARROWED (`en-GB` → `en`, `pt_BR` → `pt`): a phone's own locale is
+ * the obvious thing for an operator to copy in, and the endpoint takes the base language only. What
+ * is refused is a language NAME (`english`) or a three-letter code — sending either would be a
+ * silently ignored field, which is worse than being told at `issance stt setup`.
+ */
+export function canonicalLanguage(raw: string): string | null {
+  const base = /^([A-Za-z]{2})(?:[-_][A-Za-z0-9]{2,8})?$/.exec(raw.trim())?.[1];
+  return base === undefined ? null : base.toLowerCase();
+}
+
+/**
+ * The settings this bridge will actually run with, or null when speech-to-text is off.
+ *
+ * Off is the default and is never an error: an operator who configured nothing gets `null` in
+ * silence. A configuration that is PRESENT but unusable is a different thing — it warns and still
+ * returns null, because the alternative is a microphone button that fails only after the operator
+ * has spoken into it.
+ */
+export function resolveSttSettings(
+  file: RawSettings,
+  env: RawSettings,
+  warn: (message: string) => void,
+): SttSettings | null {
+  const named = env.provider ?? file.provider;
+  const provider = named ?? "openai-compatible";
+  const baseUrl = env.baseUrl ?? file.baseUrl;
+  const model = env.model ?? file.model;
+  const apiKey = env.apiKey ?? file.apiKey;
+  const language = env.language ?? file.language;
+  const codexBin = env.codexBin ?? file.codexBin;
+  const wireIdentity = env.wireIdentity ?? file.wireIdentity;
+  const command = env.command ?? file.command;
+  // File only: the environment has no spelling of a list (see RawSettings.args).
+  const args = file.args;
+
+  // Nothing was configured at all — the ordinary case, and not something to warn about.
+  if (
+    named === undefined &&
+    baseUrl === undefined &&
+    model === undefined &&
+    apiKey === undefined &&
+    language === undefined &&
+    codexBin === undefined &&
+    wireIdentity === undefined &&
+    command === undefined &&
+    args === undefined
+  ) {
+    return null;
+  }
+  if (!STT_PROVIDERS.some((known) => known === provider)) {
+    warn(`speech-to-text is off: unknown provider "${provider}" (expected ${STT_PROVIDERS.join(", ")})`);
+    return null;
+  }
+  if (provider === "codex") return resolveCodex(codexBin, wireIdentity, warn);
+  if (provider === "local-cli") return resolveLocalCli(command, args, warn);
+  if (provider === "whistle") return { provider: "whistle" };
+  if (baseUrl === undefined) {
+    warn(`speech-to-text is off: no endpoint configured (set ${STT_ENV_KEYS.url} or "baseUrl" in ${STT_FILENAME})`);
+    return null;
+  }
+  const canonical = canonicalBase(baseUrl);
+  if (canonical === null) {
+    warn(`speech-to-text is off: the endpoint must be an http(s) URL (${STT_ENV_KEYS.url} / "baseUrl")`);
+    return null;
+  }
+  // A keyless request to OpenAI's own API can only fail — and it fails AFTER the audio has been
+  // uploaded, so the operator pays for the recording to learn about the missing key. Refuse here
+  // instead. A self-hosted compatible endpoint may legitimately want no credential, which is why
+  // this check names one origin rather than requiring a key of everyone.
+  const officialOpenAi = new URL(canonical).origin === "https://api.openai.com";
+  if (officialOpenAi && apiKey === undefined) {
+    warn(`speech-to-text is off: ${STT_ENV_KEYS.key} is required for api.openai.com`);
+    return null;
+  }
+
+  const settings: OpenAiSttSettings = {
+    provider: "openai-compatible",
+    baseUrl: canonical,
+    model: model ?? DEFAULT_STT_MODEL,
+  };
+  // Assigned, never spread in as `undefined`: "no credential" is a mode, and it must be the ABSENCE
+  // of the field rather than a present-and-empty one the provider could send as a bearer token.
+  if (apiKey !== undefined) settings.apiKey = apiKey;
+  // Refused rather than dropped, for the same reason a bad base URL is: the operator set this field
+  // to stop the model guessing, and a value the endpoint would ignore leaves them with the exact
+  // wrong-language transcripts they configured it to end — discovered only after they have spoken.
+  if (language !== undefined) {
+    const code = canonicalLanguage(language);
+    if (code === null) {
+      warn(
+        `speech-to-text is off: "${language}" is not an ISO-639-1 language code ` +
+          `(${STT_ENV_KEYS.language} / "language") — use two letters, e.g. en, de, tr, or leave it ` +
+          "unset for auto-detect",
+      );
+      return null;
+    }
+    settings.language = code;
+  }
+  return settings;
+}
+
+/**
+ * The codex provider's half of the resolve. It needs nothing at all — naming the provider is the
+ * whole configuration, because the credential belongs to the operator's `codex` login and the
+ * endpoint is not theirs to choose.
+ *
+ * An unreadable `wireIdentity` is a refusal rather than a fall back to `honest`: this field is the
+ * operator's recorded consent to impersonate, and quietly reinterpreting a word nobody recognises
+ * would be a decision made on their behalf in exactly the way ADR 0029 refuses.
+ */
+function resolveCodex(
+  codexBin: string | undefined,
+  wireIdentity: string | undefined,
+  warn: (message: string) => void,
+): CodexSttSettings | null {
+  if (wireIdentity !== undefined && !STT_WIRE_IDENTITIES.some((known) => known === wireIdentity)) {
+    warn(
+      `speech-to-text is off: unknown wire identity "${wireIdentity}" ` +
+        `(expected ${STT_WIRE_IDENTITIES.join(", ")}) — run \`issance stt setup\` to probe for it`,
+    );
+    return null;
+  }
+  return {
+    provider: "codex",
+    codexBin: codexBin ?? DEFAULT_CODEX_BIN,
+    // SAFETY: the guard above proves this string is one of STT_WIRE_IDENTITIES; `undefined` took the
+    // documented default before the assertion is reached.
+    wireIdentity: (wireIdentity ?? "honest") as SttWireIdentity,
+  };
+}
+
+/**
+ * How a `local-cli` command is spelled: an absolute path on this host, a bare name to look up on
+ * `PATH` (no separator at all), or a relative path, which is refused everywhere it is met.
+ * Read through the {@link Host}, because `C:\x\whisper.exe` is absolute and starts with no slash.
+ */
+export function commandLookup(command: string, host: Host = HOST): "absolute" | "bare" | "relative" {
+  if (host.path.isAbsolute(command)) return "absolute";
+  return /[\\/]/.test(command) ? "relative" : "bare";
+}
+
+/** True when a string carries a NUL, which no argv entry can hold. */
+const hasNul = (value: string): boolean => value.includes("\0");
+
+/**
+ * The `local-cli` provider's half of the resolve: a command issance can run without a shell, and the
+ * arguments to put before the recording's path.
+ *
+ * Every refusal here names the FIELD, never its value. The arguments may well carry a token or a
+ * model path the operator would rather not see in a journal line.
+ */
+function resolveLocalCli(
+  command: string | undefined,
+  args: string[] | null | undefined,
+  warn: (message: string) => void,
+): LocalCliSttSettings | null {
+  if (command === undefined) {
+    warn(
+      `speech-to-text is off: the local-cli provider needs a command ` +
+        `(${STT_ENV_KEYS.command} or "command" in ${STT_FILENAME})`,
+    );
+    return null;
+  }
+  // A bare name resolves from PATH; an absolute path is itself. A RELATIVE path with a slash would
+  // resolve against whatever directory the bridge happened to start in, so it is refused.
+  if (hasNul(command) || commandLookup(command) === "relative") {
+    warn('speech-to-text is off: the local-cli "command" must be an absolute path or a bare name on PATH');
+    return null;
+  }
+  if (args === null) {
+    warn(`speech-to-text is off: the local-cli "args" in ${STT_FILENAME} must be a list of strings`);
+    return null;
+  }
+  const list = args ?? [];
+  if (list.length > MAX_LOCAL_CLI_ARGS || list.some(hasNul)) {
+    warn(
+      `speech-to-text is off: the local-cli "args" must be at most ${MAX_LOCAL_CLI_ARGS} strings ` +
+        "with no NUL characters",
+    );
+    return null;
+  }
+  return { provider: "local-cli", command, args: [...list] };
+}
+
+/**
+ * The provider the settings NAME, file and environment together, or undefined when nothing is
+ * configured at all — read before any resolve, so a file that names a provider but does not resolve
+ * (a local-cli with no command) still counts as the operator's.
+ *
+ * It is what Settings asks before it may write `stt.json` (ADR 0096 Decision 4): only an absent
+ * configuration or one that already names `whistle` may be replaced from a phone. A configuration
+ * with fields but no provider is the implicit `openai-compatible`, and is the operator's too.
+ */
+export function namedSttProvider(file: RawSettings, env: RawSettings): string | undefined {
+  const named = env.provider ?? file.provider;
+  if (named !== undefined) return named;
+  return anySetting(file) || anySetting(env) ? "openai-compatible" : undefined;
+}
+
+/** Whether any field of the settings is set at all. */
+function anySetting(raw: RawSettings): boolean {
+  return Object.values(raw).some((value) => value !== undefined);
+}
+
+/**
+ * Who last changed the host's speech option from a paired device, and when (Settings → Voice shows it
+ * as "Last changed by …"). Written beside the settings in `stt.json` by the two routes that change the
+ * option from the app, and dropped by every other writer, so a `issance stt setup` in a terminal clears
+ * it. `changedBy` is the device's pairing label, never a token, an address or a header value.
+ * {@link coerceSttFile} never reads these two fields, so they cannot change what the bridge runs.
+ */
+export interface SttChangeStamp {
+  /** The paired device's label, as its owner named it at pairing (48 characters at most). */
+  changedBy: string;
+  /** When, as an ISO 8601 time. */
+  changedAt: string;
+}
+
+/** The longest label pairing accepts (bridge/pairing.ts). A longer one in the file is not believed. */
+const MAX_CHANGED_BY = 48;
+
+/** The stamp in a parsed `stt.json`, or null when it is absent or either field is not believable. */
+export function sttChangeStamp(raw: JsonValue | undefined): SttChangeStamp | null {
+  const o = jsonRecord(raw);
+  if (o === null) return null;
+  const changedBy = optionalString(o.changedBy);
+  const changedAt = optionalString(o.changedAt);
+  if (changedBy === undefined || changedAt === undefined || changedBy.length > MAX_CHANGED_BY) return null;
+  // The rule pairing applies to a new label: control, format (bidi, zero-width) and separator characters.
+  if (hasHiddenLabelChar(changedBy)) return null;
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(changedAt) || Number.isNaN(Date.parse(changedAt))) return null;
+  return { changedBy, changedAt };
+}
+
+/** The file operations {@link writeSttSettingsFile} needs. The CLI's `Files` and the bridge's disk both fit. */
+export interface SttSettingsFileOps {
+  mkdirp(path: string, mode?: number): void;
+  write(path: string, text: string, mode?: number): void;
+  rename(from: string, to: string): void;
+  remove(path: string): void;
+}
+
+/** Writes of `stt.json` by this process so far, for the temporary's name. */
+let sttWriteSeq = 0;
+
+/**
+ * Write `<stateDir>/stt.json`, the one way it is ever written: 0600 into a 0700 state dir, through a
+ * temporary name in the same directory and renamed into place. A write that died half way must leave
+ * the previous configuration intact, never a half-file the bridge would then read as "the operator
+ * turned this off". `issance stt setup` and the Settings switch for the Whistle host engine both come
+ * through here. Returns the path written; throws when the write failed, after removing the temporary.
+ */
+export function writeSttSettingsFile(
+  stateDir: string,
+  document: SttSettingsDocument | (SttSettingsDocument & SttChangeStamp),
+  ops: SttSettingsFileOps,
+): string {
+  const path = sttSettingsPath(stateDir);
+  // A name unique to this write, as `pairing.ts` does it: a shared `stt.json.tmp` let the bridge's
+  // Settings switch and a `issance stt setup` in a terminal delete or rename each other's temporary.
+  // The pid keeps another process off the name; the counter keeps another write in this one off it.
+  const temporary = `${path}.${process.pid}.${++sttWriteSeq}.tmp`;
+  try {
+    ops.mkdirp(stateDir, 0o700);
+    ops.write(temporary, `${JSON.stringify(document, null, 2)}\n`, 0o600);
+    ops.rename(temporary, path);
+  } catch (err) {
+    try {
+      ops.remove(temporary);
+    } catch {
+      /* nothing was there to remove */
+    }
+    throw err;
+  }
+  return path;
+}
+
+/**
+ * A reader for `<stateDir>/stt.json` + the environment, re-read behind an mtime check.
+ *
+ * The mtime cache covers the FILE only; the environment is read on every call because it costs
+ * nothing and a process's environment does not change under it anyway. A file that stops parsing
+ * keeps the last good settings and warns once per change, exactly like the operator TOML readers.
+ */
+export function createSttSettingsReader(opts: {
+  stateDir: string;
+  warn: (message: string) => void;
+  io?: OperatorFileIo;
+  env?: Record<string, string | undefined>;
+}): () => Promise<SttSettings | null> {
+  const path = sttSettingsPath(opts.stateDir);
+  const io = opts.io ?? diskIo;
+  const env = opts.env ?? process.env;
+  // `seen` is the mtime `file` was derived from — including that of a file that FAILED to parse,
+  // which is what stops a broken file re-warning on every request.
+  let seen: number | null | undefined;
+  let file: RawSettings = {};
+  return async () => {
+    const mtime = await io.mtime(path);
+    if (mtime !== seen) {
+      seen = mtime;
+      if (mtime === null) {
+        file = {};
+      } else {
+        try {
+          // SAFETY: `JSON.parse` answers with a JSON value and `coerceSttFile` is its only reader —
+          // every field it names is checked before it is believed.
+          file = coerceSttFile(JSON.parse(await io.read(path)) as JsonValue);
+        } catch (err) {
+          opts.warn(`${path} could not be parsed (${String(err)}) — keeping the last good settings`);
+        }
+      }
+    }
+    return resolveSttSettings(file, sttEnvSettings(env), opts.warn);
+  };
+}

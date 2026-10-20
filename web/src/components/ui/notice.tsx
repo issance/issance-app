@@ -1,0 +1,356 @@
+import type { ReactNode } from "react";
+import { useId } from "react";
+import { X } from "lucide-react";
+
+import { cn } from "@/lib/utils";
+
+/**
+ * The app's ONE notice surface: a tinted band or box that says something is not normal.
+ *
+ * Before this existed there were six hand-rolled ones (DESIGN.md §1 lists them: three heights,
+ * three gutters, two radii and two different opinions about whether a notice has an edge at all),
+ * and the top of the app moved every time its state changed. This is the primitive they collapse
+ * into. It knows shape, tone and semantics; it knows nothing about connections, updates or panes,
+ * and it never calls `t()` — the words arrive as children from the feature that owns the condition.
+ *
+ * It deliberately does NOT decide visibility, own a timer, own a position, or portal. A notice that
+ * appears and disappears does so through `ui/collapse.tsx`; a strip that competes with other strips
+ * is arbitrated by `ui/strip-host.tsx`; a transient one floats in `ui/toast-viewport.tsx`.
+ */
+
+/**
+ * Severity, as a TONE rather than a category. This is the correction the six-banner zoo needed:
+ * severity and category had been conflated, so every new severity grew a new component. Tone is a
+ * colour and a level of politeness that any notice can carry.
+ */
+export type NoticeTone = "info" | "caution" | "danger" | "success" | "neutral";
+
+/**
+ * The two placements, and there are only two (DESIGN.md §4): `strip` is viewport chrome above the
+ * header — full-bleed, closes its own bottom edge with a rule; `box` is content, inset on the
+ * page's 16px gutter with a full border and the house 2px corner.
+ */
+export type NoticeVariant = "strip" | "box";
+
+/** How, or whether, a screen reader is interrupted. See {@link NoticeProps.announce}. */
+export type NoticeAnnounce = "alert" | "status" | "none";
+
+/**
+ * A custom `action` node is EXCLUSIVE with whole-surface tap, at the type level.
+ *
+ * Not a style preference: a `<button>` wrapping a second, arbitrary `<button>` is invalid HTML,
+ * and the browsers that tolerate it disagree about which one a tap fires. Expressing the
+ * exclusion in the union means a caller cannot write the broken combination and discover it in
+ * the field.
+ *
+ * `onActivate` MAY combine with `onDismiss`, and that pair is not the same hazard: the root stays
+ * a plain element and the whole-surface tap is a separate, absolutely-positioned `<button>`
+ * layered UNDER the dismiss control (see the render below) rather than an ancestor of it — so
+ * there is no nested `<button>` for a browser to disagree about, and a tap that lands on the ✕
+ * never reaches the layer underneath because the ✕ is what the browser hit-tests first. The third
+ * member below carries no `dismissLabel`/`onDismiss` requirement pairing beyond the ordinary one:
+ * a dismiss control cannot be added without an accessible name, which `ui/` cannot supply itself
+ * because i18n lives on the feature side.
+ */
+type NoticeInteraction =
+  | { onActivate: () => void; action?: never; onDismiss?: never; dismissLabel?: never }
+  | { onActivate: () => void; action?: never; onDismiss: () => void; dismissLabel: string }
+  | { onActivate?: never; action?: ReactNode; onDismiss?: never; dismissLabel?: never }
+  | { onActivate?: never; action?: ReactNode; onDismiss: () => void; dismissLabel: string };
+
+export type NoticeProps = {
+  tone: NoticeTone;
+  /**
+   * No default, on purpose. Which band a notice lives in is a fact about the caller's position in
+   * the tree, not something a primitive can guess — and guessing wrong puts a full-bleed strip in
+   * the middle of a content column.
+   */
+  variant: NoticeVariant;
+  /**
+   * `"alert"` emits `role="alert"` and nothing else; `"status"` emits `role="status"` and nothing
+   * else; `"none"` emits neither. There is deliberately no way to ask for a role AND an
+   * `aria-live` — that pair is a contradiction (a role carries its own implicit liveness, so
+   * `role="alert"` with `aria-live="polite"` asks for assertive and polite at once) and it was live
+   * in both of connection-banner.tsx's rows until they converted. Making it inexpressible is half of
+   * why this file exists. Default `"none"`: a notice that never changes must not claim a live region.
+   */
+  announce?: NoticeAnnounce;
+  /** Decorative, and treated as such — the copy beside it says the same thing in words. */
+  icon?: ReactNode;
+  children: ReactNode;
+  className?: string;
+  /**
+   * A strip only: let the copy wrap instead of truncating. The one exception to "strips never wrap"
+   * (see STRIP), for a sentence the reader must see whole to act on, like the dated saved-copy line
+   * at 390px beside Retry. The strip then grows past its floor, which `min-h` allows on purpose.
+   * Ignored by a box, which always wraps.
+   */
+  wrap?: boolean;
+} & NoticeInteraction;
+
+/**
+ * Tone → token, and this table is the ONLY place the tint recipe may appear.
+ *
+ * `border-status-X/40 bg-status-X/15` + `text-status-X` was copy-pasted into four components before
+ * this file existed; one table means a re-measured alpha lands once. The colour is a colour only —
+ * the border WIDTH is reserved in the shape strings below, because Tailwind v4's preflight sets
+ * `border: 0 solid` on everything (DESIGN.md §7 trap 1), so a border colour with no width paints
+ * nothing at all, silently.
+ *
+ * `caution` points at `--status-working`, which currently doubles as both "in progress" and
+ * "warning" app-wide. That is a real smell and it is deliberately not fixed here: minting a
+ * `--status-caution` with identical values is a rename, not a fix. This table is the one seam a
+ * genuine split (with re-measured values) lands in later — change the two lines here and every
+ * cautioning notice in the app follows.
+ *
+ * `neutral` is the odd one out and is not a status at all: it is the NoEchoNotice ground, the
+ * quiet "here is a note about what just happened" register, on `--muted` with the ordinary
+ * `--border` edge.
+ */
+const TONE = {
+  info: { surface: "border-status-info/40 bg-status-info/15", accent: "text-status-info" },
+  caution: { surface: "border-status-working/40 bg-status-working/15", accent: "text-status-working" },
+  danger: { surface: "border-status-blocked/40 bg-status-blocked/15", accent: "text-status-blocked" },
+  success: { surface: "border-status-done/40 bg-status-done/15", accent: "text-status-done" },
+  neutral: { surface: "border-border bg-muted/40", accent: "text-muted-foreground" },
+} satisfies Record<NoticeTone, { surface: string; accent: string }>;
+
+/**
+ * The 44px tap floor for a notice's action button, bought as HIT area so the band stays thin.
+ *
+ * Same technique and same trap as `STRIP_TAP_TARGET` in `ui/labelled-strip.tsx`: a transparent
+ * `::before` reaches past the drawn box, so a 24px button answers a 44px touch while the strip
+ * still measures 33px. Three numbers hold it together and all three are load-bearing:
+ *
+ *  1. **`h-6` is 24px drawn**, which is what connection-banner's Retry already is, and it is the
+ *     number the strip's and box's floors below are DERIVED from. Change it and re-derive them.
+ *  2. **`-inset-y-[11px]`, not `-inset-y-2.5` (10px).** An absolutely positioned child resolves its
+ *     insets against the PADDING box, and every `ui/button.tsx` carries the 1px transparent border
+ *     that DESIGN.md §2 reserves. So the padding box of an `h-6` button is 22px, not 24, and 10px
+ *     each way measures 42 — the floor missed by 2px, invisibly. 11px reaches a true 44. A control
+ *     that is NOT a Button (no reserved border) reaches 46 here, which is fine; under is not.
+ *  3. **An ancestor with `overflow: hidden` eats the extension**, taps and all, with nothing to
+ *     see. That is why `ui/collapse.tsx` drops its clip once it has finished opening: the strip
+ *     band is 33px and the reach is 11px, so every pixel of this target is outside the collapsed
+ *     box it animates inside of.
+ *
+ * The tap floor is not negotiable, and the strip's floor is derived FROM this button — the strip
+ * accommodates the target, never the other way round.
+ */
+export const NOTICE_ACTION_TAP =
+  "relative before:absolute before:inset-x-0 before:-inset-y-[11px] before:content-['']";
+
+/**
+ * The clothes for an action button inside a Notice: 24px tall, small type, and the tap target
+ * above. Pass it as `className` to `ui/button.tsx` — `<Button size="sm" className={NOTICE_ACTION}>`.
+ * It lives here rather than at the call sites because the 24px is the strip floor's derivation.
+ */
+export const NOTICE_ACTION = `h-6 gap-1 px-2 text-xs ${NOTICE_ACTION_TAP}`;
+
+/**
+ * A strip is a full-bleed one-liner of viewport chrome, and it NEVER wraps — by contract, not by
+ * luck. The copy goes in a single `min-w-0 flex-1 truncate` span below, so no string a feature
+ * passes can turn a 33px band into a 49px one behind its back.
+ *
+ * **The floor: `min-h-[33px]`.** It is derived, not picked. 24px (the `h-6` action button, the
+ * tallest thing a strip may legitimately contain) + this row's own `py-1` (2×4px) + the 1px tinted
+ * `border-b`, which `border-box` counts INSIDE a min-height. 24+8+1 = 33. The next person will want
+ * to tidy that into a round 32; the 1px they would be dropping is the rule that separates this band
+ * from the header under it, and dropping it puts the jump back.
+ *
+ * Why state a floor at all: without one a strip is exactly as tall as whatever it happens to
+ * contain, so a text-only "Reconnecting…" row renders SHORTER than an outage row carrying Retry,
+ * and the band changes height as the session degrades. That is the 60px/56px header jump this
+ * codebase already fixed once (DESIGN.md §6), one band higher up.
+ *
+ * Why `min-height` and NOT `height`, which is the same reason on record at app-header.tsx:100-109:
+ * a future child taller than the floor must GROW the strip — visibly, in every place that mounts
+ * one, so somebody has to look at the decision — rather than be clipped or overflow it silently.
+ * The `py-1` stays so that taller child keeps its 4px of breathing room.
+ *
+ * **`w-full` stays HERE and is load-bearing, unlike the box's** (see BOX below, where it was the
+ * fault). Two reasons, both measured in Chrome at 390px. First, the `onActivate` shape renders this
+ * root as a `<button>`, and a button sizes itself to its content even at `display: flex` and even as
+ * a stretch-aligned grid item — the whole-surface "new version, tap to update" row came out **160px
+ * wide instead of 390** without it, i.e. a tap target the width of its own sentence. Second, a
+ * percentage width can only collide with a margin, and a strip never carries one: it is full-bleed
+ * by definition and `ui/strip-host.tsx` owns the row it sits in, so there is no gutter for the 100%
+ * to be offset by. Both halves of that are what the box cannot say for itself.
+ *
+ * No safe-area inset here. The band sits under the header, and the header owns the notch
+ * (`app-header.tsx`); three of the old strips carried it and one did not, which is exactly the drift
+ * a single owner ends. The FLOOR, by contrast, does belong here and not on the host: it is derived from the action
+ * slot's button, which is this component's contract, and it is tone-tinted through the `border-b`,
+ * which the host is deliberately blind to.
+ */
+const STRIP = "flex min-h-[33px] w-full items-center gap-2 border-b px-4 py-1 text-xs text-foreground";
+
+/**
+ * A box is content, not chrome: inset on the page gutter, full border, 2px corner (`rounded-sm` —
+ * DESIGN.md §3, and where in doubt go sharper). The caller supplies the gutter, `mx-4 mt-3`, since
+ * only the caller knows what it sits between.
+ *
+ * Unlike a strip a box WRAPS freely, and should: a two-line "this host has not checked in since…"
+ * is two lines of true information, and truncating it would be a lie about a standing condition.
+ *
+ * **The same floor, box-shaped: `min-h-[42px]`.** 24px (the first-line slot, sized by the same
+ * `h-6` action button) + `py-2` (2×8px) + the box's 2×1px border under `border-box`. 24+16+2 = 42.
+ * Growth ABOVE the floor is legitimate; two ONE-LINE boxes differing because one carries an icon
+ * and the other does not is the fault this closes.
+ *
+ * `items-start`, not `items-center`: a wrapping body wants its icon on the first line, not floating
+ * beside the middle of a paragraph. A single line is then centred against the 24px first-line slot
+ * by the body's own `min-h-6` (below), so a lone line sits optically centred instead of top-heavy —
+ * both alignments, from one rule, without a conditional class that would make the box two heights.
+ *
+ * **No width utility, deliberately — a `w-full` here EATS the gutter it just asked the caller for.**
+ * The two sentences above are in direct contradiction with a 100% width: a margin does not shrink a
+ * percentage, it offsets it. Measured in Chrome at a 390px viewport with `mx-4`: `w-full` gave a box
+ * **390px wide starting 16px in**, so 16px hung past the right edge, clipped, and the right gutter
+ * was simply gone; without it the same box measures **358px with 16px on both sides**. Nothing is
+ * bought by the class either — this root is a block-level flex container, which already fills its
+ * line box and already shrinks by its own margins, so the fix is an absence and not a substitution.
+ * (The strip's `w-full` is a different case and stays — see STRIP above. The one shape that would
+ * still need a width here is a box with `onActivate`, whose root is a `<button>` and therefore
+ * content-sized: 162px at 390px, measured. No caller writes that combination — whole-surface tap is
+ * a strip affordance — and the answer when one does is `width: stretch`, which fills what the margin
+ * leaves, NOT a return to `w-full`.)
+ */
+const BOX = "flex min-h-[42px] flex-wrap items-start gap-x-2 gap-y-1 rounded-sm border px-4 py-2 text-xs font-medium";
+
+/**
+ * **On a narrow box the actions go under the text, never beside it in a column of their own.** The
+ * body asks for 12rem before it shares its line (`flex: 1 1 12rem`), and the root
+ * wraps, so a cluster that does not fit beside 12rem of text moves to the next line, pushed right by
+ * `ml-auto`. There it may shrink to the box's width, and its own buttons wrap. Measured on 2026-10-16
+ * in a headless browser with the composer's refusal (Screen, Open Keys, ✕): at 360 px the sentence
+ * is 280 px wide and the buttons stand on the line under it, at 412 px the sentence is 332 px wide,
+ * and at 820 px they share one line. The field case that day had the old `shrink-0` cluster squeeze
+ * the sentence into a column a word or two wide.
+ */
+const BOX_BODY = "flex min-h-6 min-w-0 flex-[1_1_12rem] flex-col justify-center";
+const BOX_ACTIONS = "relative ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1";
+const STRIP_ACTIONS = "relative flex shrink-0 items-center gap-1";
+
+export function Notice({
+  tone,
+  variant,
+  announce = "none",
+  icon,
+  children,
+  className,
+  onActivate,
+  action,
+  onDismiss,
+  dismissLabel,
+  wrap = false,
+}: NoticeProps) {
+  const { surface, accent } = TONE[tone];
+  const strip = variant === "strip";
+
+  // The live-region role rides the BODY, never the root, and it is one attribute or none — never a
+  // role plus an aria-live (see NoticeProps.announce). A live region announces its subtree's changes
+  // wherever it is nested, so nothing is lost by putting it on the body rather than higher up — and
+  // the announced text is then exactly the text that changed.
+  //
+  // `onActivate`'s overlay button (below) renders no children of its own — it sits beside the body,
+  // not around it, so a `<button>` next to a `<button>` never has to disagree with a browser about
+  // nesting. `bodyId` + `aria-labelledby` names the empty button from the body's text explicitly.
+  const role = announce === "none" ? undefined : announce;
+  const bodyId = useId();
+
+  const body = strip ? (
+    // ONE truncating, flex-1 span. This is the whole "strips never wrap" contract, and it is a
+    // single element so there is nowhere for a second line to come from.
+    <span
+      role={role}
+      id={onActivate ? bodyId : undefined}
+      // `wrap`: the opt-in exception, a sentence that must read whole (see NoticeProps.wrap).
+      className={cn("min-w-0 flex-1 font-medium", wrap ? "break-words text-pretty" : "truncate")}
+    >
+      {children}
+    </span>
+  ) : (
+    // min-h-6 + centred: the 24px first-line slot the box's floor is derived from. One line centres
+    // in it; two or more lines simply outgrow it and the box grows with them.
+    <div role={role} id={onActivate ? bodyId : undefined} className={BOX_BODY}>
+      {children}
+    </div>
+  );
+
+  const inner = (
+    <>
+      {icon ? (
+        <span
+          aria-hidden
+          className={cn(
+            "flex shrink-0 [&>svg]:size-3.5",
+            // A box tints its whole self, so the icon inherits; a strip keeps its copy at full
+            // foreground contrast (it is chrome over the page, not a tinted block) and spends the
+            // tone on the icon and its edges alone. That split is what the four existing banners
+            // already do; it is preserved here rather than re-decided.
+            strip ? cn("items-center", accent) : "mt-[5px]",
+          )}
+        >
+          {icon}
+        </span>
+      ) : null}
+      {body}
+      {action || onDismiss ? (
+        // `relative`, so this cluster stacks ABOVE the whole-surface overlay below when `onActivate`
+        // is also set — two positioned siblings with `z-index: auto` paint in DOM order, and this one
+        // is later. A tap that lands here therefore hits the ✕ (or `action`) and never the overlay
+        // underneath; `relative` alone does nothing when there is no overlay to out-stack.
+        <div className={strip ? STRIP_ACTIONS : BOX_ACTIONS}>
+          {action}
+          {onDismiss ? (
+            <button
+              type="button"
+              onClick={onDismiss}
+              aria-label={dismissLabel}
+              // Square, so it reaches sideways too — safe only because it is LAST in the row and
+              // nothing sits to its right (the same condition STRIP_TAP_TARGET_SQUARE states).
+              className={cn(
+                "flex size-6 items-center justify-center rounded-sm opacity-70 hover:opacity-100",
+                NOTICE_ACTION_TAP,
+                "before:-inset-x-[11px]",
+              )}
+            >
+              <X className="size-3.5" />
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </>
+  );
+
+  const box = cn(strip ? STRIP : BOX, surface, !strip && accent, onActivate && "relative", className);
+
+  // `data-slot` and not a test id: it is the house handle for addressing a primitive's own element
+  // (`ui/collapse.tsx`, `ui/strip-host.tsx` and the header row all carry one), and DESIGN.md §9
+  // names it as the way to scope a query inside a tree that holds a StripHost — where `role="status"`
+  // matches the band's two permanent empty live regions as readily as the notice you meant.
+  return (
+    <div data-slot="notice" className={box}>
+      {onActivate ? (
+        // `onActivate` makes the WHOLE surface the target — the "new version, tap to update" case,
+        // and now also a state that carries its own ✕ (see NoticeInteraction's header). This button
+        // is NOT the root: it is absolutely positioned UNDER whatever `action`/`onDismiss` render
+        // (that cluster is `relative`, so it wins the stacking tie), and it is the only element a tap
+        // anywhere else on the row can reach. `aria-labelledby` names it from the same text the body
+        // renders — the FULL string, since `truncate` only clips paint, never the text node itself, so
+        // the accessible name is never shorter than what a sighted reader would get by widening the
+        // window. `-inset-y-[5.5px]` buys the 44px tap floor from the 33px strip without growing it
+        // (the box's own layout is untouched — same technique as `NOTICE_ACTION_TAP` above, just
+        // vertical-only because this target is already `w-full`).
+        <button
+          type="button"
+          onClick={onActivate}
+          aria-labelledby={bodyId}
+          className="absolute inset-x-0 -inset-y-[5.5px] rounded-[inherit] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+        />
+      ) : null}
+      {inner}
+    </div>
+  );
+}

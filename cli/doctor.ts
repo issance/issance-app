@@ -1,0 +1,2379 @@
+import { readRefusals, refusalLine, refusalsPath } from "../bridge/walky/refusals.ts";
+import { basename, dirname, join } from "node:path";
+
+import { BEACON_HOOKS } from "./beacon.ts";
+import {
+  claudeSettingsTargets,
+  hookBinaryOf,
+  HOOK_MARKER_VERSION,
+  markedCommandsByEvent,
+  markerVersionOf,
+  resolveHookCommand,
+  type HookTarget,
+} from "./hooks.ts";
+import { skillReport } from "./skill-install.ts";
+import { HOST, type Host } from "../bridge/host.ts";
+import { beaconReader } from "../bridge/beacon-io.ts";
+import { readBeacons, type BeaconSweepDeps } from "../bridge/beacon/reader.ts";
+import { DEFAULT_PORT, envBool, isLoopbackBindHost, nonLoopbackBindRefusal, resolveBridgeHost } from "../bridge/config.ts";
+import { configFilePaths } from "../bridge/config-source.ts";
+import { localAuthHeader, readLocalSecret } from "../bridge/local-secret.ts";
+import type { MuxCapabilityDeclaration } from "../bridge/mux/capabilities.ts";
+import {
+  buildMuxRegistry,
+  DEFAULT_MUX,
+  factoryFor,
+  muxEndpointVar,
+  muxNames,
+  type MuxTarget,
+} from "../bridge/mux/registry.ts";
+import { TMUX_BINARY_OPTION, TMUX_MUX, TMUX_VERSION_ARGS } from "../bridge/mux/tmux/adapter.ts";
+import {
+  resolveTmuxBinary,
+  TMUX_BINARY_CANDIDATES,
+  tmuxServerArgs,
+  tmuxServerLabel,
+} from "../bridge/mux/tmux/exec.ts";
+import { ZELLIJ_BINARY_OPTION, ZELLIJ_MUX } from "../bridge/mux/zellij/adapter.ts";
+import { DURABLE_MUX } from "../bridge/mux/durable/adapter.ts";
+import { TERN_BINARY_OPTION } from "../bridge/mux/tern/adapter.ts";
+import { resolveZellijBinary, zellijBinaryCandidates } from "../bridge/mux/zellij/exec.ts";
+import { chooseSession, parseSessionList, ZELLIJ_LIST_SESSIONS_ARGS } from "../bridge/mux/zellij/protocol.ts";
+import { bindIsWildcard } from "../bridge/crew/config.ts";
+import { deriveMode } from "../bridge/crew/mode.ts";
+import { crewUrl, type HelloResult, type CrewFetch, type PeerOutcome } from "../bridge/crew/peer-client.ts";
+import { crewRuntimePath, parseMarker, rosterDrift, type CrewRuntimeMarker } from "../bridge/crew/staleness.ts";
+import { enrollmentOf, TrustStore, type TrustedMember, type TrustStoreData } from "../bridge/crew/trust-store.ts";
+import {
+  currentUserSid,
+  foreignOwners,
+  isOwnerOnly,
+  type OwnerOnlyDeps,
+  privateCommand,
+  PRIVATE_ROOTS,
+  realOwnerOnlyDeps,
+  scopeOf,
+  whoCanRead,
+} from "../bridge/owner-only.ts";
+import { sidName } from "../bridge/sddl.ts";
+import { DEVICES_FILENAME, isExpired, parseRegistryText } from "../bridge/pairing.ts";
+import { pairedRegistryOf } from "./pairing.ts";
+import { collieVersionBare, type CliContext } from "./context.ts";
+import { aboutCrew, bad, ok, skipped, warn, type DoctorStatus, type Finding } from "./finding.ts";
+import { explicitMux, probeMuxes, refusedMux, type MuxSighting } from "./mux.ts";
+import { cacheFindings } from "./cache-findings.ts";
+import { surfaceFindings } from "./surface-findings.ts";
+import { durableFindings, sourcesFindings } from "./durable-findings.ts";
+import { historyFindings, type SnapshotRead } from "./history.ts";
+import { EXIT, type Io } from "./io.ts";
+import {
+  binaryLayout,
+  type BinaryLayout,
+  classifyInstall,
+  DEFAULT_UPDATE_REPO,
+  type InstallKind,
+  originMatches,
+  originOf,
+  probeInstall,
+  publishedBinary,
+  updateRepoOf,
+  PACKAGED_SENTENCE,
+} from "./install-kind.ts";
+import { packageCommand } from "./package-command.ts";
+import { classifyLink, linkDir, linkPath, type LinkReader, onPath, realLinkFs, resolveLinkTarget } from "./link.ts";
+import { classifyExe, exePathOf, type ExeEvidence } from "../bridge/exe-replaced.ts";
+import { queryTask, taskOwner, windowsPathKey } from "./task-scheduler.ts";
+import { agentLabel, collieBinary, unitName } from "./unit.ts";
+import { pidFilePath } from "./lifecycle.ts";
+import type { Ui } from "./render.ts";
+import {
+  failureLine,
+  type MemberReach,
+  parseCrewArgs,
+  probeMemberReach,
+  soloCrewHint,
+  VERSION_REPORTED_SINCE,
+} from "./crew.ts";
+import { fingerprintRoot, mountName, parseRecord, parseServeStatus, rootAvailability } from "./serve.ts";
+import type { ServeMode } from "./context.ts";
+import type { Exec, Files } from "./sys.ts";
+import { whistleModelFindings, type WhistleSeams } from "./stt-whistle.ts";
+import { BUILD_MARKER, currentVersionDir, listVersions, platformId, readBuildMarker } from "./update.ts";
+import { settingsHold } from "./hold-entry.ts";
+import { loadProfiles } from "../web/src/lib/surface/profile.ts";
+import {
+  HTTPS_DISABLED_HINT,
+  tailnetCertDomains,
+  tailnetInboundBlocked,
+  tailnetName,
+} from "./tailnet.ts";
+
+// `issance doctor` — one read-only pass over the traps that fail silently (M7/02).
+//
+// ── READ-ONLY IS THE CONTRACT, NOT A GUIDELINE ───────────────────────────────
+// Nothing here writes a file, touches a service, mutates a store or publishes/tears down a front
+// door. That is what makes `doctor` safe to run on a machine that is already misbehaving — a
+// diagnostic that "helpfully" fixes something has changed the evidence before you read it. It is
+// enforced structurally rather than by care: {@link DoctorDeps} names no lifecycle verb, no audit
+// log and no mutating store method, so there is nothing to call.
+//
+// ── IT REUSES `crew status`'s PROBES ─────────────────────────────────────────
+// `deriveMode`, `bindIsWildcard`, `probeMembers`, `parseMarker`/`rosterDrift` (the two pure halves
+// `reportDrift` itself prints from), `tailnetInboundBlocked`, and `serve.ts`'s ownership parsing are
+// all imported, never re-derived. A second implementation of a probe is a second thing to drift, and
+// a doctor that disagrees with `crew status` is worse than no doctor.
+//
+// ── EVERY FINDING NAMES A VERB ───────────────────────────────────────────────
+// Each check is one line with a status and, unless it passed, the remedy. "Something is wrong"
+// without a verb is not a finding — the whole value of this verb is that each of these traps
+// currently announces itself as something else (a loopback bind reads as "the lead can't reach the
+// peer", a deny-all ACL as "server down", clock skew as a 401, a rebuilt-not-restarted bridge as "my
+// change didn't take").
+
+// The finding type and its four constructors live in `cli/finding.ts`, so a check can be written in
+// its own module without importing this verb. Re-exported here because `Finding` is `doctor`'s own
+// public shape and every caller and test already imports it from this file.
+export type { DoctorStatus, Finding };
+
+/**
+ * Where `doctor` reaches the world. Same shape as `crewDeps` minus everything that could change
+ * something: no `restart`/`serve`/`unserve`, no audit log, no identity minter, no entropy.
+ */
+export interface DoctorDeps {
+  readonly ctx: CliContext;
+  readonly io: Io;
+  readonly exec: Exec;
+  readonly files: Files;
+  /** Reading the published PATH name, and nothing else — {@link LinkReader} cannot write one. */
+  readonly link: LinkReader;
+  /** Read-only use: `load()` and nothing else. */
+  readonly store: TrustStore;
+  /**
+   * The injected transport — the `hello` probe and one `snapshot` READ per member, plus one GET of
+   * THIS bridge's own `/api/snapshot` (the history section, issue #137). Every one of them is a
+   * read, which is what keeps this verb's contract; there is no mutating route on the other end.
+   */
+  readonly fetch: CrewFetch;
+  /**
+   * The agent-beacon sweep's two seams — a directory listing and a pid probe, both READS
+   * (`bridge/beacon/reader.ts`). There is no writer of a beacon anywhere in the bridge: an agent's
+   * own hook writes them, so this is a diagnostic reading somebody else's file.
+   */
+  readonly beacons: BeaconSweepDeps;
+  readonly now: () => number;
+  /** The path rules and binary name this run judges the install by (`bridge/host.ts`). */
+  readonly host: Host;
+  /**
+   * The owner-only check's seams (`bridge/owner-only.ts`): a `stat`, and on Windows the `icacls` and
+   * `whoami` reads. `doctor` calls `isOwnerOnly` and `currentUserSid` only, which read; the repair
+   * functions are never called from here. A read writes `icacls /save`'s answer to a file in the
+   * user's temp folder and removes it at once: that file is the tool's output, not issance's state.
+   */
+  readonly ownerOnly: OwnerOnlyDeps;
+  /**
+   * The terminal renderer, when this run landed on one (`cli/render.ts`). Absent — which is what
+   * every test and every piped run sees — means the plain lines below, unchanged.
+   */
+  readonly ui?: Ui | null;
+  /** The Whistle model check's stand-in pin, for the tests. Production leaves it. */
+  readonly whistle?: WhistleSeams;
+}
+
+// ── §8.6's window, and the shoulder before it ────────────────────────────────
+// Past ±5 minutes every signed membership request is refused as the uniform 401 of §8.1 — an error
+// that says nothing about clocks, which is exactly why this check exists. ±2 minutes is not a
+// protocol number: it is the shoulder at which a drifting clock is worth fixing before it becomes
+// an outage nobody can diagnose.
+const CLOCK_ERROR_MS = 5 * 60_000;
+const CLOCK_WARN_MS = 2 * 60_000;
+
+/** `issance doctor [--json]`. Exit 0 unless some check is error-severity. */
+export async function cmdDoctor(deps: DoctorDeps, args: readonly string[]): Promise<number> {
+  const { bare } = parseCrewArgs(args, ["json"]);
+  const data = await deps.store.load();
+  const { mode } = deriveMode(enrollmentOf(data));
+  const inCrew = data !== null && data.crew !== null;
+
+  // The members this issance talks to: its peers on a lead, its one lead on a peer. Probed ONCE, and
+  // read by three checks (reachability, versions, clocks). Two calls per member and no more: the
+  // `hello` verdict probe, and the one real data request that keeps `member-reach` honest.
+  const members: readonly TrustedMember[] =
+    data === null ? [] : data.lead === null ? data.peers : [data.lead, ...data.peers];
+  const reaches: Map<string, MemberReach> =
+    inCrew && data !== null && members.length > 0 ? await probeMemberReach(deps, data, members) : new Map();
+  // Versions and clocks read the `hello` half alone — they are questions about the far side's build
+  // and clock, which a data request cannot answer better.
+  const probes: Map<string, PeerOutcome<HelloResult>> = new Map(
+    [...reaches].map(([id, answered]) => [id, answered.hello]),
+  );
+
+  // The emitter's two findings ride together: the second one's wording depends on whether an install
+  // was found, and reading the settings files twice would be two answers to one question.
+  const hookEntries = installedEntries(deps);
+  // The third thing that rides with them: whether the configured multiplexer names its own agents.
+  // An unknown mux name reads as `true` here — `mux` is already an error about exactly that, and a
+  // second red line derived from the same typo teaches an operator to skim.
+  // The chosen multiplexer, resolved ONCE and exactly as `issance start` resolves it — `ISSANCE_MUX`,
+  // else the config the bridge would read, else the probe. Every question below that only makes
+  // sense under one multiplexer is scoped by this same answer, so `doctor` can never report a check
+  // about an adapter this install does not drive.
+  const chosen = muxSettings(deps);
+  const declaration = muxDeclaration(chosen);
+  // How this issance got here, and where its updates come from — read once, and by the same functions
+  // `issance update` decides on, so the two verbs can never disagree about what they are looking at.
+  const install = classifyInstall(probeInstall(deps, deps.ctx.root));
+  // The one artefact a running bridge leaves behind, read once: `restart-pending` takes the pid and
+  // the boot stamp out of it, and `storeDrift` below reads the same marker for the roster.
+  const runtimeMarker = parseMarker(deps.files.read(crewRuntimePath(deps.ctx.stateDir)));
+  // This bridge's own `/api/snapshot`, read ONCE and handed to the two sections that ask for it: the
+  // history section reads the panes off it, and `restart-pending` reads the bridge's own verdict on
+  // whether it is still running the issance on disk (issue #238). One request, two readers.
+  const ownRead = once(() => ownSnapshot(deps));
+  const local: Finding[] = [
+    identity(deps),
+    configFile(deps),
+    webDist(deps),
+    pathLink(deps),
+    installKind(deps, install),
+    versionsLayout(deps, install),
+    updateSource(deps, install),
+    ...quarantine(deps, install),
+    herdrSocket(deps),
+    bindCheck(deps, mode, leadIsOnLoopback(data?.lead?.address ?? null)),
+    bindWildcard(deps),
+    acl(deps),
+    frontDoor(deps, mode),
+    pairedDevices(deps, mode),
+    mux(deps),
+    // A durable program has no binary or listing to ask. Six rows say which transport is configured,
+    // whether its socket or its URL and token may be used, and whether the program answers, and a
+    // seventh whether the lead is new enough to show its panes: only when `durable` is the
+    // multiplexer this install drives.
+    ...(chosen.name === DURABLE_MUX ? await durableFindings({ ctx: deps.ctx, crew: { mode, marker: runtimeMarker } }) : []),
+    // The programs in `sources.json` (M55): one row for the file, then one block per program, each row
+    // named `<row>:<program>`. Nothing when there is no file. The `durable-lead` row comes once: with
+    // the env form's rows above on a durable-only install, after these blocks otherwise.
+    ...(await sourcesFindings({ ctx: deps.ctx, crew: chosen.name === DURABLE_MUX ? undefined : { mode, marker: runtimeMarker } })),
+    // Windows only: who the Task Scheduler task belongs to (M43 spec 05), the long-path switch, and
+    // whether the secret folders are owner-only by their access list (M43 spec 04). No line elsewhere:
+    // on POSIX the mode bits are checked where the files are read, as before.
+    ...(deps.host.platform === "win32" ? [windowsTask(deps), windowsLongPaths(deps), secretsPrivate(deps)] : []),
+    beaconHooks(deps, hookEntries, declaration?.supports.agentDetection ?? true),
+    await beacons(deps, hookEntries.length > 0),
+    skillWalkyTalky(deps),
+    ...walkyRefusals(deps),
+    // The Whistle model (ADR 0096): one finding when the model, or the host engine that needs it, is
+    // on this host, and none otherwise. A host that never heard of Whistle reads exactly as before.
+    ...(await whistleModelFindings(deps)),
+    // Why a pane's History link is not there (issue #137) — its own module, because the chain it
+    // walks (Hangar's build, its per-agent hook, the interpreter that hook needs, what the bridge
+    // reports per pane, where a journal would be read from) is a section rather than a check.
+    ...(await historyFindings({
+      ctx: deps.ctx,
+      exec: deps.exec,
+      files: deps.files,
+      snapshot: ownRead,
+      host: deps.host,
+    })),
+    // Whether the prompt-cache chip is telling the truth: every TTL's date, and the one variable
+    // `doctor` can read that the bridge deliberately cannot (ADR 0041). Its own module for the same
+    // reason `historyFindings` is one — a section, not a check.
+    ...cacheFindings({ ctx: deps.ctx, files: deps.files, env: deps.ctx.env, now: () => Date.now() }),
+    // What the input readers saw, per harness and version, over the last seven days (M56 spec 09): a
+    // summary line and one line per row, read from the bridge's own day files. A read, like the rest.
+    ...surfaceFindings({ ctx: deps.ctx, files: deps.files, now: deps.now }),
+    restartPending(deps, install, runtimeMarker, await ownRead()),
+    // STAMPED `crew` when it is a comparison at all (ADR 0050), while still PRINTING here, where it
+    // always has. `clock` measures this machine against a member's `Date` header and its own remedy
+    // says "enable NTP on whichever machine is off", so the machine at fault may be entirely the far
+    // one: a laptop that wakes six minutes out before NTP resyncs would otherwise turn this desktop's
+    // update button off, which is the exact incident ADR 0050 exists to end. Solo it is `skipped`,
+    // about nobody, and carries no stamp. Together with `store-drift` below this is the rule: these
+    // two arrays are RENDER SECTIONS, and `aboutCrew` is applied per finding on its own merit.
+    inCrew ? aboutCrew(clock(inCrew, probes)) : clock(inCrew, probes),
+  ].filter((f) => appliesToMux(f.check, chosen.name) && appliesToHost(f.check, deps.host));
+  // STAMPED `scope: "crew"`, every one of them (ADR 0050). These four describe the crew's health,
+  // never this machine's readiness to take a new version, and `issance update --check` is the reader
+  // that must not confuse the two: a laptop asleep in another room is not a reason this desktop
+  // cannot update. The stamp rides the finding into `--json` as well, so a script gets the same
+  // split the renderer below already draws as two sections.
+  //
+  // THE STAMP IS NOT A GROUP PASS, AND IT IS NOT THE RENDER SECTION EITHER. ADR 0050's rule is that
+  // a crew fault stops an update only when the update would make it worse, and that is asked of each
+  // check on its own terms. Taken one at a time:
+  //
+  //   `reach`           — CAN be an error, and IS a crew fact. A member that did not answer is
+  //                       already out of contact and levels itself to its lead when it returns
+  //                       (ADR 0016). Stamped, so it is amber.
+  //   `clock`           — CAN be an error, and IS a crew fact, though it prints in the LOCAL section
+  //                       above. Its own remedy says "whichever machine is off", so the machine at
+  //                       fault may be the far one. Stamped there, at its line.
+  //   `store-drift`     — CAN be an error, and is NOT a crew fact. It compares this machine's running
+  //                       bridge to this machine's own store, so it is local and stays red, exactly
+  //                       as it was before ADR 0050. Not stamped; see the note at the list below.
+  //   `secret-generation` — `warn` at worst, so it never reaches the preflight's error filter and the
+  //                       stamp changes nothing for it. A rotation a member slept through does strand
+  //                       that member, which is why it is reported at all, but the strand is already
+  //                       done and an update neither causes nor deepens it. The remedy is a fresh
+  //                       invite, not a held-back release.
+  //   `member-versions` — `warn` at worst, for the same reason: §7.1 makes build skew refuse nothing
+  //                       on the wire, so it is never an error to begin with.
+  //
+  // `cli/doctor.test.ts` holds that last pair to `warn` by reading this file, so a future `bad(` in
+  // either is a failing test rather than a silent downgrade to amber. Two checks can therefore turn
+  // the preflight amber: `reach` and `clock`. Stamping anything else means re-arguing it here.
+  const crew: Finding[] =
+    inCrew && data !== null
+      ? [
+          // RENDERED in the crew section, NOT stamped as a crew fact. `store-drift` compares this
+          // machine's running bridge to this machine's own trust store; it needs no answer from
+          // anywhere else, and its remedy is `issance restart` HERE. `scope` says which machine a
+          // finding is about (`cli/finding.ts`), so stamping this one `crew` would be the group pass
+          // ADR 0050 refuses, and it would read on the phone as "the crew reports: store-drift" when
+          // no other machine reported anything. Left local, it also stays red on a PACKAGED install,
+          // where `issance update` refuses outright, so no update is ever going to restart anything.
+          storeDrift(deps, data),
+          ...[
+            secretGeneration(data, members),
+            reach(data, members, reaches),
+            memberVersions(deps, members, probes),
+            ...memberSurface(members, probes),
+          ].map(aboutCrew),
+        ]
+      : [];
+
+  const findings = [...local, ...crew];
+  if (bare.has("json")) {
+    // stdout and nothing else: the whole point of `--json` is that a script can read it.
+    deps.io.out(JSON.stringify(findings, null, 2));
+  } else {
+    await render(deps, data, mode, local, crew);
+  }
+  return findings.some((f) => f.status === "error") ? EXIT.FAIL : EXIT.OK;
+}
+
+// ── The finding set is scoped by the CHOSEN multiplexer ──────────────────────
+// issance mirrors ONE multiplexer per install, and Hangar is one adapter of the three rather than the
+// product. On a tmux or zellij install Hangar drives nothing: no socket is dialled, and the hooks
+// that name an agent are issance's own (`beacon-hooks-claude`), not `hangar integration`'s. So the
+// checks below are DROPPED there rather than reported `ok` — a hollow pass is a line an operator
+// learns to skim past, and a red one is worse: it fails `issance doctor` on a perfectly healthy host.
+//
+// A Hangar binary on PATH does not bring them back. Presence is not relevance — the same reading the
+// config-dir resolution already takes — so the ONLY thing consulted is which multiplexer this
+// install drives, the same answer `mux` reports.
+//
+// Membership is decided by what a check ASKS, never by how it is spelled: `hangar-socket` probes the
+// socket only Hangar serves, `hangar-version` runs `hangar --version`, and `hook-python3` is here
+// because the interpreter it hunts for is the one HERDR's agent hooks shell out to — issance's own
+// emitter needs none, so an absent `python3` costs a tmux host nothing and must not fail it.
+const HERDR_ONLY_CHECKS = new Set(["herdr-socket", "herdr-version", "hook-python3"]);
+/** `integration-<agent>`: every one of them is a line of `hangar integration status` (cli/history.ts). */
+const HERDR_ONLY_PREFIX = "integration-";
+
+// ── The finding set is scoped by the HOST too ───────────────────────────────
+// `hook-python3` hunts for the interpreter Hangar's shell-flavoured hooks run under. On Windows Hangar
+// installs PowerShell hooks instead (`hangar-agent-state.ps1` for claude, codex and grok, as
+// `hangar integration status` names them on the VM, 2026-10-02), so a missing `python3` costs a
+// Windows host nothing. It reported `error` there, which failed `issance doctor` on every healthy
+// Windows install without Python, and through `issance update --check` turned the phone's Update
+// button off (M43 spec 08). Dropped on Windows, the same way the multiplexer scoping above drops it.
+const NOT_ON_WINDOWS = new Set(["hook-python3"]);
+
+/** Whether a check has anything to say on this host. */
+function appliesToHost(check: string, host: Host): boolean {
+  return host.platform !== "win32" || !NOT_ON_WINDOWS.has(check);
+}
+
+/** Whether a check has anything to say on an install driving `chosenMux`. */
+function appliesToMux(check: string, chosenMux: string): boolean {
+  if (chosenMux === DEFAULT_MUX) return true;
+  return !HERDR_ONLY_CHECKS.has(check) && !check.startsWith(HERDR_ONLY_PREFIX);
+}
+
+// ── Rendering ────────────────────────────────────────────────────────────────
+
+async function render(
+  deps: DoctorDeps,
+  data: TrustStoreData | null,
+  mode: string,
+  local: readonly Finding[],
+  crew: readonly Finding[],
+): Promise<void> {
+  const heading = `issance doctor — ${collieVersionBare(deps.ctx.root, (p) => deps.files.read(p))} · mode ${mode}`;
+  const crewNote = ["crew: none — this issance is not in a crew.", soloCrewHint(deps.host)];
+  // One findings list, two renderings. The terminal gets the columns laid out and the statuses
+  // coloured; everything else gets exactly the lines below, which are what `--json`'s human twin has
+  // always printed and what scripts/issance-cli.test.sh greps.
+  if (deps.ui != null) {
+    await deps.ui.doctor({
+      heading,
+      local,
+      crewTitle: crew.length === 0 ? "crew:" : `crew: ${data?.crew?.name ?? "?"}`,
+      crew,
+      crewNote: crew.length === 0 ? crewNote : [],
+    });
+    return;
+  }
+  deps.io.out(heading);
+  deps.io.out("");
+  deps.io.out("local:");
+  for (const f of local) deps.io.out(line(f));
+  deps.io.out("");
+  if (crew.length === 0) {
+    // One line, exactly as `crew status` does — never a column of padded `skipped` crew checks,
+    // which would train an operator to skim past the ones that mean something.
+    for (const n of crewNote) deps.io.out(n);
+    return;
+  }
+  deps.io.out(`crew: ${data?.crew?.name ?? "?"}`);
+  for (const f of crew) deps.io.out(line(f));
+}
+
+/** One check, one line. The status leads, the identifier is the second word, the remedy closes it. */
+function line(f: Finding): string {
+  const head = f.status === "ok" ? "✓" : `${f.status}:`;
+  // 22 = longest check id ("integration-opencode", 20 chars) + 2, so every id gets
+  // at least one space before the detail. Grow this if a longer check id lands.
+  // A detail of more than one line (the Windows `secrets-private` line puts a path on its own)
+  // continues under its first line. No other detail holds a line break.
+  const body = `  ${head.padEnd(9)}${f.check.padEnd(22)}${f.detail.replaceAll("\n", `\n${" ".repeat(33)}`)}`;
+  return f.remedy === null ? body : `${body} → ${f.remedy}`;
+}
+
+// ── Local checks ─────────────────────────────────────────────────────────────
+
+/**
+ * The very first line: this issance's own version and platform. Not a check — there is nothing to
+ * pass or fail — but an operator pasting a `doctor --json` block into a GitHub issue should never
+ * have to be asked "which version was this" as a follow-up question.
+ */
+function identity(deps: DoctorDeps): Finding {
+  const version = collieVersionBare(deps.ctx.root, (p) => deps.files.read(p));
+  const platform = platformId(process.platform, process.arch) ?? `${process.platform}-${process.arch}`;
+  return ok("issance", `v${version} · ${platform}`);
+}
+
+/**
+ * The two `config.toml` files (ADR 0040), both named whether or not they are there.
+ *
+ * BOTH paths are always in the message, because the failure this check exists for is a typo'd
+ * `ISSANCE_CONFIG` pointing at a file nobody wrote: the settings an operator believes they set are
+ * then simply absent, and nothing else in issance would say so. The verdict ladder is the layer's own
+ * state — a dropped secret is the only `error`, because it is the only case where a value reached the
+ * file and deliberately did not reach the process.
+ */
+function configFile(deps: DoctorDeps): Finding {
+  const layer = deps.ctx.configLayer;
+  // The PATHS come from the resolver, not from the layer, so both are named even when nothing was
+  // read — which is exactly the typo'd-`ISSANCE_CONFIG` case this check exists for.
+  const present = new Map(layer.files.map((f) => [f.path, f.present]));
+  const where = configFilePaths(deps.ctx.env, deps.ctx.home, deps.ctx.configDir)
+    .map((f) => `${f.layer} ${f.path} (${present.get(f.path) === true ? "present" : "absent"})`)
+    .join(" · ");
+  if (layer.blocked.length > 0) {
+    return bad(
+      "config-file",
+      `${where} — dropped ${layer.blocked.join(", ")}: the file holding them is not owner-only`,
+      // Windows has no `chmod 600`: the loader's own warning above carries the `icacls` line for
+      // that file (M43 spec 04), and on POSIX the remedy is what it always was.
+      deps.host.platform === "win32"
+        ? "run the `icacls` line the warning above names for that file, then `issance restart`"
+        : "`chmod 600` that file, then `issance restart`",
+    );
+  }
+  if (layer.problems.length > 0) {
+    return warn(
+      "config-file",
+      `${where} — ${String(layer.problems.length)} problem(s)`,
+      "`issance config check`",
+    );
+  }
+  if (![...present.values()].includes(true)) {
+    return skipped("config-file", `${where} — no config file, the env decides everything`, "`issance config init`");
+  }
+  return ok("config-file", `${where} — parsed clean`);
+}
+
+/** The bundle the bridge serves from disk at request time. Absent means a blank app, not an error page. */
+function webDist(deps: DoctorDeps): Finding {
+  const dist = join(deps.ctx.root, "web", "dist");
+  const entries = deps.files.list(dist);
+  if (!deps.files.exists(dist) || entries.length === 0) {
+    return bad("web-dist", `${dist} is absent or empty — the app would load blank`, "`issance build`");
+  }
+  if (!entries.includes("index.html")) {
+    return bad("web-dist", `${dist} has no index.html — a half-finished build`, "`issance build`");
+  }
+  return ok("web-dist", `${entries.length} entries, index.html present`);
+}
+
+/**
+ * The name on PATH (`issance link`, ADR 0021). Not being linked is a perfectly good state — the verb
+ * is opt-in — so it reads `ok` and merely names what would publish it. What is worth a warning is a
+ * name that exists and does NOT reach this checkout: another instance's link, or something issance
+ * never published. The verdict comes from `classifyLink`, the same pure function `link` decides on,
+ * so `doctor` cannot disagree with the verb about what it is looking at.
+ */
+function pathLink(deps: DoctorDeps): Finding {
+  const at = linkPath(deps.ctx.home);
+  const own = publishedBinary(deps.ctx.root, deps.link, deps.host);
+  const verdict = classifyLink(deps.link.probe(at), own);
+  switch (verdict.action) {
+    case "create":
+      return ok("path-link", `not linked — \`issance link\` would publish ${at} → ${own}`);
+    case "keep": {
+      const dir = linkDir(deps.ctx.home);
+      if (!onPath(dir, deps.ctx.env.PATH)) {
+        return warn(
+          "path-link",
+          `${at} → ${own} (this checkout), but ${dir} is not on PATH — the name is published and the shell cannot find it`,
+          `add ${dir} to your shell profile's PATH`,
+        );
+      }
+      return ok("path-link", `${at} → ${own} (this checkout)`);
+    }
+    case "replace":
+      return warn(
+        "path-link",
+        `${at} → ${verdict.previous} — a DIFFERENT checkout owns the name, so a bare \`issance\` runs that one`,
+        "`issance link` here to take it over, or leave it to that instance",
+      );
+    case "refuse":
+      return warn(
+        "path-link",
+        `${at} is ${verdict.reason} — issance will not touch it`,
+        `move it aside yourself, then \`issance link\``,
+      );
+  }
+}
+
+/**
+ * **How this issance was installed.** Structural, never a marker file: a git dir makes it a checkout
+ * (detached is the Hangar-managed shape), a `versions/X.Y.Z` parent with a `current` symlink beside it
+ * makes it a binary install, and anything else is reported as unknown rather than guessed at. The
+ * verdict comes from `classifyInstall`, which is also the one `issance update` forks on.
+ */
+/**
+ * The PATH name that points INTO this root, or null when none of the usual ones does.
+ *
+ * A package installs `/usr/bin/issance` as a symlink into its own prefix, which is the layout
+ * `bridge/root.ts` resolves the root back through. The candidates are read, never written, and a
+ * name that points somewhere else is not this install's — so a second issance on `$PATH` is reported
+ * as "no PATH name points at it" rather than claimed.
+ */
+function packageSymlink(deps: DoctorDeps): string | null {
+  const own = collieBinary(deps.ctx.root, deps.host);
+  const candidates = ["/usr/bin/issance", "/usr/local/bin/issance", "/opt/homebrew/bin/issance", linkPath(deps.ctx.home)];
+  for (const at of candidates) {
+    const probe = deps.link.probe(at);
+    if (probe.kind === "symlink" && resolveLinkTarget(at, probe.target) === own) return at;
+  }
+  return null;
+}
+
+function installKind(deps: DoctorDeps, install: InstallKind): Finding {
+  const root = deps.ctx.root;
+  const version = collieVersionBare(root, (p) => deps.files.read(p));
+  switch (install.kind) {
+    case "binary": {
+      const layout = binaryLayout(root, deps.host);
+      const kept = deps.files.list(layout.versionsDir).filter((v) => v !== layout.version).length;
+      return ok(
+        "install",
+        `binary install, version ${layout.version} at ${layout.installRoot} (${kept} previous kept)`,
+      );
+    }
+    case "linked-clone":
+    case "detached-checkout": {
+      if (isStagedCheckout(deps, root)) {
+        // The normal shape since M15/02: a git WORKTREE of a release tag, under this install's own
+        // `versions/`, with `current` beside it. Both signals are true here on purpose.
+        const layout = binaryLayout(root, deps.host);
+        return ok(
+          "install",
+          `staged checkout, version ${layout.version} at ${layout.installRoot} (worktree of ${root})`,
+        );
+      }
+      if (install.alsoLayout) {
+        // Both signals, and no build marker: a human put a working tree inside somebody's versions/
+        // layout. `update` takes the git path — a `.git` means uncommitted work may be in there, and
+        // the binary path would rename it into `.trash/`. Printed rather than hidden.
+        return warn(
+          "install",
+          `a git checkout inside a binary layout (${root})`,
+          "`issance update` will use the git path and leave the versions/ layout alone",
+        );
+      }
+      if (install.kind === "detached-checkout") {
+        return ok("install", `Hangar-managed checkout at ${root} (detached at ${version})`);
+      }
+      const branch = deps.exec.capture("git", ["-C", root, "symbolic-ref", "--short", "HEAD"]);
+      const origin = originOf(deps.exec, root);
+      const from = origin.kind === "repo" ? origin.repo : origin.kind === "other" ? origin.url : "no origin";
+      return ok("install", `linked clone at ${root} (branch ${branch.stdout.trim() || "?"}, origin ${from})`);
+    }
+    case "packaged": {
+      // THREE FACTS, because they are the three an operator needs to check the install by hand: the
+      // kind, the prefix the root resolved to (which is what `bridge/root.ts` derived from a
+      // realpath'd `execPath`, and what decides whether `web/dist` is found), and the PATH name
+      // pointing into it (ADR 0021's pointer, here owned by the package manager rather than by
+      // `issance link`). Healthy, never a warning: nothing is wrong with this install.
+      const via = packageSymlink(deps);
+      const named = packageCommand(root);
+      const tail = [
+        `version ${version}`,
+        via === null ? "no PATH name points at it" : `via ${via}`,
+        named === null ? PACKAGED_SENTENCE : `${PACKAGED_SENTENCE} — \`${named}\``,
+      ].join(", ");
+      return ok("install", `packaged install at ${root} (${tail})`);
+    }
+    case "unknown":
+      if (install.why === "orphan-layout") {
+        return warn(
+          "install",
+          `binary layout with no \`current\` symlink (${binaryLayout(root, deps.host).installRoot})`,
+          "reinstall: curl -fsSL https://issance.com/install.sh | sh",
+        );
+      }
+      if (install.why === "broken-checkout") {
+        // NOT "cannot tell how this was installed" — we can tell, and the answer is why it stopped.
+        // The remedy is a repair, and naming it matters: the alternative the operator would
+        // otherwise reach for is a reinstall, which throws the working tree away.
+        return warn(
+          "install",
+          `a checkout whose git data is unreadable (${root}/.git exists, git will not read it)`,
+          "`git -C <root> status` to see what git says; repair or re-clone before updating",
+        );
+      }
+      return warn(
+        "install",
+        install.why === "no-marker"
+          ? `cannot tell how this issance was installed (no herdr-plugin.toml at ${root})`
+          : `cannot tell how this issance was installed (${root} has no .git of its own and no versions/ layout above it)`,
+        "`issance update` cannot run here; see docs/install.md",
+      );
+  }
+}
+
+/**
+ * Is `root` a version of a STAGED checkout — a git worktree under a `versions/` directory that
+ * carries the build marker its own build wrote? The marker is what tells this shape apart from a
+ * clone someone dropped inside a binary install's layout, which is an ambiguity, not a design.
+ */
+function isStagedCheckout(deps: DoctorDeps, root: string): boolean {
+  if (basename(dirname(root)) !== "versions") return false;
+  return readBuildMarker(deps, root) !== null;
+}
+
+/**
+ * **The `versions/` layout: what is live, what is retained, and whether `current` resolves.** This is
+ * the outside view of the stage-then-swap shape both install kinds now use — the answer to "which
+ * version am I running, and what would `--rollback` return to".
+ *
+ * On a checkout it also RECONCILES against `git worktree list`: a version is a worktree, and the two
+ * halves of a worktree (its directory and git's administrative record of it) can be removed
+ * separately. A record with no directory blocks the next `worktree add` of the same name, so it is
+ * worth a line before it is worth an incident.
+ */
+function versionsLayout(deps: DoctorDeps, install: InstallKind): Finding {
+  const root = deps.ctx.root;
+  const staged = isStagedCheckout(deps, root);
+  if (install.kind === "unknown") {
+    return skipped("versions", "install kind unknown — nothing to report a layout for", "see docs/install.md");
+  }
+  if (install.kind === "packaged") {
+    // The generic line below says "the next `issance update` stages one", which on this kind is a
+    // promise about the exact command that refuses. Before `packaged` existed the same tree was
+    // `unknown` and this check was skipped, so falling through would be a regression to a false
+    // statement sitting three lines under an install line that says the opposite.
+    return skipped(
+      "versions",
+      `a packaged install stages no versions — ${PACKAGED_SENTENCE}`,
+      "your package manager keeps its own previous versions, if it keeps any",
+    );
+  }
+  if (!staged && install.kind !== "binary") {
+    if (install.kind === "detached-checkout") {
+      return ok("versions", `in place at ${root} — a Hangar-managed checkout advances in place (ADR 0006)`);
+    }
+    return ok("versions", `in place at ${root} — no versions/ layout yet; the next \`issance update\` stages one`);
+  }
+  const kind = staged ? "checkout" : "binary";
+  const layout = binaryLayout(root, deps.host);
+  const versions = listVersions(deps, layout, kind);
+  const at = currentVersionDir(deps, layout);
+  const live = versions.find((v) => v.dir === at);
+  // Newest first: what an operator scans this line for is the rollback target, which is the first
+  // name after `current`.
+  const newestFirst = versions.toReversed();
+  const previous = newestFirst.filter((v) => v.complete && v.dir !== at).map((v) => v.dir);
+  const kept = `${previous.length} retained${previous.length === 0 ? "" : ` (${previous.join(", ")})`}`;
+  const drift = staged ? worktreeDrift(deps, layout, newestFirst.map((v) => v.dir)) : null;
+  if (at === null) {
+    return bad(
+      "versions",
+      `${layout.currentLink} resolves to no version under ${layout.versionsDir} — ${kept}`,
+      "`issance update` re-stages and re-points it; a binary install reinstalls with docs/install.md",
+    );
+  }
+  if (live === undefined || !live.complete) {
+    return bad(
+      "versions",
+      `${layout.currentLink} → ${at}, which is ${live === undefined ? "not on disk" : `incomplete (no ${BUILD_MARKER})`} — ${kept}`,
+      "`issance update --rollback` returns to the newest retained version",
+    );
+  }
+  if (drift !== null) return warn("versions", `current ${at} · ${kept} · ${drift}`, "`git worktree prune`");
+  return ok("versions", `current ${at} · ${kept}`);
+}
+
+/** What `git worktree list` says that the directories under `versions/` do not, or null when they agree. */
+function worktreeDrift(deps: DoctorDeps, layout: BinaryLayout, dirs: readonly string[]): string | null {
+  const r = deps.exec.capture("git", ["-C", deps.ctx.root, "worktree", "list", "--porcelain"]);
+  if (!r.found || r.code !== 0) return "git could not list the worktrees";
+  const listed = r.stdout
+    .split("\n")
+    .filter((row) => row.startsWith("worktree "))
+    .map((row) => row.slice("worktree ".length).trim())
+    .filter((p) => dirname(p) === layout.versionsDir)
+    .map((p) => basename(p));
+  const orphaned = listed.filter((d) => !dirs.includes(d));
+  const untracked = dirs.filter((d) => !listed.includes(d));
+  if (orphaned.length === 0 && untracked.length === 0) return null;
+  const said: string[] = [];
+  if (orphaned.length > 0) said.push(`git still records ${orphaned.join(", ")} with no directory on disk`);
+  if (untracked.length > 0) said.push(`${untracked.join(", ")} is on disk but git tracks no worktree there`);
+  return said.join("; ");
+}
+
+/**
+ * Where updates come from — the trust boundary, said out loud. On a binary install
+ * `ISSANCE_UPDATE_REPO` IS the source (it selects the tags endpoint and every constructed download
+ * URL), and on a git install it is an assertion against `origin` that `issance update` refuses on.
+ */
+function updateSource(deps: DoctorDeps, install: InstallKind): Finding {
+  const repo = updateRepoOf(deps.ctx.env);
+  if (install.kind === "packaged") {
+    // Naming a GitHub repo here would answer a question this install does not have. Nothing issance
+    // does fetches from it: `update` refuses, and the release listing is only ever read to say
+    // whether a newer version exists. Where the new files actually come from is not on disk.
+    const named = packageCommand(deps.ctx.root);
+    return ok("update-source", named === null ? PACKAGED_SENTENCE : `${PACKAGED_SENTENCE} — \`${named}\``);
+  }
+  const isGit = install.kind === "linked-clone" || install.kind === "detached-checkout";
+  if (!isGit) {
+    return repo === DEFAULT_UPDATE_REPO
+      ? ok("update-source", `github.com/${repo}`)
+      : warn(
+          "update-source",
+          `github.com/${repo} (ISSANCE_UPDATE_REPO) — updates come from a fork`,
+          "unset ISSANCE_UPDATE_REPO to take issance's own releases",
+        );
+  }
+  const origin = originOf(deps.exec, deps.ctx.root);
+  if (originMatches(origin, repo)) {
+    return repo === DEFAULT_UPDATE_REPO
+      ? ok("update-source", `github.com/${repo}`)
+      : warn(
+          "update-source",
+          `github.com/${repo} (ISSANCE_UPDATE_REPO) — updates come from a fork`,
+          "unset ISSANCE_UPDATE_REPO to take issance's own releases",
+        );
+  }
+  if (origin.kind === "unresolvable") {
+    return warn(
+      "update-source",
+      `this checkout cannot say where it came from (no \`origin\` remote, or no git), and updates are` +
+        ` configured to come from github.com/${repo}`,
+      "`issance update` will refuse rather than force-checkout; add an origin, or reinstall",
+    );
+  }
+  const named = origin.kind === "repo" ? `github.com/${origin.repo}` : origin.url;
+  return bad(
+    "update-source",
+    `origin is ${named} but updates are configured to come from github.com/${repo}`,
+    '`issance update` will refuse; see docs/upgrading.md → "You run a fork"',
+  );
+}
+
+/**
+ * macOS only, and only on a binary install: a browser-downloaded artifact carries
+ * `com.apple.quarantine` and Gatekeeper then refuses the ad-hoc-signed binary with "the developer
+ * cannot be verified". `curl` and `tar` do not set it, so the installer's path is unaffected — this
+ * check exists to turn the one confusing macOS failure into a command. Gated on `xattr` existing,
+ * which is how this stays a no-op everywhere else; reading an xattr changes nothing.
+ */
+function quarantine(deps: DoctorDeps, install: InstallKind): Finding[] {
+  if (install.kind !== "binary") return [];
+  if (deps.exec.which("xattr") === null) return [];
+  const binary = collieBinary(binaryLayout(deps.ctx.root, deps.host).currentLink, deps.host);
+  const r = deps.exec.capture("xattr", ["-p", "com.apple.quarantine", binary]);
+  if (!r.found || r.code !== 0) return [];
+  return [
+    warn(
+      "quarantine",
+      `${binary} carries com.apple.quarantine — Gatekeeper will refuse to run it`,
+      `xattr -d com.apple.quarantine ${binary}`,
+    ),
+  ];
+}
+
+/**
+ * Hangar's socket. Existence is the whole probe: dialling it would need a `Bun.connect` seam this
+ * suite cannot exercise (CLAUDE.md), and a socket file that exists with nothing behind it fails the
+ * next check an operator runs anyway — `hangar status` — which is what the remedy names.
+ */
+function herdrSocket(deps: DoctorDeps): Finding {
+  if (!deps.files.exists(deps.ctx.socket)) {
+    return bad(
+      "herdr-socket",
+      `no socket at ${deps.ctx.socket} — everything the bridge shows comes through it`,
+      "check `hangar status`, or point HERDR_SOCKET_PATH at the socket in use, then `issance restart`",
+    );
+  }
+  return ok("herdr-socket", deps.ctx.socket);
+}
+
+/** A bind that only loopback can reach. Not loopback itself — `127.0.0.1` is the right answer solo. */
+function isLoopbackBind(host: string): boolean {
+  const h = host.trim().toLowerCase();
+  return h === "localhost" || h === "::1" || h === "[::1]" || h.startsWith("127.");
+}
+
+/**
+ * Whether this peer dials its lead on loopback. The stored address goes through `crewUrl`, the same
+ * builder the dial uses, so an address the dial would refuse never counts.
+ */
+function leadIsOnLoopback(address: string | null): boolean {
+  const url = address === null ? null : crewUrl(address, "");
+  return url !== null && isLoopbackBindHost(new URL(url).hostname);
+}
+
+/**
+ * **The #1 field trap.** A peer that kept the default loopback bind answers its own machine and
+ * nobody else, so the lead's `hello` never lands, the member never loses its `provisional` marker,
+ * and every symptom points at the lead.
+ *
+ * Except when this peer reaches its lead on loopback too. Then the lead sits on this host or at the
+ * far end of an operator-owned tunnel (an `ssh -L`/`-R` pair, say), the lead's own dial arrives over
+ * that same tunnel, and loopback is the right bind: ADR 0013's table names both rows. This peer
+ * cannot see the lead's dial, so a tunnel that runs one way only is the lead's `member-reach` to
+ * catch.
+ */
+function bindCheck(deps: DoctorDeps, mode: string, leadOnLoopback: boolean): Finding {
+  const host = resolvedBind(deps);
+  const shown = bindIsWildcard(host) ? "0.0.0.0/:: (ISSANCE_HOST empty)" : host;
+  if (mode === "peer" && isLoopbackBind(host)) {
+    if (leadOnLoopback) {
+      return ok("bind", `${shown} (mode peer: this peer listens on loopback, and it reaches its lead on loopback too, so the lead sits on this host or at the end of a tunnel)`);
+    }
+    const suggestion = tailnetName(deps.exec) ?? "<address the lead can dial>";
+    return bad(
+      "bind",
+      `ISSANCE_HOST=${host} on a PEER — only this machine can reach the crew listener, so the lead's` +
+        " probe never lands and the member stays provisional",
+      `set ISSANCE_HOST=${suggestion} in ${join(deps.ctx.configDir, ".env")}, then \`issance restart\``,
+    );
+  }
+  // The other direction, and it stops the process rather than degrading it: outside a crew, a bind
+  // that is not loopback is REFUSED at boot (bridge/index.ts), because every browser write gate is a
+  // header a client can set. Asking bridge/config.ts rather than re-deciding here keeps one rule.
+  if (
+    mode === "solo" &&
+    nonLoopbackBindRefusal({
+      host,
+      allowNonLoopbackBind: envBool("ISSANCE_ALLOW_NON_LOOPBACK_BIND", false, deps.ctx.env),
+    }) !== null
+  ) {
+    return bad(
+      "bind",
+      `ISSANCE_HOST=${shown} is not loopback and this issance is in no crew — the bridge refuses to start`,
+      `set ISSANCE_HOST=127.0.0.1 in ${join(deps.ctx.configDir, ".env")} and put your ingress in front, or set ISSANCE_ALLOW_NON_LOOPBACK_BIND=1 if you meant it`,
+    );
+  }
+  return ok("bind", `${shown} (mode ${mode})`);
+}
+
+/**
+ * `ISSANCE_HOST` as the BRIDGE resolves it (`resolveBridgeHost` in `bridge/config.ts`: absent ⇒
+ * loopback, explicitly empty ⇒ every interface), which is also how `crew status` prints it and how
+ * the `issance start`/`status` banner probes readiness. Resolving it differently here would make
+ * `doctor` warn about a bind the process never had.
+ */
+const resolvedBind = (deps: DoctorDeps): string => resolveBridgeHost(deps.ctx.env);
+
+/**
+ * Whether any device is paired here (M46 spec 03). Pairing is always on (ADR 0086): with nothing in
+ * `paired-devices.json` the bridge answers `/api/health` and `/api/pair` and refuses every other
+ * `/api` route with `device not paired`, so the phone shows its pair screen and nothing else. A warning
+ * and not an error: it is the state every fresh install starts in, and the remedy is one command.
+ *
+ * Read off disk through `pairedRegistryOf`, the reader `devices list` uses, so a half-written file
+ * counts the same devices here as there. A PEER is skipped: it publishes no front door (ADR 0013), its phone
+ * reads it through the lead, and the lead's registry is the one that decides.
+ */
+function pairedDevices(deps: DoctorDeps, mode: string): Finding {
+  if (mode === "peer") {
+    return skipped("pairing", "a peer is read through its lead — pair devices on the lead", "`issance pair` on the lead");
+  }
+  // A file that is THERE and not a registry is its own finding, before the count: `pairedRegistryOf`
+  // reads it as empty, while the bridge answers every phone `503 pairing unavailable` until it can
+  // read it (bridge/pairing.ts, RegistryUnreadableError). Saying "no device paired" would send the
+  // operator to pair again over a registry that still holds every device.
+  const raw = deps.files.read(join(deps.ctx.stateDir, DEVICES_FILENAME));
+  if (raw !== null && parseRegistryText(raw) === null) {
+    return warn(
+      "pairing",
+      `${DEVICES_FILENAME} is there and cannot be read: every phone gets 503 \`pairing unavailable\` until it can`,
+      `restore ${join(deps.ctx.stateDir, DEVICES_FILENAME)} from a backup, or move it aside and run \`issance pair\` for each phone`,
+    );
+  }
+  const devices = pairedRegistryOf(deps.files, deps.ctx.stateDir).devices;
+  const live = devices.filter((d) => !isExpired(d, Date.now()));
+  if (devices.length === 0) {
+    return warn(
+      "pairing",
+      "no device paired yet: every /api route but health and pair answers 403 `device not paired`",
+      "run `issance pair` here and enter the code on the phone",
+    );
+  }
+  if (live.length === 0) {
+    return warn(
+      "pairing",
+      `${String(devices.length)} device(s) paired, and every pairing has expired: no device can read or write`,
+      "run `issance pair` here and enter the code on the phone",
+    );
+  }
+  return ok("pairing", `${String(live.length)} device(s) paired`);
+}
+
+/** The operator's own decision, reported back — never a failure (ADR 0013's posture). */
+function bindWildcard(deps: DoctorDeps): Finding {
+  if (!bindIsWildcard(resolvedBind(deps))) return ok("bind-wildcard", "bound to one address");
+  return warn(
+    "bind-wildcard",
+    "ISSANCE_HOST is a wildcard — ALL interfaces, gated only by pinned mTLS + the crew secret (§3)",
+    `deliberate? nothing to do. Otherwise set ISSANCE_HOST to one address in ${join(deps.ctx.configDir, ".env")} and \`issance restart\``,
+  );
+}
+
+/**
+ * The tailnet ACL smoke alarm, and **its asymmetry is load-bearing**: an empty inbound packet filter
+ * proves this node admits nobody; a non-empty one proves nothing at all (a filter can grant some peer
+ * some port and still not grant your phone :443). So the pass reads `can't disprove`, never as proof
+ * of reachability — the wording is the check.
+ */
+function acl(deps: DoctorDeps): Finding {
+  if (deps.exec.which("tailscale") === null) {
+    return skipped(
+      "acl",
+      "no `tailscale` here — this node's inbound packet filter cannot be read",
+      "check your tailnet ACL policy by hand (`tailscale debug netmap`, on a host that has it)",
+    );
+  }
+  if (tailnetInboundBlocked(deps.exec)) {
+    return bad(
+      "acl",
+      "this node's inbound packet filter is EMPTY — no tailnet peer is admitted, so the URL is a" +
+        " promise nothing can keep and the failure reads as `server down`",
+      "grant this node access in your TAILNET ACL policy (not a issance verb), then re-run `issance doctor`",
+    );
+  }
+  return ok("acl", "inbound packet filter is non-empty — can't disprove reachability; non-empty proves nothing");
+}
+
+/**
+ * On Windows issance publishes no front door (M43 spec 09, docs/windows.md): the operator runs
+ * `tailscale serve` by hand, so a remedy that says `issance serve` sends them to the wrong place.
+ * The by-hand command lives here, once; every Windows remedy below builds on it.
+ */
+const tailscaleServeByHand = (port: number): string => `\`tailscale serve --bg --set-path=/ ${port}\``;
+
+/**
+ * Pairing is always on (ADR 0086): a published issance answers no phone until one is paired. The
+ * remedies that publish say so, because a door that opens onto a pair screen looks broken otherwise.
+ */
+const WINDOWS_PAIR_NOW = "run `issance pair` to pair a device";
+
+const windowsPublishRemedy = (port: number): string =>
+  `run ${tailscaleServeByHand(port)} in PowerShell, then ${WINDOWS_PAIR_NOW}: until then issance` +
+  " answers no device (docs/windows.md); or set ISSANCE_SKIP_SERVE=1 if you own the ingress";
+
+const windowsHttpsDisabledHint = (port: number): string =>
+  'enable HTTPS in the admin console (https://login.tailscale.com/admin/dns, "Enable HTTPS"), then run' +
+  ` ${tailscaleServeByHand(port)} again; on a Headscale tailnet (a self-hosted Tailscale server) use` +
+  ` \`tailscale serve --bg --http=80 --set-path=/ ${port}\`; ${WINDOWS_PAIR_NOW} after you publish (docs/windows.md)`;
+
+const windowsStatusUnreadableRemedy = (port: number): string =>
+  `run \`tailscale serve status\` by hand; if no / mapping to port ${port} shows, run` +
+  ` ${tailscaleServeByHand(port)} (docs/windows.md)`;
+
+const windowsOccupiedRemedy = (port: number): string =>
+  "run `tailscale serve status` to see what owns that listener; free it, or point issance elsewhere, then run" +
+  ` ${tailscaleServeByHand(port)} (docs/windows.md)`;
+
+/**
+ * The listener of a hand-made root mount that proxies to this issance, or `null`. Two places are
+ * looked at: the listener the configured serve mode names, and plain HTTP on :80, which is the form
+ * docs/windows.md gives for a tailnet with no HTTPS certificates (Headscale).
+ */
+function windowsHandMadeDoor(deps: DoctorDeps): number | null {
+  const status = liveServeStatus(deps);
+  if (status === null) return null;
+  const proxy = `http://127.0.0.1:${deps.ctx.port}`;
+  const configured = deps.ctx.serveMode === "http" ? deps.ctx.port : deps.ctx.servePort;
+  const candidates: [number, ServeMode][] = [
+    [configured, deps.ctx.serveMode],
+    [80, "http"],
+  ];
+  for (const [listener, protocol] of candidates) {
+    try {
+      if (rootAvailability(status, listener, protocol, proxy, deps.ctx.basePath) === "adoptable") return listener;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * `tailscale serve` reality vs. the `tailscale-managed-handler` record. Only a mapping matching the
+ * record is ours (ADR 0001); a mapping we do not own is REPORTED, never touched — and a **peer** with
+ * any mapping at all is an error, because a peer publishes nothing (ADR 0013).
+ */
+function frontDoor(deps: DoctorDeps, mode: string): Finding {
+  const windows = deps.host.platform === "win32";
+  const skip = deps.ctx.env.ISSANCE_SKIP_SERVE === "1";
+  const raw = deps.files.read(deps.ctx.handlerFile);
+
+  if (raw !== null && mode === "peer") {
+    return bad(
+      "front-door",
+      `this issance is a PEER and still owns a \`tailscale serve\` mapping (${deps.ctx.handlerFile}) —` +
+        " a peer publishes no front door (ADR 0013)",
+      "`issance unserve` here",
+    );
+  }
+  if (skip && raw !== null) {
+    return warn(
+      "front-door",
+      "ISSANCE_SKIP_SERVE=1, but a issance-owned mapping is still recorded — the ingress you think is" +
+        " closed may still be open",
+      "`issance unserve` here",
+    );
+  }
+  if (skip) return ok("front-door", "ISSANCE_SKIP_SERVE=1 — the operator owns the ingress, issance publishes nothing");
+
+  if (deps.exec.which("tailscale") === null) {
+    return skipped(
+      "front-door",
+      "no `tailscale` here — the published mapping cannot be read",
+      windows
+        ? `install tailscale and run ${tailscaleServeByHand(deps.ctx.port)} (docs/windows.md), or set ISSANCE_SKIP_SERVE=1 if you own the ingress (docs/deployment.md Variant E)`
+        : "install tailscale and `issance serve`, or set ISSANCE_SKIP_SERVE=1 if you own the ingress (docs/deployment.md Variant E)",
+    );
+  }
+  // Windows records no mapping, so a root mount that proxies to us is the operator's own
+  // `tailscale serve`, and it is the door working as designed (docs/windows.md). Asked before the
+  // certificate question: on a Headscale tailnet the door is plain HTTP on :80 and no certificate
+  // will ever exist.
+  if (windows && raw === null && mode !== "peer") {
+    const door = windowsHandMadeDoor(deps);
+    if (door !== null) {
+      return ok(
+        "front-door",
+        `:${door} proxies to http://127.0.0.1:${deps.ctx.port}, published by hand (issance records no mapping on Windows)`,
+      );
+    }
+  }
+  // No certificates, no https door — and `tailscale serve` says so by asking a question at a
+  // terminal a service has not got (#172). `issance serve` refuses on this same fact; doctor names it
+  // here so the operator reads it before they type the verb.
+  if (deps.ctx.serveMode === "https" && tailnetCertDomains(deps.exec)?.length === 0) {
+    return warn(
+      "front-door",
+      "this tailnet has no HTTPS certificates, so an https front door cannot be published",
+      windows ? windowsHttpsDisabledHint(deps.ctx.port) : HTTPS_DISABLED_HINT,
+    );
+  }
+  const status = liveServeStatus(deps);
+  if (status === null) {
+    return skipped(
+      "front-door",
+      "`tailscale serve status --json` did not answer readably",
+      windows
+        ? windowsStatusUnreadableRemedy(deps.ctx.port)
+        : "run it by hand; then `issance serve` if this issance's root mount is missing",
+    );
+  }
+
+  if (raw === null) {
+    // No record. On a peer that is the correct state; on a lead it is a crew with no published URL.
+    const proxy = `http://127.0.0.1:${deps.ctx.port}`;
+    const listener = deps.ctx.serveMode === "http" ? deps.ctx.port : deps.ctx.servePort;
+    let availability;
+    try {
+      availability = rootAvailability(status, listener, deps.ctx.serveMode, proxy, deps.ctx.basePath);
+    } catch {
+      return skipped("front-door", "the serve status was not readable", "run `tailscale serve status --json` by hand");
+    }
+    if (mode === "peer") {
+      return availability === "adoptable"
+        ? bad(
+            "front-door",
+            `this issance is a PEER and a root mount on :${listener} still proxies to ${proxy} — a peer publishes nothing (ADR 0013)`,
+            "`issance unserve` here",
+          )
+        : ok("front-door", "a peer publishes nothing, and nothing of ours is published");
+    }
+    if (availability === "occupied" || availability === "protocol-mismatch") {
+      return warn(
+        "front-door",
+        `:${listener} carries a root mount issance does not own (${availability}) — reported, never touched`,
+        windows
+          ? windowsOccupiedRemedy(deps.ctx.port)
+          : "free that listener, or point issance elsewhere, then `issance serve`",
+      );
+    }
+    const detail = `no issance-managed mapping is recorded and nothing of ours is published on :${listener}`;
+    const publishRemedy = windows
+      ? windowsPublishRemedy(deps.ctx.port)
+      : "`issance serve` here (or ISSANCE_SKIP_SERVE=1 if you own the ingress)";
+    return mode === "lead"
+      ? bad(
+          "front-door",
+          `${detail} — the crew has a lead with no URL for the phone`,
+          publishRemedy,
+        )
+      : warn(
+          "front-door",
+          `${detail} — the phone has nothing to point at`,
+          publishRemedy,
+        );
+  }
+
+  let record;
+  try {
+    record = parseRecord(raw);
+  } catch (err) {
+    return warn(
+      "front-door",
+      `the ownership record is unreadable — ${err instanceof Error ? err.message : String(err)}; issance` +
+        " will refuse to tear down what it cannot prove it owns",
+      `fix or remove ${deps.ctx.handlerFile}, then \`issance serve\``,
+    );
+  }
+  // The record names the mount the door was published at; the bridge serves the one in its
+  // environment. When the two differ the phone opens one path and the app lives at another, and
+  // nothing else reports it (ADR 0052).
+  if (record.path !== deps.ctx.basePath) {
+    return warn(
+      "front-door",
+      `the published door is the ${mountName(record.path)} on ${record.hostPort}, but ISSANCE_BASE_PATH` +
+        ` mounts this issance at ${deps.ctx.basePath} — the phone and the app name different paths`,
+      "`issance serve` here to move the door to the configured mount",
+    );
+  }
+  const fingerprint = fingerprintRoot(status, record.hostPort, record.port, record.path);
+  if (fingerprint === `${record.mode}|proxy:${record.proxy}`) {
+    const at = record.path === "/" ? "" : ` at ${record.path}`;
+    return ok("front-door", `${record.hostPort}${at} → ${record.proxy} (recorded and live)`);
+  }
+  if (fingerprint === "absent") {
+    return warn(
+      "front-door",
+      `the record names ${record.hostPort}, but no root mount is published there`,
+      "`issance serve` here to republish it",
+    );
+  }
+  return warn(
+    "front-door",
+    `the record names ${record.hostPort} → ${record.proxy}, but that root is now ${fingerprint} —` +
+      " something else owns it and issance will not touch it",
+    `\`issance serve\` here, or clear ${deps.ctx.handlerFile} if that mapping is deliberately someone else's`,
+  );
+}
+
+/** `tailscale serve status --json`, parsed — `null` for every "can't tell", as everywhere else. */
+function liveServeStatus(deps: DoctorDeps): ReturnType<typeof parseServeStatus> | null {
+  const r = deps.exec.capture("tailscale", ["serve", "status", "--json"]);
+  if (!r.found || r.code !== 0) return null;
+  try {
+    return parseServeStatus(r.stdout);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * This bridge's own `/api/snapshot`, as text — `null` when nothing answered there.
+ *
+ * The address is the one the bridge BOUND (`resolveBridgeHost`, as `status` probes it), not a
+ * hard-wired loopback: a peer sets `ISSANCE_HOST` to its tailnet address and never answers on
+ * 127.0.0.1, and dialling loopback there would report "the bridge is down" against a bridge that is
+ * up. A wildcard bind answers everywhere, so loopback is the right dial for it.
+ *
+ * A READ, and the only route this verb asks its own bridge for. The budget is short on purpose:
+ * `doctor` is run when something is already wrong, and a hung diagnostic is a worse answer than
+ * "it did not answer".
+ */
+async function ownSnapshot(deps: DoctorDeps): Promise<SnapshotRead> {
+  const host = resolvedBind(deps);
+  const dialled = bindIsWildcard(host) ? "127.0.0.1" : host;
+  const bracketed = dialled.includes(":") && !dialled.startsWith("[") ? `[${dialled}]` : dialled;
+  try {
+    const answer = await deps.fetch(`http://${bracketed}:${String(deps.ctx.port)}/api/snapshot`, {
+      signal: AbortSignal.timeout(SNAPSHOT_BUDGET_MS),
+      headers: ownReadHeaders(deps),
+    });
+    if (answer.ok) return { kind: "body", text: await answer.text() };
+    return { kind: "refused", status: answer.status };
+  } catch {
+    return { kind: "silent" };
+  }
+}
+
+/**
+ * The identity this verb shows its own bridge, or nothing when none is configured (issue #238).
+ *
+ * `checkAccess` (bridge/server.ts) fails closed on a request with no `Tailscale-User-Login` while
+ * `tailscale serve` is in front, because an absent header is not evidence of a local caller: a TAGGED
+ * node arrives without one too. So this verb could not read its own snapshot, and reported a healthy
+ * bridge as one that had not answered.
+ *
+ * Sending the configured login GRANTS NOTHING THAT WAS NOT ALREADY THERE. The login is an identity,
+ * not a secret, and the bridge already accepts the header from any caller that reaches its port —
+ * `curl -H 'Tailscale-User-Login: …' http://127.0.0.1:<port>/api/snapshot` answers 200 today, which is
+ * how the reporter demonstrated the bug. The alternative, a loopback exemption, is the one thing that
+ * must NOT be done: `tailscale serve` dials the bridge from loopback itself, so every tailnet request
+ * would take it.
+ *
+ * With no login configured the header is omitted rather than invented: the bridge is then either open
+ * to the tailnet (it warns about that itself at boot) or it refuses, and a refusal reads as a refusal.
+ */
+function identityHeader(deps: DoctorDeps): Record<string, string> | undefined {
+  const login = deps.ctx.env.ISSANCE_TRUSTED_USER ?? "";
+  return login === "" ? undefined : { "Tailscale-User-Login": login };
+}
+
+/**
+ * Everything this verb shows its own bridge on a read: the configured login (issue #238, above) and
+ * the bridge's local read credential (`<stateDir>/local-secret`, bridge/local-secret.ts), because
+ * reads need a pairing token now (ADR 0086) and this process holds none. The credential reads only,
+ * and only from this host (loopback or the host's own bound address); with no file (the bridge is
+ * down, or older) nothing is sent and the bridge refuses as it did before, which `ownAnswerSentence`
+ * and the history section report as a refusal.
+ */
+function ownReadHeaders(deps: DoctorDeps) {
+  return {
+    ...identityHeader(deps),
+    ...localAuthHeader(readLocalSecret(deps.ctx.stateDir, (p) => deps.files.read(p))),
+  };
+}
+
+/** Long enough for a busy loopback bridge, short enough that a wedged one does not hold the verb. */
+const SNAPSHOT_BUDGET_MS = 3000;
+
+/** A thunk that runs at most once: the first caller pays, every later one shares the same promise. */
+function once<T>(run: () => Promise<T>): () => Promise<T> {
+  let pending: Promise<T> | null = null;
+  return () => (pending ??= run());
+}
+
+/**
+ * The running bridge's own answer to "am I still executing the issance on disk?", read off its
+ * snapshot: `update.restartNeeded`, and the restart command it spells for its install kind.
+ *
+ * `null` when the read carried no such verdict — a refusal, a silence, or a body from a bridge old
+ * enough not to report one — and the caller falls back to reading the process from outside.
+ */
+function bridgeRestartVerdict(read: SnapshotRead): { restartNeeded: boolean; restartCommand: string | null } | null {
+  if (read.kind !== "body") return null;
+  let parsed: RestartWire;
+  try {
+    // SAFETY: the shape `bridge/server.ts` serialises for `/api/snapshot`, of which only the two
+    // `update` fields this check reads are declared, both optional. A body that disagrees yields no
+    // verdict below and the process is read from outside instead — never a pass.
+    parsed = JSON.parse(read.text.trim() === "" ? "{}" : read.text) as RestartWire;
+  } catch {
+    return null;
+  }
+  const restartNeeded = parsed.update?.restartNeeded;
+  if (restartNeeded !== true && restartNeeded !== false) return null;
+  return { restartNeeded, restartCommand: parsed.update?.restartCommand ?? null };
+}
+
+/** The two fields of `UpdateStatus` (bridge/types.ts) this verb reads off the snapshot wire. */
+interface RestartWire {
+  update?: { restartNeeded?: boolean; restartCommand?: string } | null;
+}
+
+/** Why the bridge's own verdict was not available, for the sentence that falls back to the process. */
+function ownAnswerSentence(read: SnapshotRead): string {
+  switch (read.kind) {
+    case "refused":
+      return `the bridge refused this check's own read of \`/api/snapshot\` (${String(read.status)})`;
+    case "silent":
+      return "the bridge did not answer `/api/snapshot`";
+    case "body":
+      return "the bridge's `/api/snapshot` carries no restart verdict";
+  }
+}
+
+/**
+ * Is the running bridge still executing the issance that is installed?
+ *
+ * Two different questions live under one check id, because the operator's question is one:
+ * "is what I am talking to the code that is on this disk?"
+ *
+ * ── ON A SINGLE-FILE INSTALL (`binary`, `packaged`) IT IS ANSWERED ───────────
+ * The payload ships no `bridge/` — the bridge is compiled INTO `bin/issance` — so there is no source
+ * tree for the process to be behind, and `bridgeStale` is permanently false there. What there IS is
+ * an executable, and a package manager replaces it and restarts NOTHING. Observed on Arch:
+ * `pacman -U` of a rebuilt `issance-bin` leaves the service active on a deleted inode, still serving
+ * the old code, while every version file around it describes the new build. On a rebuild of the same
+ * version the version comparison in `bridge/update.ts` cannot see it at all, because no version
+ * string moved.
+ *
+ * THE BRIDGE IS ASKED FIRST (issue #238). It already answers this exact question about itself, on
+ * every snapshot, as `update.restartNeeded`: two witnesses, the version files against the version it
+ * booted with, and on Linux `/proc/self/exe` against the file on disk (`selfExeReplaced`,
+ * bridge/index.ts). That answer needs no pid and no `/proc` from this side, which is what a launchd
+ * or unsupervised install on a Mac had neither of — there `bridgePid` had no tier to ask, and even
+ * with a pid there is no `/proc/<pid>/exe` to read, so the check said "no pid" against a bridge that
+ * was up and could have said. The bridge also spells the restart command for its own install kind,
+ * so the remedy is its sentence rather than a guess.
+ *
+ * Asking the process whether it is stale is not circular: neither witness runs new code. Both compare
+ * a value captured at boot (the version, the inode) against a file on disk NOW, and a stale process
+ * reads the disk as well as a fresh one. What it is, on Linux, is a superset of the read below, and
+ * elsewhere the only read there is. Two limits are accepted and said rather than hidden: the bridge
+ * recomputes the answer at most every `STALE_TTL_MS` (5s, bridge/update.ts), so a `doctor` run inside
+ * that window after a swap can still read the previous answer; and off Linux the pass rests on the
+ * version witness alone, which the finding's own sentence states.
+ *
+ * Only when the snapshot carried no verdict — refused, silent, or an older bridge — is the process
+ * read from outside: `/proc/<pid>/exe` of the bridge's own pid, judged by {@link classifyExe}. The
+ * check was once skipped here with the sentence "whatever installs the new version restarts it",
+ * which is simply false for a package manager.
+ *
+ * ── ON A CHECKOUT IT STILL IS NOT ───────────────────────────────────────────
+ * There the process may be behind `bridge/*.ts`, and the running bridge leaves exactly one artefact
+ * (`crew-runtime.json`, bridge/crew/staleness.ts) recording `bootedAt`, `pid`, the mode and the
+ * roster — not a version, and not a source stamp. Answering that would take a new field, a new file
+ * or a new route, so it ships `skipped` rather than approximating.
+ */
+function restartPending(
+  deps: DoctorDeps,
+  install: InstallKind,
+  marker: CrewRuntimeMarker | null,
+  read: SnapshotRead,
+): Finding {
+  if (install.kind !== "binary" && install.kind !== "packaged") {
+    return skipped(
+      "restart-pending",
+      "the running bridge records no version — `crew-runtime.json` carries its boot time, pid, mode and" +
+        " roster, and nothing names the code it is executing",
+      "`issance restart` after any build if in doubt; `issance logs` dates the running process",
+    );
+  }
+  const own = bridgeRestartVerdict(read);
+  if (own !== null) {
+    const binary = collieBinary(deps.ctx.root, deps.host);
+    if (own.restartNeeded) {
+      return warn(
+        "restart-pending",
+        `the running bridge reports that ${binary} no longer holds the issance it is executing — the` +
+          " files were replaced under it and nothing restarted it",
+        `\`${own.restartCommand ?? "issance restart"}\``,
+      );
+    }
+    // On Linux the bridge compared both the version files and the executable's inode; elsewhere
+    // there is no `/proc/self/exe`, so only the version witness spoke, and a same-version rebuild
+    // by a package manager would pass unseen. Said, rather than reported as a full pass.
+    return ok(
+      "restart-pending",
+      process.platform === "linux"
+        ? `the running bridge reports it is executing ${binary}, the installed issance`
+        : `the running bridge reports it is executing the version installed at ${binary} — judged by` +
+            " version alone on this platform, where the executable itself cannot be compared",
+    );
+  }
+  const pid = bridgePid(deps, marker);
+  const evidence = exeEvidence(deps, pid, marker);
+  const installed = exePathOf(evidence.exeLink) ?? collieBinary(deps.ctx.root, deps.host);
+  switch (classifyExe(evidence)) {
+    case "replaced":
+      return warn(
+        "restart-pending",
+        `the running bridge is executing a issance that ${installed} no longer holds — the files were` +
+          " replaced under it and nothing restarted it",
+        "`issance restart`",
+      );
+    case "current":
+      return ok("restart-pending", `the running bridge is executing ${installed}, the installed issance`);
+    case "unknown":
+      return skipped(
+        "restart-pending",
+        pid === null
+          ? `${ownAnswerSentence(read)}, and there is no pid for the bridge — without one there is no` +
+              " executable to compare against the installed issance"
+          : `the executable behind pid ${String(pid)} could not be read, so it cannot be compared` +
+              " against the installed issance",
+        "`issance restart` after a package upgrade — a package manager replaces the files and restarts" +
+          " nothing; `issance logs` dates the running process",
+      );
+  }
+}
+
+/**
+ * The bridge's pid, from the tier that started it: the systemd unit's `MainPID`, else the pidfile
+ * the unsupervised tier writes, else the pid the running bridge recorded in `crew-runtime.json`.
+ *
+ * Read-only throughout — `systemctl show` prints a property and touches nothing.
+ */
+function bridgePid(deps: DoctorDeps, marker: CrewRuntimeMarker | null): number | null {
+  const shown = deps.exec.capture("systemctl", [
+    "--user",
+    "show",
+    unitName(deps.ctx.instance),
+    "--property=MainPID",
+    "--value",
+  ]);
+  const main = shown.found && shown.code === 0 ? Number(shown.stdout.trim()) : Number.NaN;
+  if (Number.isInteger(main) && main > 1) return main;
+  const fromFile = Number(deps.files.read(pidFilePath(deps.ctx.configDir, deps.ctx.instance))?.trim() ?? "");
+  if (Number.isInteger(fromFile) && fromFile > 1) return fromFile;
+  // A bridge that neither systemd nor the pidfile tier owns still wrote its own pid, but only in a
+  // crew — a solo instance writes no marker (CREW_PROTOCOL.md §11's zero-tax contract).
+  return marker === null ? null : marker.pid;
+}
+
+/**
+ * The five probes {@link classifyExe} judges. Each one is allowed to decline, and every one of them
+ * is a read.
+ *
+ * `startedAtMs` comes from the marker only when it names THIS pid: it is the boot stamp of the
+ * process that wrote it, and taken from any other pid it would be a start time for a process it does
+ * not describe. That is the mtime fallback's only source here, which is why a non-Linux solo install
+ * lands on `unknown` rather than on a guess.
+ */
+function exeEvidence(deps: DoctorDeps, pid: number | null, marker: CrewRuntimeMarker | null): ExeEvidence {
+  if (pid === null) {
+    return { exeLink: null, exeInode: null, installedInode: null, installedMtimeMs: null, startedAtMs: null };
+  }
+  const procExe = `/proc/${String(pid)}/exe`;
+  const exeLink = deps.files.readlink(procExe);
+  const installedPath = exePathOf(exeLink) ?? collieBinary(deps.ctx.root, deps.host);
+  const installed = deps.files.stat(installedPath);
+  return {
+    exeLink,
+    exeInode: deps.files.stat(procExe)?.inode ?? null,
+    installedInode: installed?.inode ?? null,
+    installedMtimeMs: installed?.mtimeMs ?? null,
+    startedAtMs: marker !== null && marker.pid === pid ? marker.bootedAt : null,
+  };
+}
+
+/**
+ * Local clock vs. the far side's, from the HTTP `Date` on the `hello` this verb already sent —
+ * **no new route, field or exchange** (§8.6's window is the threshold, and a failure there is the
+ * uniform 401 that says nothing about clocks).
+ */
+function clock(inCrew: boolean, probes: Map<string, PeerOutcome<HelloResult>>): Finding {
+  if (!inCrew) {
+    return skipped(
+      "clock",
+      "solo — there is no far side to compare against, and inventing a reference clock is worse than silence",
+      "re-run `issance doctor` once this issance is in a crew",
+    );
+  }
+  const deltas: { member: string; delta: number }[] = [];
+  for (const [member, outcome] of probes) {
+    if (!outcome.ok || outcome.date === null) continue;
+    deltas.push({ member, delta: outcome.date - outcome.receivedAt });
+  }
+  if (deltas.length === 0) {
+    return skipped(
+      "clock",
+      "no member answered with a readable `Date` header — nothing to compare this clock against",
+      "fix the link first (`issance crew status`), then re-run `issance doctor`",
+    );
+  }
+  const worst = deltas.reduce((a, b) => (Math.abs(b.delta) > Math.abs(a.delta) ? b : a));
+  const seconds = Math.round(Math.abs(worst.delta) / 1000);
+  const direction = worst.delta > 0 ? "behind" : "ahead of";
+  const detail = `this machine's clock is ${seconds}s ${direction} "${worst.member}"`;
+  if (Math.abs(worst.delta) > CLOCK_ERROR_MS) {
+    return bad(
+      "clock",
+      `${detail} — past §8.6's ±5m window, so every signed membership request is refused as a bare 401` +
+        " that says nothing about clocks",
+      "enable NTP on whichever machine is off (`timedatectl set-ntp true`), then `issance restart` there",
+    );
+  }
+  if (Math.abs(worst.delta) > CLOCK_WARN_MS) {
+    return warn(
+      "clock",
+      `${detail} — inside §8.6's ±5m window, but drifting toward it`,
+      "enable NTP on whichever machine is off (`timedatectl set-ntp true`)",
+    );
+  }
+  return ok("clock", `${detail} — well inside §8.6's ±5m window`);
+}
+
+// ── Which multiplexer this issance drives, and whether it is answering ────────
+//
+// THE PROBE IS A READ AND STAYS ONE. `tmux list-sessions` and `zellij list-sessions` are the two
+// cheapest questions each multiplexer answers, and neither of them starts a server, attaches a
+// client or creates a session — `doctor` never brings a multiplexer up, because a server this verb
+// started is evidence it manufactured.
+//
+// EVERY NAME COMES FROM THE REGISTRY. The valid mux names, the endpoint variable and the per-adapter
+// binary resolution are all imported from `bridge/mux/` rather than restated here, so a fourth
+// multiplexer cannot leave this file quietly reporting a stale set. What is written out per mux —
+// the argv of the liveness probe — is exactly what cannot be shared: each one has its own CLI.
+
+/**
+ * What decided the multiplexer this issance drives — the other half of the `mux` line since M14/03.
+ *
+ * `undecided` is a real state and not an error state to hide: with no `ISSANCE_MUX` and no single
+ * multiplexer running, `issance start` REFUSES, and a doctor that reported a cheerful "herdr" for that
+ * host would be reporting a bridge that is never going to come up.
+ */
+type MuxOrigin =
+  | { readonly kind: "explicit" }
+  | { readonly kind: "auto"; readonly evidence: string }
+  | { readonly kind: "undecided"; readonly found: readonly MuxSighting[] };
+
+/** The mux settings, read from the CLI's merged env exactly as `bridge/config.ts` reads them. */
+interface MuxSettings {
+  readonly name: string;
+  readonly endpoint: string;
+  readonly tmuxBin: string;
+  readonly zellijBin: string;
+  readonly ternBin: string;
+  readonly origin: MuxOrigin;
+}
+
+/**
+ * `ISSANCE_MUX` and the endpoint it addresses, resolved as `issance start` resolves them.
+ *
+ * Hangar's endpoint IS the Hangar socket path (`bridge/config.ts`), so it comes from the context that
+ * already resolved `HERDR_SOCKET_PATH` — the same value `hangar-socket` probes, which is why the
+ * `mux` line defers to that check instead of stating a path twice.
+ *
+ * With nothing configured this asks `cli/mux.ts`'s probe rather than falling to `DEFAULT_MUX`, so
+ * `doctor` names the multiplexer the next `start` would actually pick, and the evidence for it. The
+ * probe is a read (see that module's header); running it costs one listing per installed adapter.
+ */
+function muxSettings(deps: DoctorDeps): MuxSettings {
+  const env = deps.ctx.env;
+  const tmuxBin = (env.ISSANCE_TMUX_BIN ?? "").trim();
+  const zellijBin = (env.ISSANCE_ZELLIJ_BIN ?? "").trim();
+  const ternBin = (env.ISSANCE_TERN_BIN ?? "").trim();
+  const named = explicitMux(env);
+  if (named !== null) {
+    return {
+      name: named,
+      endpoint: named === DEFAULT_MUX ? deps.ctx.socket : (env[muxEndpointVar(named)] ?? "").trim(),
+      tmuxBin,
+      zellijBin,
+      ternBin,
+      origin: { kind: "explicit" },
+    };
+  }
+  const found = probeMuxes(deps);
+  const only = found.length === 1 ? found[0] : undefined;
+  if (only === undefined) {
+    return { name: DEFAULT_MUX, endpoint: "", tmuxBin, zellijBin, ternBin, origin: { kind: "undecided", found } };
+  }
+  return {
+    name: only.mux,
+    endpoint: only.mux === DEFAULT_MUX ? deps.ctx.socket : only.endpoint,
+    tmuxBin,
+    zellijBin,
+    ternBin,
+    origin: { kind: "auto", evidence: only.evidence },
+  };
+}
+
+/** How the name was arrived at, appended to whatever the per-mux branch found. */
+function originSuffix(origin: MuxOrigin): string {
+  if (origin.kind === "explicit") return " · set by ISSANCE_MUX";
+  if (origin.kind === "auto") return ` · no ISSANCE_MUX, so \`start\` picks it: ${origin.evidence}`;
+  return "";
+}
+
+/** The target the bridge would build for these settings (`bridge/index.ts`), minus nothing. */
+function muxTarget(settings: MuxSettings): MuxTarget {
+  return {
+    endpoint: settings.endpoint,
+    // Zero means "the adapter's own default" (`createMux`'s factories read `timeoutMs || DEFAULT`),
+    // and nothing here ever calls the adapter, so no budget of this verb's is being declared.
+    timeoutMs: 0,
+    options: {
+      [TMUX_BINARY_OPTION]: settings.tmuxBin,
+      [ZELLIJ_BINARY_OPTION]: settings.zellijBin,
+      [TERN_BINARY_OPTION]: settings.ternBin,
+    },
+  };
+}
+
+/**
+ * What the configured adapter DECLARES, or `null` when the name is not one this build drives.
+ *
+ * Built through the registry's own factory, so the declaration is the adapter's rather than a second
+ * table here that would drift the day a multiplexer's capabilities changed. Constructing an adapter
+ * is not a call to a multiplexer — every factory in the tree builds stateless configuration (a
+ * socket path, a binary path, a session name) and dials nothing until a method is invoked, which
+ * nothing here does.
+ */
+function muxDeclaration(settings: MuxSettings): MuxCapabilityDeclaration | null {
+  const factory = factoryFor(buildMuxRegistry(), settings.name);
+  return factory === undefined ? null : factory.create(muxTarget(settings)).capabilities;
+}
+
+/**
+ * `mux` — which multiplexer this issance drives, where it would look for it, and whether anything
+ * answered there.
+ *
+ * An unreachable multiplexer is an `error` and not a warning: it is not a degraded issance, it is a
+ * issance with no panes at all, and the symptom an operator sees first is an empty home screen or the
+ * disconnected banner — neither of which names the socket, the session or the binary.
+ */
+/** Where Windows keeps the long-path switch, and the value `reg query` reads. */
+export const LONG_PATHS_KEY = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem";
+/** An install folder longer than this leaves little room under 260 characters for what sits inside it. */
+export const LONG_INSTALL_PATH = 200;
+const PANE_PATH_LIMIT =
+  "Hangar cannot start a pane in a folder whose path is longer than 260 characters (os error 267). Keep your work folders short.";
+
+/**
+ * `windows-long-paths`: Windows only, and never more than a warning. Measured on the VM on 2026-10-02:
+ * with `LongPathsEnabled` 0, a pane asked for in a 280-character folder fails inside Hangar with
+ * `CreateProcessW ... The directory name is invalid (os error 267)`. Read with `reg query`, which
+ * needs no administrator.
+ */
+export function windowsLongPaths(deps: Pick<DoctorDeps, "ctx" | "exec">): Finding {
+  const check = "windows-long-paths";
+  const r = deps.exec.capture("reg", ["query", LONG_PATHS_KEY, "/v", "LongPathsEnabled"]);
+  const value = /LongPathsEnabled\s+REG_DWORD\s+0x([0-9a-f]+)/i.exec(r.stdout)?.[1];
+  const enabled = value === undefined ? null : Number.parseInt(value, 16) !== 0;
+  const long = deps.ctx.root.length > LONG_INSTALL_PATH;
+  if (long) {
+    return warn(
+      check,
+      `${PANE_PATH_LIMIT} The install folder ${deps.ctx.root} is ${String(deps.ctx.root.length)} characters long.`,
+      "install issance in a shorter folder: set ISSANCE_DIR to a short path, then run install.ps1 again",
+    );
+  }
+  if (enabled === false) {
+    return warn(
+      check,
+      `${PANE_PATH_LIMIT} LongPathsEnabled is 0 on this machine.`,
+      `in an Administrator PowerShell: Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem' -Name LongPathsEnabled -Value 1`,
+    );
+  }
+  if (enabled === null) return skipped(check, "`reg query` could not read LongPathsEnabled", "run `issance doctor` from a PowerShell");
+  return ok(check, `LongPathsEnabled is 1, and the install folder is ${String(deps.ctx.root.length)} characters long`);
+}
+
+/**
+ * `secrets-private`: Windows only (M43 spec 04). The state folder and the config folder, each read
+ * with everything below it (`isOwnerOnly`, one `icacls /T` each), and the owner of each folder and
+ * secret file (one PowerShell `Get-Acl`, which `icacls` cannot answer). Three answers:
+ *
+ *   - a VERIFIED grant to an account outside the allowlist, or a foreign owner: `error`, the
+ *     severity a `config.toml` secret dropped for a loose mode gets on POSIX (`config-file`);
+ *   - a folder that could not be checked (no access list, a network share, a tool that failed):
+ *     `warn`, "cannot confirm", never silent and never ok;
+ *   - private: ok.
+ *
+ * `doctor` changes nothing (the contract at the top of this file). The bridge repairs issance's own
+ * folders at start, so "restart issance" is the first fix there; the `icacls` line is the same repair
+ * by hand, and the only fix for a folder issance does not own.
+ */
+export function secretsPrivate(deps: Pick<DoctorDeps, "ctx" | "host" | "ownerOnly">): Finding {
+  const check = "secrets-private";
+  const { path } = deps.host;
+  const roots = PRIVATE_ROOTS.map((root) => ({ root, dir: root.id === "state" ? deps.ctx.stateDir : deps.ctx.configDir })).filter(
+    (r) => deps.ownerOnly.stat(r.dir) !== null,
+  );
+  if (roots.length === 0) {
+    return skipped(check, "there is no issance state or config folder yet", "`issance start` creates the state folder private");
+  }
+  const owned = roots.flatMap(({ root, dir }) => [dir, ...root.secrets.map((n) => path.join(dir, n))]).filter(
+    (p) => deps.ownerOnly.stat(p) !== null,
+  );
+  const owners = foreignOwners(owned, deps.ownerOnly);
+  const user = currentUserSid(deps.ownerOnly.acl);
+  const problems: { detail: string; remedy: string }[] = [];
+  const unconfirmed: string[] = [];
+  for (const { root, dir } of roots) {
+    const verdict = isOwnerOnly(dir, deps.host, deps.ownerOnly);
+    const strangeOwners = owned.filter((p) => (p === dir || path.dirname(p) === dir) && owners.has(p));
+    if (verdict.state === "not-checked" && strangeOwners.length === 0) {
+      unconfirmed.push(`${root.label}: ${verdict.reason}\n${dir}`);
+      continue;
+    }
+    const leaks = verdict.state === "loose" ? verdict.leaks : [];
+    const own = leaks.filter((l) => l.path === dir);
+    const inside = leaks.filter((l) => l.path !== dir);
+    const ownCollie = scopeOf(dir, false, deps.host, deps.ownerOnly).allowed;
+    const restart = ownCollie ? "restart issance, or run: " : "run: ";
+    if (own.length > 0 && user !== null) {
+      problems.push({
+        detail: `${root.label} can be read by other accounts (${whoCanRead(own)}).\n${dir}`,
+        remedy: `Fix: ${restart}${privateCommand(dir, user, true, own)}`,
+      });
+    } else if (inside.length > 0) {
+      const files = [...new Set(inside.map((l) => l.path))];
+      const secret = files.every((f) => root.secrets.includes(path.basename(f)));
+      problems.push({
+        detail: `${root.label} holds files other accounts can read (${whoCanRead(inside)}): ${files.slice(0, 3).map((f) => path.relative(dir, f)).join(", ")}.\n${dir}`,
+        remedy: `Fix: ${secret && ownCollie ? "restart issance, or run: " : "run: "}icacls "${files[0]!}" /reset`,
+      });
+    }
+    for (const p of strangeOwners) {
+      const sid = owners.get(p)!;
+      problems.push({
+        detail: `${p === dir ? root.label : path.basename(p)} is owned by ${sidName(sid)} [${sid}], who can always change its permissions.\n${p}`,
+        remedy: user === null ? "Fix: take ownership as your account" : `Fix: in an Administrator PowerShell, icacls "${p}" /setowner "*${user}"`,
+      });
+    }
+  }
+  if (problems.length > 0) {
+    return bad(check, problems.map((p) => p.detail).join("\n"), problems.map((p) => p.remedy).join("; "));
+  }
+  if (unconfirmed.length > 0) {
+    return warn(
+      check,
+      `cannot confirm who can read ${unconfirmed.join("\n")}`,
+      "keep the state and config folders on an NTFS drive on this PC, and run `issance doctor` as the account that runs issance",
+    );
+  }
+  return ok(check, `${roots.map((r) => r.root.label).join(" and ")} are private to your account, SYSTEM and Administrators`);
+}
+
+/**
+ * `windows-task`: the Task Scheduler task this install registers, read back. The failure it exists
+ * for is silent: a task that still runs `contrib\windows\issance-ctl.ps1` after an update deleted that
+ * file keeps the old loop alive until the next logon, and then starts nothing at all.
+ */
+export function windowsTask(deps: Pick<DoctorDeps, "ctx" | "exec" | "host" | "link">): Finding {
+  const check = "windows-task";
+  const name = agentLabel(deps.ctx.instance);
+  const query = queryTask(deps.exec, name, deps.host);
+  if (query === undefined) return skipped(check, "no PowerShell to read Task Scheduler with", "run `issance status` from a PowerShell");
+  if (query === null) return skipped(check, `no task ${name} is registered`, "`issance start` registers it");
+  switch (taskOwner(query, deps.ctx.root, deps.host)) {
+    case "legacy":
+      return warn(check, `Task ${name} still runs the old script (contrib\\windows\\issance-ctl.ps1)`, "Run: issance restart");
+    case "foreign":
+      return warn(
+        check,
+        `Task ${name} runs ${query.program}, another issance install; one issance per Windows machine`,
+        "run `issance uninstall` from that install, then `issance start` here",
+      );
+    case "issance": {
+      // A binary install's task must run the binary `current` points at, or a restart after an update
+      // relaunches the version the task was registered from. `start` registers it there (M43 spec
+      // 06), so this reads ok for a task this release wrote and warns for one an older build wrote.
+      const published = publishedBinary(deps.ctx.root, deps.link, deps.host);
+      if (windowsPathKey(query.program) !== windowsPathKey(published)) {
+        return warn(
+          check,
+          `Task ${name} runs ${query.program}, not ${published}; after an update moves \`current\`, it keeps relaunching the old version`,
+          "run `issance start` once: it registers the task on `current`",
+        );
+      }
+      return ok(check, `Task ${name} runs ${query.program} (${query.state})`);
+    }
+  }
+}
+
+function mux(deps: DoctorDeps): Finding {
+  const settings = muxSettings(deps);
+  const registry = buildMuxRegistry();
+  if (settings.origin.kind === "undecided") {
+    const { detail, remedy } = refusedMux(settings.origin.found, deps.ctx.configDir, deps.ctx.env);
+    return bad("mux", `${detail}, so \`issance start\` refuses`, remedy);
+  }
+  if (factoryFor(registry, settings.name) === undefined) {
+    return bad(
+      "mux",
+      `ISSANCE_MUX="${settings.name}" is not a multiplexer this build drives, so the bridge refuses to start`,
+      `set ISSANCE_MUX to one of ${muxNames(registry).join(", ")} in ${join(deps.ctx.configDir, ".env")},` +
+        " then `issance restart`",
+    );
+  }
+  if (settings.name === DEFAULT_MUX) {
+    return ok("mux", `${DEFAULT_MUX} — see herdr-socket${originSuffix(settings.origin)}`);
+  }
+  if (settings.name === TMUX_MUX) return tmuxMux(deps, settings);
+  if (settings.name === ZELLIJ_MUX) return zellijMux(deps, settings);
+  // A durable program is asked by the six `durable-*` rows (and `durable-lead` in a crew), so this
+  // line defers to them as the Hangar line defers to `hangar-socket`.
+  if (settings.name === DURABLE_MUX) return ok("mux", `${DURABLE_MUX}, see the durable-* lines${originSuffix(settings.origin)}`);
+  // Registered, and this verb has no probe for it. `skipped` rather than a pass, for the reason
+  // `acl` gives: a check that could not run must never render as one that did.
+  return skipped(
+    "mux",
+    `${settings.name} — registered, but \`issance doctor\` has no liveness probe for it`,
+    `ask that multiplexer whether it is running, by hand; \`issance doctor\` reports ${TMUX_MUX} and ${ZELLIJ_MUX}`,
+  );
+}
+
+/** The first non-empty line of a tool's complaint — a doctor line is one line. */
+function firstLine(text: string): string {
+  return text.split("\n").map((l) => l.trim()).find((l) => l !== "") ?? "it said nothing";
+}
+
+/**
+ * tmux, in ONE invocation: the version and the session list, `;`-joined the way the adapter joins
+ * its own listing (`bridge/mux/tmux/protocol.ts` § LISTING_ARGS). Neither command starts a server.
+ */
+function tmuxMux(deps: DoctorDeps, settings: MuxSettings): Finding {
+  const where = tmuxServerLabel(settings.endpoint);
+  const dotenv = join(deps.ctx.configDir, ".env");
+  const binary = resolveTmuxBinary(settings.tmuxBin, (p) => deps.files.exists(p));
+  if (binary === null) {
+    const why =
+      settings.tmuxBin === ""
+        ? `nothing executable at ${TMUX_BINARY_CANDIDATES.join(", ")}`
+        : `ISSANCE_TMUX_BIN="${settings.tmuxBin}" is not an absolute path to a file that is there`;
+    return bad(
+      "mux",
+      `tmux — ${where}, and there is no tmux binary to run: ${why} (a Hangar plugin action gets no` +
+        " login shell, so PATH is never consulted)",
+      `install tmux, or set ISSANCE_TMUX_BIN to its absolute path in ${dotenv}, then \`issance restart\``,
+    );
+  }
+  const serverArgs = tmuxServerArgs(settings.endpoint);
+  const asked = deps.exec.capture(binary, [
+    ...serverArgs,
+    ...TMUX_VERSION_ARGS,
+    ";",
+    "list-sessions",
+    "-F",
+    "#{session_name}",
+  ]);
+  if (!asked.found || asked.code !== 0) {
+    const detail = asked.found ? firstLine(asked.stderr || asked.stdout) : `${binary} could not be run`;
+    return bad(
+      "mux",
+      `tmux — ${binary} is there, but no server answered on ${where}: ${detail}`,
+      `start one (\`tmux ${[...serverArgs, "new", "-d"].join(" ")}\`), or point ` +
+        `${muxEndpointVar(TMUX_MUX)} at the server you already run, in ${dotenv}, then \`issance restart\``,
+    );
+  }
+  // The version is the first line the joined invocation printed; every line after it is a session.
+  const lines = asked.stdout.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+  const version = lines[0] ?? "?";
+  const sessions = lines.length === 0 ? 0 : lines.length - 1;
+  return ok(
+    "mux",
+    `tmux ${version} · ${where} · ${String(sessions)} session${sessions === 1 ? "" : "s"}` +
+      originSuffix(settings.origin),
+  );
+}
+
+/**
+ * zellij: one `list-sessions`, read by the SAME two pure functions the adapter's session binding
+ * reads it with (`parseSessionList` + `chooseSession`), so `doctor` and the bridge cannot disagree
+ * about which session this issance drives — or about why there is none.
+ */
+function zellijMux(deps: DoctorDeps, settings: MuxSettings): Finding {
+  const dotenv = join(deps.ctx.configDir, ".env");
+  const candidates = zellijBinaryCandidates(deps.ctx.home);
+  const binary = resolveZellijBinary(settings.zellijBin, (p) => deps.files.exists(p), candidates);
+  if (binary === null) {
+    const why =
+      settings.zellijBin === ""
+        ? `nothing executable at ${candidates.join(", ")}`
+        : `ISSANCE_ZELLIJ_BIN="${settings.zellijBin}" is not an absolute path to a file that is there`;
+    return bad(
+      "mux",
+      `zellij — there is no zellij binary to run: ${why} (a Hangar plugin action gets no login shell,` +
+        " so PATH is never consulted)",
+      `install zellij, or set ISSANCE_ZELLIJ_BIN to its absolute path in ${dotenv}, then \`issance restart\``,
+    );
+  }
+  const asked = deps.exec.capture(binary, [...ZELLIJ_LIST_SESSIONS_ARGS]);
+  if (!asked.found) {
+    return bad(
+      "mux",
+      `zellij — ${binary} could not be run`,
+      `set ISSANCE_ZELLIJ_BIN to a zellij that runs, in ${dotenv}, then \`issance restart\``,
+    );
+  }
+  // A box with no sessions exits non-zero and says so on stderr; the chooser turns that, the
+  // ambiguity and the exited session into one sentence — the same one the adapter would print.
+  const sessions = parseSessionList(asked.code === 0 ? asked.stdout : "");
+  const choice = chooseSession(sessions, settings.endpoint);
+  const running = sessions.filter((session) => session.running).length;
+  if (!choice.ok) {
+    const named = settings.endpoint.trim();
+    return bad(
+      "mux",
+      `zellij — ${binary} answered, and ${choice.detail}`,
+      named === ""
+        ? `start one (\`zellij -s <name>\`) and name it in ${muxEndpointVar(ZELLIJ_MUX)} in ${dotenv}, then \`issance restart\``
+        : `start it (\`zellij -s ${named}\`) or attach once to resurrect it — issance never creates or` +
+          ` resurrects a session; then \`issance restart\``,
+    );
+  }
+  return ok(
+    "mux",
+    `zellij · session ${choice.session} · ${String(running)} running of ${String(sessions.length)} listed` +
+      originSuffix(settings.origin),
+  );
+}
+
+// ── The agent's own hooks, and the beacons they write (M11/05) ───────────────
+//
+// BOTH ARE READS, and both read the SAME CODE the verbs do: `claudeSettingsTargets` finds the files,
+// `markedCommandsByEvent` says which entries are ours, `markerVersionOf` dates them, `hookBinaryOf`
+// says what one runs and `resolveHookCommand` says what an install would write. A second probe here
+// would be a second definition of "installed", and the drift would show up as a capability declared
+// over beacons nobody writes.
+//
+// WHAT A MISSING INSTALL COSTS DEPENDS ON THE MULTIPLEXER, so this check ASKS THE ADAPTER rather
+// than assuming. `agentDetection` is a declared mux capability (`bridge/mux/capabilities.ts`), and it
+// is the whole question:
+//
+//  • Declared (Hangar), the multiplexer names the agent and its status from its own wire. The emitter
+//    is optional there (it adds the hook edges of M56 spec 11), and a red line here would exit this
+//    verb non-zero on a perfectly healthy machine. An operator who learns to ignore one red line ignores the next. `ok`.
+//  • Absent (tmux, zellij) — the emitter is the ONLY thing that can give that adapter sight
+//    (`beaconMatcher`, M11/03). Without it every pane reads as a shell: no agent list, no "needs
+//    you", no notification. That is not a degraded issance, it is the feature missing. `error`.
+//
+// The name is never read here. A fourth multiplexer inherits the right tier from its own declaration.
+
+/** What one settings file carries: the commands we own, and where they were found. */
+interface InstalledEntry {
+  readonly target: HookTarget;
+  readonly command: string;
+}
+
+/** Every entry issance owns, across every settings file this host has. */
+function installedEntries(deps: DoctorDeps): InstalledEntry[] {
+  const found: InstalledEntry[] = [];
+  for (const target of claudeSettingsTargets(deps.ctx)) {
+    const text = deps.files.read(target.path);
+    if (text === null || text.trim() === "") continue;
+    let document;
+    try {
+      document = JSON.parse(text);
+    } catch {
+      // A file we cannot read is one `hooks install` refuses to merge into, so nothing of ours is in
+      // it. `hooks status` says the same thing in its own words; neither of them repairs it.
+      continue;
+    }
+    for (const command of markedCommandsByEvent(document)) {
+      if (command !== null) found.push({ target, command });
+    }
+  }
+  return found;
+}
+
+/**
+ * `beacon-hooks-claude` — is the emitter registered in the agent's own settings, is it current, and
+ * does the command it runs still exist?
+ *
+ * The third question is the one this check is really for. A hook pinned to a checkout that has since
+ * moved is still valid JSON, still carries our marker, and simply never runs: every pane goes on
+ * reading as a shell and nothing anywhere says why.
+ *
+ * `muxReportsAgents` is the configured adapter's own `agentDetection` declaration, and it sets the
+ * tier of a missing install — see the section header.
+ */
+function beaconHooks(
+  deps: DoctorDeps,
+  entries: readonly InstalledEntry[],
+  muxReportsAgents: boolean,
+): Finding {
+  const check = "beacon-hooks-claude";
+  const would = resolveHookCommand(deps.ctx, deps.link);
+  const name = muxSettings(deps).name;
+  const install =
+    `\`issance hooks install claude\` (writes ${String(BEACON_HOOKS.length)} marked entries into` +
+    " ~/.claude/settings.json; running Claudes must be relaunched)";
+  if (entries.length === 0) {
+    return muxReportsAgents
+      ? ok(check, `not needed — ${name} reports agents itself; hooks installed: no`)
+      : bad(
+          check,
+          `no settings file here carries the beacon emitter, and ${name} cannot name an agent on its` +
+            ' own — so every pane reads as a shell, "needs you" never lights and no notification can' +
+            ` fire (an install would pin \`${would.binary}\`)`,
+          install,
+        );
+  }
+
+  // The path first: an entry that points at nothing never runs, so its version is beside the point.
+  const dangling = entries.filter((entry) => {
+    const binary = hookBinaryOf(entry.command);
+    return binary !== null && !deps.files.exists(binary);
+  });
+  if (dangling.length > 0) {
+    const binaries = [...new Set(dangling.map((entry) => hookBinaryOf(entry.command)))];
+    return warn(
+      check,
+      `${dangling.length} installed entr${dangling.length === 1 ? "y" : "ies"} run \`${binaries.join(", ")}\`,` +
+        " which is not there any more — the checkout moved, so the hook fires and does nothing",
+      "`issance link` here (ADR 0021: the published name is a symlink, so it survives a move), then" +
+        " `issance hooks install claude` to re-pin the entries",
+    );
+  }
+
+  const versions = [...new Set(entries.map((entry) => markerVersionOf(entry.command)))];
+  const stale = versions.filter((version) => version !== HOOK_MARKER_VERSION);
+  if (stale.length > 0) {
+    return warn(
+      check,
+      `installed at v${stale.join("/")}, and this build writes v${String(HOOK_MARKER_VERSION)} — the` +
+        " entry is ours and out of date",
+      "`issance hooks install claude` — it replaces our own entry in place and leaves every other hook alone",
+    );
+  }
+
+  // Partial, exactly as `hooks status` reports it: some events registered and some not.
+  const expected = BEACON_HOOKS.length;
+  const perFile = new Map<string, number>();
+  for (const entry of entries) perFile.set(entry.target.path, (perFile.get(entry.target.path) ?? 0) + 1);
+  const partial = [...perFile].filter(([, count]) => count < expected);
+  if (partial.length > 0) {
+    return warn(
+      check,
+      `a settings file carries only some of the ${String(expected)} registrations` +
+        ` (${partial.map(([path, count]) => `${path}: ${String(count)}/${String(expected)}`).join("; ")})`,
+      "`issance hooks install claude` to complete it",
+    );
+  }
+  // Installed under a multiplexer that names its own agents is still `ok`. That multiplexer does not
+  // need the hooks to name an agent, so the line says what they still give: the hook edges of the
+  // input surface (M56 spec 11).
+  const spare = muxReportsAgents ? `; ${name} names agents itself and does not need them for that, so they give hook edges only` : "";
+  // The permission hold (M56 spec 12): which files hold permissions for the phone, if any.
+  const holdEvent = loadProfiles().get("claude")?.hold?.event;
+  const holding = holdEvent === undefined ? 0 : [...perFile.keys()].filter((path) => settingsHold(deps.files.read(path), holdEvent)).length;
+  const holds = holding > 0 ? `; holds permissions in ${String(holding)}` : "";
+  return ok(
+    check,
+    `v${String(HOOK_MARKER_VERSION)} in ${String(perFile.size)} settings file${perFile.size === 1 ? "" : "s"},` +
+      ` running \`${hookBinaryOf(entries[0]?.command ?? "") ?? would.binary}\`${spare}${holds}`,
+  );
+}
+
+/**
+ * `skill-walky-talky` — does any instruction file carry a walky talky skill older than this build's?
+ *
+ * Warn on stale, ok otherwise, as `hooksAreBehind` treats the hooks: a target with no skill is not
+ * drift (the harness is not here, the sync is off, or the operator uninstalled it, ADR 0111). A refused
+ * target is named, because install would not heal it, but it is not a warning either.
+ */
+function skillWalkyTalky(deps: DoctorDeps): Finding {
+  const check = "skill-walky-talky";
+  const report = skillReport({ ctx: deps.ctx, files: deps.files, fs: deps.link });
+  const stale = report.filter((r) => r.state.kind === "stale");
+  const installed = report.filter((r) => r.state.kind === "installed");
+  if (stale.length > 0) {
+    return warn(
+      check,
+      `${String(stale.length)} installed copy behind this build (${stale.map((r) => r.file.target.harness).join(", ")}) — the agent reads old advice`,
+      "`issance skill install all` — it replaces our own file or block in place and leaves every other line alone",
+    );
+  }
+  if (installed.length === 0) return ok(check, "not installed — `issance skill install all` teaches agents to message each other");
+  const refused = report.filter((r) => r.state.kind === "refused").length;
+  const left = refused > 0 ? `; ${String(refused)} target${refused === 1 ? "" : "s"} refused, see \`issance skill status\`` : "";
+  return ok(check, `current in ${installed.map((r) => r.file.target.harness).join(", ")}${left}`);
+}
+
+/**
+ * `walky-refusals` — how many walky talky messages this machine refused, per reason (M62 hardening I).
+ *
+ * One row when `<stateDir>/walky/refusals.json` exists, none otherwise, so a host that never refused a
+ * message reads as before. Never a warning: a refusal is the bridge doing its job. The row says which
+ * limit agents keep hitting, which is the operator's question. The file holds no body and no sender.
+ */
+function walkyRefusals(deps: DoctorDeps): Finding[] {
+  const raw = deps.files.read(refusalsPath(deps.ctx.stateDir));
+  if (raw === null) return [];
+  const held = readRefusals(raw);
+  const total = Object.values(held.counts).reduce((sum, count) => sum + count, 0);
+  if (total === 0) return [ok("walky-refusals", "none counted")];
+  const since = held.since === null ? "" : ` since ${new Date(held.since).toISOString().slice(0, 10)}`;
+  return [ok("walky-refusals", `${String(total)} refused${since}: ${refusalLine(held.counts)}`)];
+}
+
+/**
+ * `beacons` — how many agents have identified themselves here, and how many of those are gone.
+ *
+ * An expired beacon is ORDINARY and never a warning: agents end. Its pane goes back to reading as a
+ * shell the moment the agent's pid dies (M11/03), and the conversation it left behind stays readable
+ * (M11/04). What this finding answers is the question `hooks status` cannot — whether anything has
+ * actually been written since the emitter was installed.
+ *
+ * Nothing here removes a file. The sweep is a READ, on this path as on the bridge's.
+ */
+async function beacons(deps: DoctorDeps, installed: boolean): Promise<Finding> {
+  const readings = await readBeacons(deps.beacons);
+  const live = readings.filter((reading) => reading.liveness === "live").length;
+  const expired = readings.length - live;
+  if (readings.length === 0) {
+    return skipped(
+      "beacons",
+      installed
+        ? "no agent has written one yet — the emitter is installed, and a beacon appears at an agent's first hook event"
+        : "nothing writes one here, because the emitter is not installed",
+      installed
+        ? "start (or prompt) an agent in a pane and re-run `issance doctor`"
+        : "`issance hooks install claude`",
+    );
+  }
+  return ok(
+    "beacons",
+    `${String(live)} live, ${String(expired)} expired — an expired one's agent has ended, and its pane reads as a shell again`,
+  );
+}
+
+// ── Crew checks ──────────────────────────────────────────────────────────────
+
+/**
+ * "Enrolled but INACTIVE" — a membership change that reached the store but not the running process.
+ *
+ * The comparison is `parseMarker` + `rosterDrift`, i.e. the two pure functions `crew status`'s
+ * `reportDrift` prints from, so the two verbs cannot disagree about what drift is.
+ */
+function storeDrift(deps: DoctorDeps, data: TrustStoreData): Finding {
+  const marker = parseMarker(deps.files.read(crewRuntimePath(deps.ctx.stateDir)));
+  if (marker === null) {
+    return skipped(
+      "store-drift",
+      "no boot marker — no bridge has started here since this trust store existed, so there is no" +
+        " running process for the store to be ahead of",
+      "`issance start` here, then re-run `issance doctor`",
+    );
+  }
+  const drift = rosterDrift(marker, data);
+  if (drift === null) return ok("store-drift", "the running bridge holds this roster");
+  const parts: string[] = [];
+  if (drift.gained.length > 0) parts.push(`not yet active: ${drift.gained.join(", ")}`);
+  if (drift.lost.length > 0) parts.push(`still wired for: ${drift.lost.join(", ")}`);
+  if (drift.modeChanged !== null) parts.push(`a ${drift.modeChanged} on disk, a ${marker.mode} in memory`);
+  return bad(
+    "store-drift",
+    `enrolled but INACTIVE — ${parts.join("; ")}`,
+    "`issance restart` on THIS machine (nothing is lost meanwhile: the store is correct, the process is behind)",
+  );
+}
+
+/** A member that missed a rotation (§8.4), or one a rotation already dropped. */
+function secretGeneration(data: TrustStoreData, members: readonly TrustedMember[]): Finding {
+  const current = data.crew?.secretGeneration ?? 0;
+  const behind = members
+    .filter((m) => m.status === "enrolled" && m.secretGeneration !== current)
+    .map((m) => `${m.memberId} (generation ${m.secretGeneration})`);
+  const tombstones = members.filter((m) => m.status === "unenrolled").map((m) => m.memberId);
+  if (behind.length === 0 && tombstones.length === 0) {
+    return ok("secret-generation", `every member holds generation ${current}`);
+  }
+  const parts: string[] = [];
+  if (behind.length > 0) parts.push(`behind generation ${current}: ${behind.join(", ")}`);
+  if (tombstones.length > 0) parts.push(`unenrolled by a rotation they were offline for: ${tombstones.join(", ")}`);
+  return warn(
+    "secret-generation",
+    parts.join("; "),
+    "`issance crew rotate` on the lead — or, for one already unenrolled, `issance crew invite` here and" +
+      " `issance join` there",
+  );
+}
+
+/**
+ * ` → \`issance crew set-address <member> <address>:8787\``, for a silent PEER row on a lead whose
+ * stored address has no port and no scheme: the one repair that can be named exactly, because the
+ * default port is what a member answers on unless it set `ISSANCE_PORT`. Empty for everything else,
+ * and for an address with any `:` in it, which may be an IPv6 literal that `:8787` would change.
+ */
+function portlessRepair(data: TrustStoreData, m: TrustedMember): string {
+  if (data.lead !== null || m.role === "lead" || m.address === "" || m.address.includes(":")) return "";
+  if (m.address.includes("/")) return "";
+  return ` → \`issance crew set-address ${m.memberId} ${m.address}:${DEFAULT_PORT}\` (${DEFAULT_PORT} unless that machine set ISSANCE_PORT)`;
+}
+
+/**
+ * The link, not the machine: `member-reach` on a lead, `lead-reach` on a peer.
+ *
+ * **Both halves of {@link MemberReach}, because `hello` alone was a lie.** The verdict probe runs on
+ * the patient budget and every real read runs on the strict clamped one, so a link whose handshake
+ * outprices the poll answered the probe while the phone got nothing — and this check printed `✓` over
+ * a crew that was 503ing every pane. A member that answers and then starves is now its own finding,
+ * with its own remedy: the address is right, the budget is not.
+ */
+function reach(data: TrustStoreData, members: readonly TrustedMember[], reaches: Map<string, MemberReach>): Finding {
+  const check = data.lead === null ? "member-reach" : "lead-reach";
+  const enrolled = members.filter((m) => m.status === "enrolled");
+  if (enrolled.length === 0) {
+    return skipped(
+      check,
+      "no enrolled members to dial",
+      "`issance crew invite` here, then `issance join` on the other machine",
+    );
+  }
+  const silent: string[] = [];
+  const starved: string[] = [];
+  const served: number[] = [];
+  for (const m of enrolled) {
+    const answered = reaches.get(m.memberId);
+    if (answered === undefined) {
+      silent.push(`${m.memberId} — not dialled`);
+      continue;
+    }
+    if (!answered.hello.ok) {
+      silent.push(`${m.memberId} at ${m.address} — ${failureLine(answered.hello)}${portlessRepair(data, m)}`);
+      continue;
+    }
+    // F21: on a peer the one enrolled member is the LEAD, and a peer asks its lead for no snapshot —
+    // `/crew/v1/snapshot` is not on the closed peer → lead route set (`bridge/crew/router.ts`, RFC
+    // §8.6), so the question has no answer but a refusal. `hello` is the whole verdict for that row.
+    if (m.role === "lead") continue;
+    if (answered.data === null || !answered.data.ok) {
+      const why = answered.data === null ? "no data request was sent" : failureLine(answered.data);
+      starved.push(`${m.memberId} at ${m.address} — ${why}`);
+      continue;
+    }
+    served.push(answered.dataMs ?? 0);
+  }
+  if (silent.length > 0) {
+    const note = starved.length === 0 ? "" : `; answered but served no data: ${starved.join("; ")}`;
+    return bad(
+      check,
+      `${silent.length} of ${enrolled.length} did not answer: ${silent.join("; ")}${note}`,
+      // On a lead every row is a PEER, and `set-address` refuses an address a crew link cannot dial
+      // where `reconnect` takes anything (a portless one included). A peer's one row is its lead, and
+      // `set-address` is the lead's verb, so there `reconnect` stays.
+      (data.lead === null
+        ? "`issance crew set-address <member> <host:port>` if the address is wrong or moved"
+        : "`issance reconnect <address>` if the address moved") + "; otherwise `issance restart` on that machine",
+    );
+  }
+  if (starved.length > 0) {
+    return bad(
+      check,
+      `${enrolled.length} of ${enrolled.length} answered \`hello\`, but ${starved.length} served no data:` +
+        ` ${starved.join("; ")} — the machines are there; their data misses the per-poll budget`,
+      "raise BOTH `ISSANCE_CREW_TIMEOUT_MS` and `ISSANCE_POLL_MS` here (the first is clamped to 0.8 of the" +
+        " second), then `issance restart`",
+    );
+  }
+  // `lead-reach` sends no data request (above), so there is no timing to report and claiming one
+  // would be an invention. The two checks say what each of them actually asked.
+  if (served.length === 0) {
+    return ok(check, `${enrolled.length} of ${enrolled.length} answered \`hello\` (a peer asks its lead nothing else, §8.6)`);
+  }
+  const slowest = Math.max(...served);
+  return ok(check, `${enrolled.length} of ${enrolled.length} answered and served a snapshot (slowest ${slowest}ms)`);
+}
+
+/**
+ * Build skew across the crew (§7.1). Skew **refuses nothing on the wire**, so it must not fail this
+ * verb's exit either — it is a `warn` naming both versions and the remedy. A member that answers
+ * without the field is pre-{@link VERSION_REPORTED_SINCE} and renders as such: informational, never an
+ * error and never a reason to skip the whole check.
+ */
+function memberVersions(
+  deps: DoctorDeps,
+  members: readonly TrustedMember[],
+  probes: Map<string, PeerOutcome<HelloResult>>,
+): Finding {
+  const answered = members
+    .map((m) => ({ id: m.memberId, outcome: probes.get(m.memberId) }))
+    .filter((e): e is { id: string; outcome: PeerOutcome<HelloResult> & { ok: true } } => e.outcome?.ok === true);
+  if (answered.length === 0) {
+    return skipped(
+      "member-versions",
+      "no member answered, so no version can be compared",
+      "fix the link first (`issance crew status`), then re-run `issance doctor`",
+    );
+  }
+  const ours = collieVersionBare(deps.ctx.root, (p) => deps.files.read(p));
+  const unreported = answered.filter((e) => e.outcome.value.version === null).map((e) => e.id);
+  const note =
+    unreported.length === 0 ? "" : `; pre-${VERSION_REPORTED_SINCE} (not reported): ${unreported.join(", ")}`;
+  if (ours === "unknown") {
+    // This checkout has neither a build stamp nor a manifest version, so there is no older machine to
+    // name — reporting a skew whose other half we cannot state would be noise.
+    return skipped(
+      "member-versions",
+      `this checkout reports no version of its own, so nothing can be compared against it${note}`,
+      "`issance build` here to stamp one",
+    );
+  }
+  const behind = answered.filter(
+    (e) => e.outcome.value.version !== null && e.outcome.value.version !== ours,
+  );
+  const skewed = behind.map((e) => `${e.id} runs ${e.outcome.value.version}`);
+  if (skewed.length === 0) return ok("member-versions", `every member that reported one runs ${ours}${note}`);
+  // The remedy is a command, with the members already in it — a lead levels its peers over ssh
+  // (ADR 0016), and the only other way is `issance update` on each of those machines by hand.
+  return warn(
+    "member-versions",
+    `this machine runs ${ours}; ${skewed.join(", ")} — build skew refuses nothing (§7.1), the link keeps` +
+      ` working${note}`,
+    `\`issance crew update ${behind.map((e) => e.id).join(" ")}\` here, or \`issance update\` on each`,
+  );
+}
+
+/**
+ * The Surface reader version each answering member sent on its `hello` (M56 spec 09), one quiet row.
+ * A member that sent none is an older build: the lead refuses a text reply to it, because that build
+ * types blind, and this row names it so the refusal has a reason on screen. No row when nobody answered.
+ * Never a warning: an older member is a fact about its build, and the keys still work.
+ */
+function memberSurface(
+  members: readonly TrustedMember[],
+  probes: Map<string, PeerOutcome<HelloResult>>,
+): Finding[] {
+  const parts: string[] = [];
+  for (const member of members) {
+    const outcome = probes.get(member.memberId);
+    if (outcome?.ok !== true) continue;
+    const version = outcome.value.surfaceVersion;
+    parts.push(`${member.memberId} ${version === undefined ? "none (older build)" : `reader ${String(version)}`}`);
+  }
+  if (parts.length === 0) return [];
+  return [ok("member-surface", `Surface reader version: ${parts.join(", ")}`)];
+}
+
+// ── Production wiring ────────────────────────────────────────────────────────
+
+/**
+ * The real seams, built from the lifecycle set. Deliberately assembled here rather than reusing
+ * `crewDeps`: what `doctor` cannot reach, it cannot be made to call by a later edit.
+ */
+export function doctorDeps(base: {
+  ctx: CliContext;
+  io: Io;
+  exec: Exec;
+  files: Files;
+  ui?: Ui | null;
+  host?: Host;
+}): DoctorDeps {
+  return {
+    host: HOST,
+    ...base,
+    link: realLinkFs,
+    store: new TrustStore(base.ctx.stateDir),
+    fetch: (url, init) => fetch(url, init),
+    // The bridge's own reader, seams and all (`bridge/beacon-io.ts`), so `doctor` counts what the
+    // running bridge counts. Both of its seams are reads; neither can create the directory.
+    beacons: beaconReader(base.ctx.stateDir),
+    now: () => Date.now(),
+    ownerOnly: realOwnerOnlyDeps,
+  };
+}

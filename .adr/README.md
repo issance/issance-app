@@ -1,0 +1,193 @@
+# Architecture decision records
+
+Decisions with a **blast radius wider than the diff that made them** — the ones a future
+contributor (or a future agent) would otherwise re-derive from scratch, or quietly reverse because
+the reasoning lived only in a PR thread.
+
+One file per decision, numbered in the order they were accepted:
+
+```
+.adr/NNNN-kebab-case-title.md
+```
+
+Format is [Michael Nygard's](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions):
+**Context** (the forces, including what was actually measured), **Decision** (what we do, in the
+imperative), **Consequences** (what this costs, and what would justify revisiting it).
+
+## When to write one
+
+Write an ADR when a decision **closes off an option someone will reasonably propose again**. The
+signal is that you find yourself explaining *why not* rather than *how*.
+
+- ✅ "We manage exactly one front door" — a NetBird PR, then a Cloudflare Tunnel PR, then a ZeroTier PR
+- ✅ "Polling, not an event stream" — perennial, and the reasoning isn't obvious from the code
+- ❌ "Use Vitest for the web suite" — that's just what the repo does; `CLAUDE.md` covers it
+- ❌ Anything already legible from the code, a test name, or a commit message
+
+**The bar is high, and it is meant to be.** These are for the handful of decisions that shape the
+system, not a record of work done. A merged PR is not an occasion for an ADR; neither is a decision
+that merely took some thought, nor one you'd like on the record because it was hard-won. If a
+directory of ADRs reads like a changelog, it has stopped being useful — the signal drowns, and the
+few entries that genuinely close off a road get skimmed past with the rest.
+
+Before adding one, both of these must be true:
+
+1. **Someone has actually argued for the other road, or demonstrably will.** A real PR, a real issue,
+   a proposal you had to talk someone out of. "A future contributor might wonder" is not enough — that
+   is what a comment is for.
+2. **The argument has nowhere better to live.** If it fits at the line that would change, put it
+   there: whoever reopens the question is reading that code, not this directory. An ADR is for
+   reasoning that spans files, or that argues against a road with no single line to attach to.
+
+**Write the `Trail:` line first, and make it name the opponent.** Every ADR opens with a `Trail:`
+header naming the PR, the issue or the thread where somebody argued for the other road, beside the
+files the decision reaches. Write that line before the body. If you cannot fill it, condition 1 has
+not been met and what you have is a header comment — put it at the line and stop. This is the whole
+bar above, reduced to something answerable in the moment: 0049 has issue #243; the two candidates
+turned down below had nothing to put there, and neither did the update-screen write-up that became
+0044, which is the one entry in this directory no source file cites.
+
+When in doubt, don't. A comment at the point of change costs nothing and is read by exactly the
+person who needs it; an ADR that didn't need writing dilutes the ones that did. Two candidates were
+turned down on this basis in one day (bundled-font laziness, and the direct-typing lifecycle) — both
+became file-header comments, and both are better for it.
+
+## Relationship to the other docs
+
+Nothing here restates what lives elsewhere; the point is the *reasoning*, once.
+
+| Where | What belongs there |
+| --- | --- |
+| [`CLAUDE.md`](../CLAUDE.md) | The **rule** — short, normative, linking here for why |
+| [`ARCHITECTURE.md`](../ARCHITECTURE.md) | How the system is **built**, as it stands today |
+| [`README.md`](../README.md) | How an operator **runs** it |
+| `.adr/` | Why a road **wasn't** taken |
+
+A superseded ADR is never deleted or edited into agreement with the present. Mark it
+`Superseded by NNNN` and write the new one — the wrong turn is the useful part.
+
+A decision that is still correct but whose **scope** later changes is *amended*, not superseded: the
+new ADR says what it amends, the old one gains an `Amended in scope by NNNN` pointer at the top, and
+**nothing in its body is rewritten**. If you find yourself editing the argument rather than adding
+the pointer, it was a supersede.
+
+## Index
+
+| # | Decision | Status |
+| --- | --- | --- |
+| [0001](./0001-one-managed-front-door.md) | issance manages exactly one front door | Accepted |
+| [0002](./0002-invert-the-light-terminal-mirror.md) | The light terminal mirror is inverted, not re-themed (addendum 2026-09-21: a per-pane override lands) | Accepted |
+| [0003](./0003-one-shared-seen.md) | "Seen" is one shared fact, and only issance's own reads count | Accepted |
+| [0004](./0004-the-statusline-run-is-bounded.md) | The statusline run is bounded, but the bound guards less than it looks | Amended in scope by 0048 |
+| [0005](./0005-a-composed-key-queue-never-outlives-its-dock.md) | A composed key queue never outlives its dock | Accepted |
+| [0006](./0006-update-advances-the-checkout-herdr-installed.md) | `update` advances the checkout Hangar installed, and never re-links it | Accepted |
+| [0007](./0007-the-idle-lock-is-a-pause-not-a-gate.md) | The idle lock is a pause, not a gate | Accepted |
+| [0008](./0008-issance-does-not-run-a-terminal-emulator.md) | issance does not run a terminal emulator | Accepted |
+| [0009](./0009-a-generic-menu-is-driven-by-the-keys-it-names.md) | A generic menu is driven by the keys it names, never by digits | Accepted |
+| [0010](./0010-long-sends-are-verified-via-the-paste-placeholder.md) | Long sends are verified via the paste placeholder, not by chunking them (addendum 2026-10-03: a long send to Claude goes as one bracketed paste) | Accepted |
+| [0011](./0011-the-pack-protocol-is-the-mux-driver-seam.md) | The pack protocol is the mux-driver seam, and peers are full collies | Accepted |
+| [0012](./0012-every-machine-runs-a-issance-and-the-pack-has-a-lead.md) | Every machine runs a issance; the pack has a lead | Accepted |
+| [0013](./0013-a-peer-listens-without-becoming-a-front-door.md) | A peer listens without becoming a front door (amends 0001) | Accepted |
+| [0014](./0014-promote-is-a-confirm-on-the-lead.md) | Promotion is a confirm on the receiver, not a command from the claimant | Accepted |
+| [0015](./0015-pack-add-pushes-over-the-operators-ssh.md) | `pack add` pushes the lead's own commit over the operator's SSH (addendum 2026-09-21: a commitless lead installs from the release) | Accepted |
+| [0016](./0016-updates-ride-the-operators-ssh.md) | Updates ride the operator's SSH, never the pack wire (addendum 2026-09-04: peers follow) | Amended in scope by 0062 |
+| [0017](./0017-recognising-a-password-prompt-changes-what-issance-says.md) | Recognising a password prompt changes what issance says, never what it sends | Accepted |
+| [0018](./0018-operator-command-rows-replace-the-catalog.md) | The operator's command rows replace the catalog, never merge into it | Accepted |
+| [0019](./0019-oxlint-and-vendored-anti-slop-are-the-lint-gate.md) | oxlint + vendored anti-slop is the lint gate; one linter; TypeScript 7 | Accepted |
+| [0020](./0020-a-major-upgrade-is-consented-by-flag.md) | A major upgrade is consented by flag; routine update follows tags within the major | Accepted |
+| [0021](./0021-the-path-name-is-a-pointer-never-a-copy.md) | The name on PATH is a pointer, never a copy | Accepted |
+| [0022](./0022-the-mux-seam-is-a-port-issance-owns.md) | The multiplexer is a port issance owns, not a relocated Hangar client | Accepted |
+| [0023](./0023-compression-is-hop-local-on-the-pack-link.md) | Compression is hop-local on the pack link; the ETag names the identity bytes | Accepted |
+| [0024](./0024-a-beacon-is-a-hint-never-a-control-channel.md) | A beacon is a hint, never a control channel | Accepted |
+| [0025](./0025-the-wire-guard-forces-a-decision-never-a-bump.md) | The pack-wire guard forces a decision, never a bump | Accepted |
+| [0026](./0026-the-operator-is-the-quorum.md) | The operator is the quorum | Accepted |
+| [0027](./0027-the-deputy-is-named-ahead-of-time.md) | The deputy is named ahead of time, and takes over on the operator's word | Accepted |
+| [0028](./0028-the-standby-door-is-a-second-listener.md) | The standby door is a second listener that arms on silence (amends 0013) | Accepted |
+| [0029](./0029-speech-to-text-is-a-provider-seam-issance-owns.md) | Speech-to-text is a provider seam issance owns; Codex auth rides the operator's own binary (addendum 2026-10-03: a local command provider) | Accepted |
+| [0030](./0030-the-ui-is-translated-by-a-typed-dictionary-not-a-library.md) | The UI is translated by a typed dictionary, not an i18n library | Amended in scope by 0074 |
+| [0031](./0031-freshness-is-a-declared-promise.md) | Freshness, focus and shape are contract promises, not adapter folklore | Accepted |
+| [0032](./0032-a-worktree-is-opened-by-the-multiplexer-not-by-git.md) | A worktree is opened by the multiplexer, not by Git (addendum 2026-10-07: Hangar 0.9.3 reads the repo off `worktree.list`) | Accepted |
+| [0033](./0033-the-app-face-is-a-device-preference.md) | The app's face is a device preference; an operator's fonts add to the list (differs from 0018) | Accepted |
+| [0034](./0034-issance-collects-nothing-and-opt-in-is-the-ceiling.md) | issance collects nothing, and opt-in is the ceiling | Accepted |
+| [0035](./0035-a-packaged-install-is-not-ours-to-update.md) | A packaged install is not ours to update | Accepted |
+| [0036](./0036-the-map-of-machines-is-collies-a-mux-reports-one-machine.md) | The map of machines is issance's, a mux reports one machine | Accepted |
+| [0037](./0037-a-staged-update-confirms-its-runner-before-it-exits.md) | A staged update confirms its runner before it exits | Accepted |
+| [0038](./0038-the-group-is-a-crew-the-wire-keeps-pack.md) | The group is a crew; the wire keeps "pack" (supersedes the word in 0012) | Superseded in part by 0039 |
+| [0039](./0039-the-machine-says-crew-too.md) | The machine says "crew" too: protocol version 2, one release of overlap (supersedes the machine names in 0038) | Accepted |
+| [0040](./0040-configuration-precedence-and-the-config-file.md) | Configuration precedence, and the config file under it | Accepted |
+| [0041](./0041-cache-rules-are-sourced-claims.md) | Cache rules are sourced claims | Accepted |
+| [0042](./0042-notification-kinds-and-the-cache-watch.md) | Notification kinds, and the cache watch: global OR per-pane, keyed by session ref | Accepted |
+| [0043](./0043-operator-bar-rows-replace-the-bar-not-the-palette.md) | Operator bar rows replace the bar, not the palette (applies 0018 per surface) | Accepted |
+| [0044](./0044-the-update-screen-is-one-reducer-and-one-shared-poll.md) | The update screen is one reducer and one shared poll | Amended in scope by 0064 |
+| [0045](./0045-a-build-below-the-protocol-floor-is-a-red-preflight.md) | A build below the protocol floor is a red preflight, never a silent link | Accepted |
+| [0046](./0046-an-urgent-patch-keeps-the-daily-cadence.md) | An urgent patch keeps the daily cadence | Accepted |
+| [0047](./0047-muse-panes-render-natively.md) | Muse panes render natively: no light-theme inversion (addendum 2026-09-21: the bit's own limit) | Accepted |
+| [0048](./0048-the-input-box-is-found-by-its-own-frame.md) | The input box is found by its own frame; the statusline bound only bounds what is stripped (amends 0004; addendum 2026-09-26: an indented row inside the frame is draft text) | Accepted |
+| [0049](./0049-no-child-inherits-a-relocated-repository.md) | No child of issance inherits a variable that relocates a git repository | Accepted |
+| [0050](./0050-a-crew-fault-blocks-an-update-only-when-the-update-makes-it-worse.md) | A crew fault blocks an update only when the update would make it worse (distinguishes 0045) | Accepted |
+| [0051](./0051-the-phone-app-runs-react-router-in-library-mode.md) | The phone app runs React Router in library mode; four build seams framework mode would take | Accepted |
+| [0052](./0052-one-build-serves-any-mount.md) | One build serves any mount: `ISSANCE_BASE_PATH` is a runtime setting the bridge applies when it serves the shell | Accepted |
+| [0053](./0053-an-unread-dialog-still-has-a-way-out.md) | An unread dialog still has a way out: a footer phrase never silences a grammar, and a raw-only modal gets its adapter's declared cancel key (addendum 2026-09-26: positive evidence of a modal) | Accepted |
+| [0054](./0054-a-printed-scale-is-tappable.md) | A printed scale is tappable: when the screen names every value the arrows move along, the card shows them all and a tap sends the delta as repeated arrow presses | Accepted |
+| [0055](./0055-a-pointed-list-is-walked-then-confirmed.md) | A pointed list is walked, then confirmed: an unnumbered list with a `❯` on one row is tapped as the arrow delta plus the commit key the footer named, and never a synthesised digit (applies 0054 to a list) | Accepted |
+| [0056](./0056-a-card-can-be-put-down.md) | A lifted card can be put down: every card carries a Terminal control that shows the rows it replaced, lasting only as long as that dialog | Accepted |
+| [0057](./0057-the-composer-is-one-box.md) | The composer is one box: the field, the attach control and Send share one bordered container with a toolbar row, the prompt-input pattern ported by hand | Accepted |
+| [0058](./0058-the-resume-picker-commits-with-enter.md) | The resume picker commits with Enter: the `/resume` session picker, recognised by its own title, search box and footer, lifts as a pointed list whose tap is the walk plus an unprinted Enter, a narrow exception to 0009 for this one dialog | Accepted |
+| [0059](./0059-a-card-docks-above-the-belt.md) | A card docks above the belt: every lifted card renders in one slot outside the mirror's scroller, directly above the actions belt, capped and scrolled inside (moves where 0056's card renders) | Accepted |
+| [0060](./0060-an-attachment-is-a-chip-not-a-path.md) | An attachment is a chip, not a path: an upload shows as a chip above the field and a `[Image #N]` marker in the draft, and Send swaps in the path where the marker stands | Accepted |
+| [0061](./0061-the-terminal-draft-notice-floats.md) | The terminal draft notice floats: it leaves the layout for an absolute slot at the mirror's bottom edge, above the card dock or the belt, and an x hides it until that draft is gone (addendum 2026-10-18: the held-send card floats in the same slot, one column, collapsed from two rows) | Accepted |
+| [0062](./0062-a-crew-run-levels-to-its-target-and-its-second-step-is-not-a-new-attempt.md) | A crew run levels to its target, and its second step is not a new attempt: no turn below the target, the hourly limit exempts a step inside the same run, the lead names the limit (amends 0016) | Accepted |
+| [0063](./0063-a-pane-keeps-its-place-when-its-state-changes.md) | A pane keeps its place when its state changes: no list is ordered by status, the bridge and the crew merge send place order, every surface recomputes it, and urgency is a mark plus one summary line | Amended in scope by 0070 |
+| [0064](./0064-an-update-puts-the-phone-in-update-mode.md) | An update puts the phone in update mode: a locked app, a docked panel, seven steps that end only on Done, Rolled back or Stuck, the phone's own reload last and once, and a panel that never moves (amends 0044) | Accepted |
+| [0065](./0065-the-changes-view-reads-git-read-only.md) | The Changes view reads git, read-only: HEAD as the base, nested repo discovery under two per-device settings, git hardened against repo-driven execution, and a diff served only for a repo and path the bridge itself listed | Accepted |
+| [0066](./0066-the-dashboard-has-a-footer-panes-needs-you-changes.md) | The dashboard has a footer: Panes, Attention, Changes. Attention filters to the attention panes and never sorts, Changes lists workspaces with counts that refresh every 5 s only while the tab is on screen, the tab is kept per device (amends nothing in 0063) | Amended in scope by 0068, 0070 and 0085 |
+| [0067](./0067-back-goes-up-one-level.md) | Back goes up one level: down is a push that records `from`, sideways is a replace that carries it, up steps back onto a legitimate parent or replaces onto the structural one, a cold deep link is seeded with its parents, a POP draws no slide, and sheets own no history | Accepted |
+| [0068](./0068-the-second-tab-is-focus-not-attention.md) | The dashboard's second tab is Focus, not Attention: renamed for the same reason "Needs you" was, and `CircleDot` replaces `BellRing`, which read as a notification even in the quiet state (amends 0066 in scope) | Amended in scope by 0085 |
+| [0069](./0069-a-row-glides-into-its-header.md) | A row glides into its header: one engine, hand-started same-document view transitions, forward on the tap and reverse only on the in-app back arrow, a crossfade when the landing isn't real, and no frozen screen because a network wait is paid before the transition starts, not during it | Accepted |
+| [0070](./0070-a-pin-is-a-place-the-operator-chose.md) | A pin is a place the operator chose: pinned panes lead Panes, Focus, Changes and the switcher under the summary line, in place order, each listed once, keyed by the row and the workspace name in their own per-device store, pruned only by the operator's acts (amends 0063 and 0066 in scope) | Accepted |
+| [0071](./0071-the-operator-may-ask-for-activity-order.md) | The operator may ask for activity order: place is the default, the switcher and a Settings row write one standing per-device value, activity folds the space headings into one newest-first list, and the clock is read ONCE when the list opens so no row moves under a thumb (takes up 0063's Revisit clause) | Accepted |
+| [0072](./0072-a-two-pane-box-pans.md) | A two-pane box pans: a frame row carrying any COLUMN junction anchors a table run, a cross or a vertical tee, because a two-pane box draws no cross and refusing it left the box clipped rather than wrapped; a side tee is still not an anchor | Amended in scope by 0076 |
+| [0073](./0073-a-live-session-is-a-bounded-window-on-the-existing-poll.md) | A live session is a bounded window on the existing poll: `GET /api/pane/:id/chat` answers what moved, a 2 MB per-session window ticks only when asked, and three positions each do one job (`gen` which numbering, `rev` when, `seq` where); no WebSocket and no seq-cursored delta | Accepted |
+| [0074](./0074-a-push-title-is-a-code-the-phone-translates.md) | A push title is a code the phone translates: the bridge sends a catalogue code beside its English title, the page leaves the active language's templates in Cache Storage, and the service worker fills them, falling back to the English on any miss (amends 0030 in scope) | Accepted |
+| [0075](./0075-windows-is-a-supported-host.md) | Windows is a supported host: Windows 11 x64 with Hangar only, a `windows.yml` gate, a release zip with a sha256, a `make win-rehearse` before each tag, a native Task Scheduler tier, owner-only secrets by NTFS access list, no tmux, zellij, ARM, crew membership or managed front door, and the maintainer owns the code (supersedes the contrib-only decisions on PR 71 and PR 298) | Accepted |
+| [0076](./0076-the-omp-resume-picker-is-lifted-and-every-omp-modal-has-a-way-out.md) | The omp resume picker is lifted, and every omp modal has a way out: omp declares Escape as its cancel key together with positive modal evidence, its own key-hint footer naming the way out, and `/resume` lifts as a pointed list whose footer prints Enter (amends 0053's omp gap and 0072 in scope) | Amended in scope by 0077, 0078 and 0079 |
+| [0077](./0077-the-omp-ask-single-select-is-lifted-and-its-multi-select-is-not.md) | The omp Ask single-select is lifted, and its multi-select is not: captured single-select questions are pointed lists read off their measured footers; `Other` opens the answer editor; multi-select keeps the Escape card because its walk-then-Space toggle has no shared recipe and its Enter changed meaning (amends 0076 in scope; addendum 2026-10-10: option descriptions; addendum 2026-10-13: current footer hints, styled batch identity, expansion and explicit batch review) | Amended in scope by 0078 |
+| [0078](./0078-the-omp-tool-approval-is-lifted-and-deny-never-lands-on-approve.md) | The omp tool approval is lifted, and Deny never lands on Approve: the `bash` and `write` approval in its two captured presets is Approve, Deny and Cancel, Approve walks from the pointer while Deny always sends Down then Enter so every race ends on a denial, the card carries the whole command, or the path and all of the content, and declines rather than cut a row, and every uncaptured shape keeps the Escape card (amends 0076 and 0077 in scope) | Accepted |
+| [0079](./0079-the-omp-model-picker-is-lifted-as-its-visible-window.md) | The omp model picker is lifted as its visible window: the session-only `/switch` picker is one button per model row on screen, labelled by its full id and walked from the pointer, a shortened or over-context row is never offered, the card types nothing into the search, and the modal gate accepts the picker's task-mode toggle after the way out so its declined states keep the Escape card (amends 0076 in scope) | Accepted |
+| [0080](./0080-a-pointed-list-is-walked-verified-then-confirmed.md) | A pointed list is walked, verified, then confirmed: a tap on a pointed row sends the arrows bound to the tapped screen, reads again, and sends Enter only after a fresh read shows the pointer on the row, bound to that read, in the action layer for every harness (amends 0055 point 4) | Accepted |
+| [0081](./0081-a-front-doors-signed-identity-is-verified-cloudflare-access-is-the-first-preset.md) | A front door's signed identity is verified, not assumed; Cloudflare Access is the first preset: with `ISSANCE_ACCESS_TEAM` and `ISSANCE_ACCESS_AUD` set, a request through the tunnel needs a `Cf-Access-Jwt-Assertion` with this app's `aud`, the team's `iss` and a live `exp`; half a setting or unfetched keys fail closed | Accepted |
+| [0082](./0082-chat-is-the-default-view-of-an-agent-pane.md) | Chat is the default view of an agent pane: the opt-in under Settings → Experiments is gone, the per-device pane view defaults to Chat and a device that chose Terminal keeps it, and the shell-to-agent handover is one sequence in which the body changes only under the cover | Accepted |
+| [0083](./0083-the-files-view-reads-the-changes-root.md) | The Files view reads the Changes root: one folder or one file relative to the root the snapshot names, refused on its shape before any disk call, contained on real paths, `.git` and the bridge's state and config folders denied, one `unknown-path` answer, JSON only, and an authorised device required (`device-read`) (reused 2026-10-19 by the New page's folder browser, home as the root) | Accepted |
+| [0084](./0084-machines-report-their-load.md) | Machines report their load: each issance samples CPU, memory, load, network and disk on the tick it has, a member sends its last sample as the additive `machineStats` sibling of its snapshot answer, the lead or a solo issance keeps 24 hours of minutes and one CPU, one memory and one disk rule per machine, and pushes once per episode | Accepted |
+| [0085](./0085-the-dashboards-tabs-are-dashboard-crew-and-changes.md) | The dashboard's tabs are Dashboard, Crew and Changes: Focus becomes a switch in the summary line (`needsYouOnly`, per device), the first tab is renamed, Crew is drawn only while a crew is configured, a stored Focus reads as Dashboard with the switch on once (amends 0066 and 0068 in scope) | Accepted |
+| [0086](./0086-reads-need-the-pairing-token.md) | Reads need the pairing token, and pairing is always on: every `/api/*` route but `/api/health` and `/api/pair` answers `403 device not paired` without a valid token, an empty registry refuses everything else, the header gate stays write-only, and the crew link and the standby door keep their own credentials (amends 0083 and 0028 in reasoning) | Accepted |
+| [0087](./0087-the-on-device-store-is-one-thing.md) | The on-device store is one thing: session content the phone keeps past a page's life lives in one IndexedDB database, `issance-store`, with `fetchedAt` and the instance on every record, a 24 h default lifetime, a 256 KiB per-pane and a 10 MiB total cap, a purge on open and one wipe hook; the last-seen mirror moves there from sessionStorage | Accepted |
+| [0088](./0088-paths-the-agent-prints-are-links.md) | Paths the agent prints are links, inside the Changes root only: a path in the chat, a tool card or the terminal mirror is tappable when it resolves on the phone to a path under the pane's Changes root; only that root-relative path and never `~`, an absolute path, a line suffix or a `file://` URI reaches the bridge | Accepted |
+| [0089](./0089-a-second-agent-on-a-branch.md) | A second agent on a branch: a pane's ⋯ menu creates a worktree on a fresh branch and may start a `launchers.toml` row in it; the phone tags each create with a request id and the bridge keeps a receipt per id (`worktree-receipts.json`, 0600, 200 entries) so a retry replays, the launcher is matched exactly like `/api/launch`, a launcher failure is still a 200, the worktree calls get 60 s, the route is lead-local, and `trust_repository` is never sent | Accepted |
+| [0090](./0090-files-shows-images.md) | Files shows pictures, as bytes typed by their own content: `files/image` beside the Files read serves a PNG, JPEG, GIF, WebP or AVIF under the same root, checks and `device-read` gate, typed by magic bytes only (`415` otherwise), capped at 16 MiB (`413`), `no-store` and sandboxed; an SVG is text and is drawn from the text read in an `<img>`; the phone revokes each object URL, and a Markdown preview draws its first 20 relative pictures | Accepted |
+| [0091](./0091-launch-by-id-with-a-request-id.md) | An agent is started by id, with a request id and a receipt: the bridge owns the list of agents it starts (`bridge/harness-launch.ts`, one binary word each), reports `harnesses: [{ id, label, found }]` on `GET /api/launchers` with found checked on the login shell's PATH (asked once, cached 60 s), `POST /api/launch` takes exactly one of `command`, `harness` or `shell: true` plus an optional `cwd`, and a phone-minted `requestId` replays from `launch-receipts.json` (0600, 200 entries) so a retry never opens a second pane | Accepted |
+| [0092](./0092-the-keys-pad-is-a-board-you-arrange.md) | The Keys pad is a board you arrange: 7 columns, a key anchored at one cell and spanning 1 to 3 columns and 1 or 2 rows, never overlapping, a same-size drop swaps and any other overlap is refused; sticky modifiers and chord keys both come from the builder; the layout lives in the browser and is shared as a `issance-keys:2:` code (version 1 still read); the operator's Presets stay the operator's | Accepted |
+| [0093](./0093-a-branch-folder-is-named-by-its-parent.md) | A branch's folder is named by its parent, and checked on every use: "Hangar's default" sends no path and the sheet shows Hangar's predicted folder; "Other folder" names a parent under home and the bridge names the child after the branch; the parent must be absolute, `..`-free as sent, a real directory under home, reached through no link, outside every dotdir and the repo, and the child must not exist; the rule runs at plan and again at create; the last choices are kept per repo in `worktree-choices.json` | Accepted |
+| [0094](./0094-launchers-added-from-a-phone.md) | Launchers added from a phone live on the machine, under the operator's switches: `launchers-added.json` (0600, versioned, atomic, 20 rows, re-checked at read), never `launchers.toml`; the allowlist merges built-in ids, operator rows and the added rows the switches allow (operator wins); recipes first, free text only with `[phone] free_text`, `[phone] adds` turns phone rows off; a strict character rule; adds are writes with a request id; revoke removes the device's rows (route, CLI, read-time sweep, a crew forget); "No prompts" rows get a badge and one confirm per device; `items` gives availability and a reason per machine | Accepted |
+| [0095](./0095-one-off-commands-and-their-history.md) | One-off commands and their history: `POST /api/launch` takes `{ run }`, typed into a fresh shell as a row is, after a paired device, `[phone] run` (default true), the character rule and the folder rules; never on a new branch; a run that worked joins `commands-recent.json` (0600, versioned, 12 lines, newest first, one per line, re-checked at read); `recentRuns` on `GET /api/launchers`, remove and clear as writes, forwarded per machine; a revoke leaves the history, because an entry is a line and not a grant; the audit keeps the command word and the length, never the line; a typed line is checked first (`POST /api/launch/check`, a read) so the no-prompts confirm comes before its first run | Accepted |
+| [0096](./0096-speech-can-stay-on-the-phone.md) | Speech can stay on the phone: a per-device engine choice, Host or This phone, both running the same `needle` wasm vendored at a pinned commit with its sha256, licence and import list; on the phone only in a dedicated worker whose own response carries `script-src 'self' 'wasm-unsafe-eval'` and no network, while the document CSP never gains it; on the host as the `whistle` provider, a child of issance's own binary fed 16 kHz WAV by the phone (4-minute cap); the model is never in a release, reaches the host by one deliberate act (a write-gated tap in Settings, the one exception to setup-is-a-CLI-act, or `issance stt whistle`) from a pinned URL, and a phone only from the host by its own tap; no silent switch between engines (amends 0029 in scope) | Accepted |
+| [0097](./0097-codex-speech-can-be-chosen-from-settings.md) | Codex speech can be chosen from Settings: the Voice page shows the host's provider whatever it is (`GET /api/stt/host`, a read), and a write device may switch the host between Whistle, Codex and Off only (`PUT /api/stt/host`); Codex after the full consent, the CLI's own words kept equal by a drift test, accepted with an I accept tap that sends the consent's id, then the CLI's honest-first probe and the same recorded identity; a provider set up with a key or a command, or named by the environment, is shown with the command that changes it and never replaced; sign-in asked of `codex login status`, cached 30 s; the second exception to setup-is-a-CLI-act (amends 0029 and 0096 in scope) | Accepted |
+| [0098](./0098-pi-questions-are-read-by-shape-and-footer.md) | pi questions are read by shape and footer: one reader for every pi-family question screen, naming no extension; plans come from the footer alone (arrows and Enter select: walk, verify, commit; `1-9 select` on one question: the digit alone; typed digits: nothing); a complete Submit page lifts as a review; multi-select, a pointer on the free-text row and answer editors stay raw with the Escape card; the phone never types into a dialog |
+| [0099](./0099-a-durable-program-is-a-mux-with-no-screen.md) | A durable program is a mux with no screen: a `durable` adapter behind the mux port, a 0600 Unix socket the program listens on and the peer dials from `ISSANCE_DURABLE_SOCKET`, no token, a host-local experimental wire, Chat only | Accepted, amended in scope by 0103 and 0104 |
+| [0100](./0100-an-ask-travels-as-data-and-is-answered-by-id.md) | An ask travels as data and is answered by id: `asks?: Ask[]` on `PaneWire`, `POST /api/pane/:id/answer` with ask id, revision and request id, a receipt before the answer leaves, only a tap answers, an on-disk push guard | Accepted |
+| [0101](./0101-a-control-on-a-screenless-pane-names-the-turn-it-saw.md) | A control on a screenless pane names the turn it saw: send and abort carry a turn id or ask id and a request id, and a stale one gets 409 | Accepted |
+| [0102](./0102-starters-are-launcher-rows.md) | Starters are launcher rows: a program's starters ride `GET /api/launchers` and `POST /api/launch` with the ADR 0091 receipt | Accepted |
+| [0103](./0103-the-wire-has-two-transports-a-private-socket-or-tls-with-a-token.md) | The wire has two transports: a private socket, or TLS with a token: `ISSANCE_DURABLE_URL` and `ISSANCE_DURABLE_TOKEN` as a pair, exclusive with the socket; `https://` only, loopback `http://` with a port for `wrangler dev`; a token of at least 32 bytes on every request, never printed; 401 or 403 is `token-refused`; 2 s and 10 s polls and 5000 ms budgets because each poll is billed; the program checks the token first, in constant time; version stays 1 (amends 0099 in scope) | Accepted |
+| [0104](./0104-a-program-is-a-session.md) | A program is a session: a durable program is one more session of the issance you already run, listed in `sources.json` (name, kind, socket or url with a token, mode 0600) and written by `issance durable attach`; the session is the thing and a pane is one view of it; each source gets the durable adapter from the same factory, a session card says what it can do, capabilities are read per (host, session); `ISSANCE_MUX=durable` still runs a durable-only instance; the exit: by 1.24.0 a public repository that speaks the wire or an outside issue exists, else the durable code moves to `experiments/` and the docs page goes (amends 0099 in scope) | Accepted |
+| [0105](./0105-the-durable-sdk-is-an-npm-package.md) | The durable SDK is an npm package: `@colliepwa/durable-sdk`, built from `packages/durable-sdk/` by `bun run sdk:build` and proven by `scripts/sdk-pack-check.sh` on Node and Bun; one root import picks the Bun or the Node server at run time, with `./node`, `./bun`, `./pi` and `./core` beside it; no runtime dependency, the Pi packages are optional peers; published under the dist-tag `experimental`, never `latest`, by Altan alone and never by CI; its own semver, with `SDK_VERSION` and `WIRE_VERSION`; it follows ADR 0104's exit, which deprecates it with `npm deprecate` (amends 0104 in scope) | Accepted |
+| [0106](./0106-a-theme-is-a-closed-file-of-named-tokens.md) | A theme is a closed file of named tokens: one JSON file, `version` 1, an id, a light half and a dark half of 43 colour tokens each, and one `fonts.ui` key; an unknown key, version, value or a shipped id is refused with a message, never dropped; a value is hex or plain `oklch()`, no `var()` or `url()`; shipped themes apply by `data-theme` and generated `light-dark()` CSS, imported ones as inline properties from the validated object; the default `issance` applies nothing; the mirror and the ANSI 16 wait for a native-mirror mode; layout, radius, motion and status meaning are never themeable; the exit test is a zero pixel diff of the current theme (amends 0033 in scope) | Accepted |
+| [0107](./0107-sent-keeps-shell-lines-per-machine.md) | Sent keeps shell lines per machine: a line sent to a shell pane or run once from the New page joins `<stateDir>/sent.jsonl` on the machine that owns the pane, after Enter went out; prompts to agents, programs and keys never record; a line with a leading blank, a secret shape or a masked shape leaves no trace; at most 5000 records and 365 days; a lead merges its members over a forwardable read and keeps no copy; `ISSANCE_SENT=off` keeps nothing | Accepted |
+| [0108](./0108-a-dialog-over-live-chrome-declares-its-tail.md) | A dialog over live chrome declares its tail: `PromptModel.bindTail` sent as `expected_tail_lines`, a window from 6 to 12 rows the bridge only counts to, for Hermes panels with ticking rows under them; an older bridge fails closed | Proposed |
+| [0109](./0109-an-above-prompt-notice-is-not-a-modal.md) | An above-prompt notice is not a modal: a notice a profile names (`idle.notices`) whose keys act only on a box holding one digit leaves the box free; a send whose whole text is one of its printed keys, on an empty box, still takes the manual Send (and is refused in a running turn, a Replace, or an Add to it on an empty box); its card sends only the digits its key row prints, bound through the box's bottom border, so it is outside 0009's numbered-row ban; the conformance tail-anchoring check exempts it, because it lifts only over the live box and its tap is bound to the notice rows | Proposed |
+| [0110](./0110-two-release-lines.md) | Two release lines, Stable and Edge: `vX.Y.Z-edge.N` pre-releases stamped from the tag; one record (`update-line.json`) and one resolver (`lineOffer`); the switch installs nothing; a downgrade only for a rollback and the person-started switch back to Stable (`--downgrade`, "Go back now"), through the kept Stable build when present; the crew follows the lead's line (`X-Crew-Lead-Line`); and the state-shape rule, new fields and new files only, held in CI against the last Stable's fixtures | Accepted |
+| [0111](./0111-the-skill-follows-the-update.md) | The walky talky skill follows the update: after every successful swap (update, rollback, switch, crew follow, in-place, terminal rollback) the new binary runs `issance skill sync`, which installs into every harness present on the machine and rewrites a stale copy, within 30 s and never failing the update; `issance skill uninstall` leaves a marker the sync respects; `ISSANCE_SKILL_SYNC=off` keeps the old note; the bridge still never writes | Accepted |
+| [0112](./0112-a-pane-outside-its-workspace-folder-reads-its-own.md) | A pane outside its workspace folder reads its own: the workspace root (0065 §3) applies to a pane only when the pane's folder sits inside it; a pane outside it (`cd` to a scratch folder, another repo) reads its own cwd, bounded, never another pane's repo; workspace routes unchanged; an unknown cwd keeps the root and symlink spellings are re-checked on disk (amends 0065 in scope) | Proposed |
+
+Numbers are claimed across **both** branches: 0011–0016 were accepted here on `v1` while `main` was
+still at 0010, so a new ADR continues from the highest number in use anywhere, not the highest one on
+the branch you happen to be on.

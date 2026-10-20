@@ -1,0 +1,880 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+
+import { parseAnsi } from "../../ansi";
+import { splitLines, type StyledLine } from "../../blocks";
+import { COMBINING_RANGES, WIDE_RANGES } from "../../text-width";
+import {
+  composerPrompt,
+  extractInputDraft,
+  extractStatusLines,
+  hasComposer,
+  locateComposer,
+  stripChrome,
+} from "./chrome";
+import { lineText } from "./markers";
+
+// omp's composer chrome. The whole adapter's Tier-1 value — and its safety half — is here: the shape
+// this scanner finds is the statusline, the stranded draft, AND the answer to "may a phone reply be
+// typed right now". A false "yes" types the user's message into whatever modal has the keyboard.
+
+// Anchored on this file's directory (see markers.test.ts for why not `new URL(import.meta.url)`).
+const PANES_DIR = join(import.meta.dirname, "..", "..", "..", "fixtures", "panes");
+
+function fixtureLines(name: string): StyledLine[] {
+  return splitLines(parseAnsi(readFileSync(join(PANES_DIR, name), "utf8")));
+}
+function lines(text: string): StyledLine[] {
+  return splitLines(parseAnsi(text));
+}
+
+// Synthesise omp's composer box at a caller-chosen width. Nothing in the scanner measures a row any
+// more, so the padding is here only to keep these buffers shaped like the captures they stand in for.
+function boxRows(
+  draftTail: string,
+  opts: { width?: number; cont?: string[]; status?: string } = {},
+): string[] {
+  const width = opts.width ?? 60;
+  const fill = (open: string, body: string, close: string, filler: string): string =>
+    open + body + filler.repeat(Math.max(0, width - open.length - body.length - close.length)) + close;
+  return [
+    fill("╭──", opts.status ?? " statusline ", "╮", "─"),
+    ...(opts.cont ?? []).map((c) => fill("│  ", c, "  │", " ")),
+    fill("╰─ ", draftTail, " ─╯", " "),
+  ];
+}
+
+// The boxed scanner's positive cohort. Every other OMP capture — the three `rule` composer states
+// included — must return null here; index.ts composes the separate rule scanner over this one.
+const BOX_COMPOSER_FIXTURES = [
+  "omp--done--tool-result.txt",
+  "omp--done.txt",
+  "omp--draft-ghost-suggestion.txt",
+  "omp--draft-ghost-suggestion-busy.txt",
+  "omp--draft-single.txt",
+  "omp--draft-wrapped.txt",
+  "omp--fresh-agents-hint.txt",
+  "omp--fresh-effort-hint.txt",
+  "omp--fresh-idle-widget-above.txt",
+  "omp--fresh-idle-widget-below.txt",
+  "omp--fresh-idle.txt",
+  "omp--menu-dismissed.txt",
+  "omp--slash-palette--filtered.txt",
+  "omp--slash-palette.txt",
+  "omp--v18-4-composer-idle.txt",
+  "omp--v18-10-draft-blank-line.txt",
+  "omp--v18-10-draft-indented.txt",
+  "omp--v18-10-draft-two-lines.txt",
+  "omp--working.txt",
+  // omp 18.6.1 with `/settings` typed: a five-row palette under the open box (lab, 2026-10-17).
+  "omp--v18-6-slash-settings-list--w120.txt",
+  "omp--v18-6-slash-settings-list--w80.txt",
+  // omp 18.11.3's box composer, nerd and unicode symbol presets (issue 497, 2026-10-18).
+  "omp--v18-11-ghost-word--w130.txt",
+  "omp--v18-11-image-chip--w130.txt",
+  "omp--v18-11-nerd-box-path-text--w130.txt",
+  "omp--v18-11-nerd-box-path-text--w80.txt",
+  "omp--v18-11-nerd-box-two-lines--w130.txt",
+  "omp--v18-11-nerd-box-two-lines--w80.txt",
+  "omp--v18-11-nerd-box-wrapped--w130.txt",
+  "omp--v18-11-nerd-box-wrapped--w80.txt",
+  "omp--v18-11-nerd-ghost-word--w130.txt",
+  "omp--v18-11-nerd-ghost-word--w80.txt",
+  "omp--v18-11-nerd-image-chip--w130.txt",
+  "omp--v18-11-nerd-image-chip--w80.txt",
+  "omp--v18-11-nerd-running-tool--w130.txt",
+  "omp--v18-11-nerd-running-tool--w80.txt",
+  "omp--v18-11-nerd-running-tool-minute--w130.txt",
+  "omp--v18-11-nerd-running-tool-minute--w80.txt",
+  "omp--v18-11-nerd-skill-long-form--w130.txt",
+  "omp--v18-11-nerd-skill-pointed--w130.txt",
+  "omp--v18-11-nerd-skill-pointed--w80.txt",
+  "omp--v18-11-skill-pointed--w130.txt",
+  // omp 18.12.1's default `band` composer under the nerd preset, and one unicode control (issue 505).
+  "omp--v18-12-band-idle--w130.txt",
+  "omp--v18-12-nerd-band-done--w130.txt",
+  "omp--v18-12-nerd-band-done--w80.txt",
+  "omp--v18-12-nerd-band-draft--w130.txt",
+  "omp--v18-12-nerd-band-draft--w80.txt",
+  "omp--v18-12-nerd-band-idle--w130.txt",
+  "omp--v18-12-nerd-band-idle--w80.txt",
+  "omp--v18-12-nerd-band-running--w130.txt",
+  "omp--v18-12-nerd-band-running--w80.txt",
+  "omp--v18-12-nerd-band-running-minute--w130.txt",
+  "omp--v18-12-nerd-band-two-lines--w130.txt",
+  "omp--v18-12-nerd-band-two-lines--w80.txt",
+  "omp--v18-12-nerd-band-wrapped--w130.txt",
+  "omp--v18-12-nerd-band-wrapped--w80.txt",
+  // omp 18.11.1's band, stock and with a transparent, slash, minimal or ascii status line (issue 505).
+  "omp--v18.11.1-ascii-idle--w120.txt",
+  "omp--v18.11.1-minimal-idle--w120.txt",
+  "omp--v18.11.1-powerline-draft--w120.txt",
+  "omp--v18.11.1-powerline-idle--w120.txt",
+  "omp--v18.11.1-powerline-transparent-draft--w120.txt",
+  "omp--v18.11.1-powerline-transparent-idle--w120.txt",
+  "omp--v18.11.1-slash-idle--w120.txt",
+];
+
+// omp 18.6.1 with `/model` or `/mod` typed (lab, 2026-10-17): a ten-row palette under the open box. The
+// box is found and its draft read, but the palette pushes the row past the bridge's tail window, so no
+// region is named (see "declines the region" below).
+const TALL_PALETTE_FIXTURES = [
+  "omp--v18-6-slash-mod-partial--w120.txt",
+  "omp--v18-6-slash-model-list--w120.txt",
+  "omp--v18-6-slash-model-list--w80.txt",
+  // omp 18.11.3, nerd preset: `/ship` and `/model` with a ten-row palette (issue 497, 2026-10-18).
+  "omp--v18-11-nerd-skill-and-command--w130.txt",
+  "omp--v18-11-nerd-slash-model--w130.txt",
+  "omp--v18-11-nerd-slash-model--w80.txt",
+];
+
+const ALL_OMP_FIXTURES = readdirSync(PANES_DIR)
+  .filter((f) => f.startsWith("omp--") && f.endsWith(".txt"))
+  .toSorted();
+
+const NON_BOX_COMPOSER_FIXTURES = ALL_OMP_FIXTURES.filter((f) => !BOX_COMPOSER_FIXTURES.includes(f) && !TALL_PALETTE_FIXTURES.includes(f));
+
+describe("locateComposer — the real corpus, pinned so any change to the walk shows up as a diff", () => {
+  const PINNED: { fixture: string; top: number; bottom: number; suggestEnd: number; draftEnd?: number }[] = [
+    { fixture: "omp--fresh-idle.txt", top: 26, bottom: 27, suggestEnd: 28 },
+    // Issue 468: an extension's widget row under the box (`belowEditor`) falls in the suggestion
+    // rows, and one over it (`aboveEditor`) moves the box down a row.
+    { fixture: "omp--fresh-idle-widget-below.txt", top: 26, bottom: 27, suggestEnd: 29, draftEnd: 28 },
+    { fixture: "omp--fresh-idle-widget-above.txt", top: 27, bottom: 28, suggestEnd: 29 },
+    // omp 18.4's empty-composer hint (`⇧⇥ to change thinking effort`) sits right-aligned in the
+    // bottom border: it changes what the row SAYS, never where the box is.
+    { fixture: "omp--fresh-effort-hint.txt", top: 1, bottom: 2, suggestEnd: 3 },
+    // The same border with the higher-priority hint, `← ← to see 1 running agent`: a background
+    // subagent was running. Its key run is two glyphs with a space between them.
+    { fixture: "omp--fresh-agents-hint.txt", top: 1, bottom: 2, suggestEnd: 3 },
+    { fixture: "omp--draft-single.txt", top: 26, bottom: 27, suggestEnd: 28 },
+    // The same screen with omp's inline suggestion painted after the draft: the ghost changes what
+    // the row SAYS, never where the box is.
+    { fixture: "omp--draft-ghost-suggestion.txt", top: 26, bottom: 27, suggestEnd: 28 },
+    // The same ghost again, on the shape omp 18 draws while the agent is WORKING: the draft carries an
+    // explicit foreground of its own, so the ghost is no longer "colour after no colour".
+    { fixture: "omp--draft-ghost-suggestion-busy.txt", top: 26, bottom: 27, suggestEnd: 28 },
+    // A draft long enough to wrap: two continuation rows ABOVE the bottom border (omp folds the
+    // other way from Claude, which indents continuations BELOW its `❯` line).
+    { fixture: "omp--draft-wrapped.txt", top: 26, bottom: 29, suggestEnd: 30 },
+    { fixture: "omp--done.txt", top: 53, bottom: 54, suggestEnd: 55 },
+    { fixture: "omp--done--tool-result.txt", top: 49, bottom: 50, suggestEnd: 51 },
+    { fixture: "omp--working.txt", top: 32, bottom: 33, suggestEnd: 34 },
+    { fixture: "omp--menu-dismissed.txt", top: 26, bottom: 27, suggestEnd: 28 },
+    // omp 18.4.10 after `/resume` forked a session: a 177-row buffer whose boxed composer is empty and
+    // whose top border carries the 18.4 powerline (`… ▶─2%───┃─1.1M─`, no branch named `master`).
+    { fixture: "omp--v18-4-composer-idle.txt", top: 175, bottom: 176, suggestEnd: 177 },
+    // The slash palette renders BELOW the box — so `suggestEnd` runs past `bottom + 1` and the strip
+    // takes the palette with the box.
+    { fixture: "omp--slash-palette.txt", top: 26, bottom: 27, suggestEnd: 31 },
+    { fixture: "omp--slash-palette--filtered.txt", top: 26, bottom: 27, suggestEnd: 33 },
+    // OMP 18.10 paints a draft's later lines UNDER its open-ended prompt row: `bottom` is the prompt,
+    // and the rows down to `draftEnd` are the draft, a blank line of it included.
+    { fixture: "omp--v18-10-draft-two-lines.txt", top: 11, bottom: 12, suggestEnd: 14, draftEnd: 14 },
+    { fixture: "omp--v18-10-draft-blank-line.txt", top: 11, bottom: 12, suggestEnd: 15, draftEnd: 15 },
+    { fixture: "omp--v18-10-draft-indented.txt", top: 11, bottom: 12, suggestEnd: 15, draftEnd: 15 },
+    // omp 18.6.1: the `/settings` palette under the open box, at 120 and 80 columns.
+    { fixture: "omp--v18-6-slash-settings-list--w120.txt", top: 17, bottom: 18, suggestEnd: 23 },
+    { fixture: "omp--v18-6-slash-settings-list--w80.txt", top: 18, bottom: 19, suggestEnd: 24 },
+    // omp 18.11.3's box composer (issue 497): drafts, chips, a short skill list and a running turn.
+    { fixture: "omp--v18-11-ghost-word--w130.txt", top: 15, bottom: 16, suggestEnd: 17 },
+    { fixture: "omp--v18-11-image-chip--w130.txt", top: 21, bottom: 22, suggestEnd: 23 },
+    { fixture: "omp--v18-11-nerd-box-path-text--w130.txt", top: 14, bottom: 16, suggestEnd: 17 },
+    { fixture: "omp--v18-11-nerd-box-path-text--w80.txt", top: 15, bottom: 18, suggestEnd: 19 },
+    { fixture: "omp--v18-11-nerd-box-two-lines--w130.txt", top: 14, bottom: 16, suggestEnd: 17 },
+    { fixture: "omp--v18-11-nerd-box-two-lines--w80.txt", top: 15, bottom: 17, suggestEnd: 18 },
+    { fixture: "omp--v18-11-nerd-box-wrapped--w130.txt", top: 14, bottom: 16, suggestEnd: 17 },
+    { fixture: "omp--v18-11-nerd-box-wrapped--w80.txt", top: 15, bottom: 18, suggestEnd: 19 },
+    { fixture: "omp--v18-11-nerd-ghost-word--w130.txt", top: 14, bottom: 15, suggestEnd: 16 },
+    { fixture: "omp--v18-11-nerd-ghost-word--w80.txt", top: 15, bottom: 16, suggestEnd: 17 },
+    { fixture: "omp--v18-11-nerd-image-chip--w130.txt", top: 20, bottom: 21, suggestEnd: 22 },
+    { fixture: "omp--v18-11-nerd-image-chip--w80.txt", top: 21, bottom: 22, suggestEnd: 23 },
+    { fixture: "omp--v18-11-nerd-running-tool--w130.txt", top: 43, bottom: 44, suggestEnd: 45 },
+    { fixture: "omp--v18-11-nerd-running-tool--w80.txt", top: 43, bottom: 44, suggestEnd: 45 },
+    { fixture: "omp--v18-11-nerd-running-tool-minute--w130.txt", top: 43, bottom: 44, suggestEnd: 45 },
+    { fixture: "omp--v18-11-nerd-running-tool-minute--w80.txt", top: 43, bottom: 44, suggestEnd: 45 },
+    { fixture: "omp--v18-11-nerd-skill-long-form--w130.txt", top: 14, bottom: 15, suggestEnd: 17 },
+    { fixture: "omp--v18-11-nerd-skill-pointed--w130.txt", top: 14, bottom: 15, suggestEnd: 17 },
+    { fixture: "omp--v18-11-nerd-skill-pointed--w80.txt", top: 15, bottom: 16, suggestEnd: 19 },
+    { fixture: "omp--v18-11-skill-pointed--w130.txt", top: 15, bottom: 16, suggestEnd: 18 },
+    // omp 18.12.1's default `band` composer (issue 505): the status band is the top row, `╰─` the prompt.
+    { fixture: "omp--v18-12-band-idle--w130.txt", top: 10, bottom: 11, suggestEnd: 12 },
+    { fixture: "omp--v18-12-nerd-band-done--w130.txt", top: 38, bottom: 39, suggestEnd: 40 },
+    { fixture: "omp--v18-12-nerd-band-done--w80.txt", top: 38, bottom: 39, suggestEnd: 40 },
+    { fixture: "omp--v18-12-nerd-band-draft--w130.txt", top: 11, bottom: 12, suggestEnd: 13 },
+    { fixture: "omp--v18-12-nerd-band-draft--w80.txt", top: 11, bottom: 12, suggestEnd: 13 },
+    { fixture: "omp--v18-12-nerd-band-idle--w130.txt", top: 11, bottom: 12, suggestEnd: 13 },
+    { fixture: "omp--v18-12-nerd-band-idle--w80.txt", top: 11, bottom: 12, suggestEnd: 13 },
+    { fixture: "omp--v18-12-nerd-band-running--w130.txt", top: 26, bottom: 27, suggestEnd: 28 },
+    { fixture: "omp--v18-12-nerd-band-running--w80.txt", top: 38, bottom: 39, suggestEnd: 40 },
+    { fixture: "omp--v18-12-nerd-band-running-minute--w130.txt", top: 26, bottom: 27, suggestEnd: 28 },
+    { fixture: "omp--v18-12-nerd-band-two-lines--w130.txt", top: 11, bottom: 12, suggestEnd: 14, draftEnd: 14 },
+    { fixture: "omp--v18-12-nerd-band-two-lines--w80.txt", top: 11, bottom: 12, suggestEnd: 14, draftEnd: 14 },
+    { fixture: "omp--v18-12-nerd-band-wrapped--w130.txt", top: 11, bottom: 12, suggestEnd: 14, draftEnd: 14 },
+    { fixture: "omp--v18-12-nerd-band-wrapped--w80.txt", top: 11, bottom: 12, suggestEnd: 15, draftEnd: 15 },
+    // omp 18.11.1's band (issue 505), stock and with other status line styles: the band is the top row.
+    { fixture: "omp--v18.11.1-ascii-idle--w120.txt", top: 13, bottom: 14, suggestEnd: 15 },
+    { fixture: "omp--v18.11.1-minimal-idle--w120.txt", top: 13, bottom: 14, suggestEnd: 15 },
+    { fixture: "omp--v18.11.1-powerline-draft--w120.txt", top: 13, bottom: 14, suggestEnd: 15 },
+    { fixture: "omp--v18.11.1-powerline-idle--w120.txt", top: 13, bottom: 14, suggestEnd: 15 },
+    { fixture: "omp--v18.11.1-powerline-transparent-draft--w120.txt", top: 15, bottom: 16, suggestEnd: 17 },
+    { fixture: "omp--v18.11.1-powerline-transparent-idle--w120.txt", top: 15, bottom: 16, suggestEnd: 17 },
+    { fixture: "omp--v18.11.1-slash-idle--w120.txt", top: 13, bottom: 14, suggestEnd: 15 },
+  ];
+
+  // These eleven indices are byte-identical to the ones the width-gated scanner produced. That is
+  // evidence that dropping the measurements cost nothing the corpus can see: every boxed composer
+  // capture still resolves to the same rows and every other capture still resolves to null.
+  it.each(PINNED)("$fixture locates the box", ({ fixture, top, bottom, suggestEnd, draftEnd }) => {
+    const box = locateComposer(fixtureLines(fixture));
+    expect(box).not.toBeNull();
+    expect(box!).toEqual({ top, firstDraftRow: top + 1, bottom, suggestEnd, draftEnd: draftEnd ?? bottom + 1 });
+  });
+
+  it("covers every boxed composer capture in the corpus", () => {
+    expect(PINNED.map((p) => p.fixture).toSorted()).toEqual(BOX_COMPOSER_FIXTURES.toSorted());
+  });
+});
+
+describe("the boxed composer gate", () => {
+  // This module must decline both modals and other composer shapes. The composite adapter's stronger
+  // assertion — every captured modal makes `composerReady` false, while every `rule` fixture is
+  // true — lives at the public seam in harness/omp.test.ts.
+  it.each(NON_BOX_COMPOSER_FIXTURES)("%s: not a boxed composer", (name) => {
+    expect(locateComposer(fixtureLines(name))).toBeNull();
+    expect(hasComposer(fixtureLines(name))).toBe(false);
+  });
+
+  it.each(BOX_COMPOSER_FIXTURES)("%s: the composer IS on screen", (name) => {
+    expect(hasComposer(fixtureLines(name))).toBe(true);
+  });
+});
+
+describe("extractInputDraft", () => {
+  const DRAFTS: { fixture: string; draft: string | null }[] = [
+    { fixture: "omp--draft-single.txt", draft: "list the files in this repo" },
+    // The suggestion (`sitory`, painted after `repo` in omp's muted colour) is not in the input
+    // buffer, so it is not the draft: returning `list the files in this repository` here stalled
+    // every send with "Message didn't reach the input box" (markers.ts `composerGhost`).
+    { fixture: "omp--draft-ghost-suggestion.txt", draft: "list the files in this repo" },
+    // The same row with the draft painted in omp 18's explicit foreground. The first ghost rule
+    // anchored on the draft being UNSTYLED and returned `list the files in this repository` here,
+    // which brought the stall back verbatim on every busy pane.
+    { fixture: "omp--draft-ghost-suggestion-busy.txt", draft: "list the files in this repo" },
+    {
+      fixture: "omp--draft-wrapped.txt",
+      // Three fragments folded into one line: the two continuation rows, top-down, then the tail off
+      // the bottom border. Joined with a single space — omp soft-wraps at word boundaries, so the
+      // break it removed was one.
+      draft:
+        "list the files in this repo and then write a one sentence summary for each file, keep every " +
+        "summary under twenty words, sort the whole list alphabetically by file name, skip anything " +
+        "inside the dot git directory, and finally print the total count of files at the very bottom " +
+        "of the answer so it is easy to check the result quickly against a manual count taken by hand",
+    },
+    // A slash command mid-typing is a draft like any other — the palette below the box is chrome.
+    { fixture: "omp--slash-palette.txt", draft: "/" },
+    { fixture: "omp--slash-palette--filtered.txt", draft: "/new" },
+    { fixture: "omp--v18-6-slash-settings-list--w120.txt", draft: "/settings" },
+    { fixture: "omp--v18-6-slash-settings-list--w80.txt", draft: "/settings" },
+    { fixture: "omp--v18-6-slash-model-list--w120.txt", draft: "/model" },
+    { fixture: "omp--v18-6-slash-model-list--w80.txt", draft: "/model" },
+    { fixture: "omp--v18-6-slash-mod-partial--w120.txt", draft: "/mod" },
+    // Empty composers. omp 17/18.1 painted nothing in an empty box; omp 18.4 paints a right-aligned
+    // key hint there (`⇧⇥ to change thinking effort`), which is placeholder text, not a draft.
+    // Reading it as one showed "Draft in terminal" on every fresh session (markers.ts
+    // `draftPlaceholder`).
+    { fixture: "omp--fresh-effort-hint.txt", draft: null },
+    { fixture: "omp--fresh-agents-hint.txt", draft: null },
+    { fixture: "omp--fresh-idle.txt", draft: null },
+    { fixture: "omp--done.txt", draft: null },
+    { fixture: "omp--done--tool-result.txt", draft: null },
+    { fixture: "omp--working.txt", draft: null },
+    { fixture: "omp--menu-dismissed.txt", draft: null },
+    { fixture: "omp--v18-4-composer-idle.txt", draft: null },
+  ];
+
+  it.each(DRAFTS)("$fixture reads its draft", ({ fixture, draft }) => {
+    expect(extractInputDraft(fixtureLines(fixture))).toBe(draft);
+  });
+
+  it.each(NON_BOX_COMPOSER_FIXTURES)("%s: no box at the tail ⇒ no draft", (name) => {
+    expect(extractInputDraft(fixtureLines(name))).toBeNull();
+  });
+});
+
+describe("extractStatusLines", () => {
+  it.each(BOX_COMPOSER_FIXTURES)("%s: re-surfaces exactly one styled row", (name) => {
+    const rows = extractStatusLines(fixtureLines(name));
+    expect(rows).toHaveLength(1);
+    // STYLED, not flattened: omp colours each powerline field separately, and that is what makes the
+    // strip readable at a glance once the mirror can no longer show it.
+    expect(rows[0]!.segments.length).toBeGreaterThan(1);
+  });
+
+  // The two omp 18.4 hint captures carry the capturing operator's own statusline template, not
+  // the `π … ▶` powerline these assertions read, and neither does the 18.4.10 idle capture, whose
+  // row runs on into a context meter (`▶─2%───┃─1.1M`) and names branch `main`. The three 18.10 draft
+  // captures run on into the same meter (`▶───5%───…128K─`). The 18.11 captures run in a scratch folder
+  // with no branch, and the nerd preset draws no `π` and no `▶`. The 18.12 band captures run on into
+  // the meter too, and name branch `main`. The 18.11.1 band captures draw no `π` either, bar the ascii
+  // one, which writes `pi`.
+  it.each(
+    BOX_COMPOSER_FIXTURES.filter(
+      (f) =>
+        f !== "omp--done.txt" &&
+        f !== "omp--fresh-effort-hint.txt" &&
+        f !== "omp--fresh-agents-hint.txt" &&
+        f !== "omp--v18-4-composer-idle.txt" &&
+        !f.startsWith("omp--v18-10-draft-") &&
+        !f.startsWith("omp--v18-6-") &&
+        !f.startsWith("omp--v18-11-") &&
+        !f.startsWith("omp--v18-12-") &&
+        !f.startsWith("omp--v18.11.1-"),
+    ),
+  )(
+    "%s: trims the border glyphs off both ends, keeping the whole powerline",
+    (name) => {
+      const text = lineText(extractStatusLines(fixtureLines(name))[0]!);
+      expect(text.startsWith("π")).toBe(true);
+      expect(text.endsWith("▶")).toBe(true);
+      // By glyph class, never by content: nothing here reads `⬢`, `⑂`, `◫` or `(sub)`, all of which
+      // are user-configurable in omp's statusline template (see the fixtures README's warning).
+      expect(text).toContain("master");
+    },
+  );
+
+  it.each(NON_BOX_COMPOSER_FIXTURES)("%s: no box at the tail ⇒ the strip hides", (name) => {
+    expect(extractStatusLines(fixtureLines(name))).toEqual([]);
+  });
+
+  it("returns [] when the statusline has been configured away entirely", () => {
+    // A bare `╭────╮` has nothing but border left. No special case: the strip simply hides, which is
+    // the honest answer for a user who turned their statusline off.
+    const buffer = lines(["output above", ...boxRows("", { status: "──" })].join("\n"));
+    expect(locateComposer(buffer)).not.toBeNull();
+    expect(extractStatusLines(buffer)).toEqual([]);
+  });
+});
+
+describe("known limitation — the `◀ N` transcript-scroll indicator", () => {
+  // omp splices a scroll indicator into the SAME border it paints the statusline into, and it is not
+  // a border glyph: the trailing trim stops at the `1` segment, so this one capture's strip keeps the
+  // rule run and `◀ 1` on the end. A tighter rule would have to read the `◀ N` CONTENT, which is
+  // exactly the content-anchoring this function refuses to do. Pinned rather than hidden.
+  it("keeps the rule run and `◀ 1` on omp--done.txt", () => {
+    const text = lineText(extractStatusLines(fixtureLines("omp--done.txt"))[0]!);
+    expect(text.startsWith("π")).toBe(true);
+    expect(text.endsWith("◀ 1")).toBe(true);
+    expect(text).toContain("▶───");
+  });
+});
+
+describe("stripChrome", () => {
+  it.each(["omp--fresh-idle.txt", "omp--slash-palette.txt"])(
+    "%s: peels the box (and anything below it) off the tail, keeping the transcript",
+    (name) => {
+      const original = fixtureLines(name);
+      const stripped = stripChrome(original);
+      // 25 rows survive in both: the box at 26, the blank at 25 exposed above it, and — for the
+      // palette capture — the three autocomplete rows below it, all gone. `✔ New session started`
+      // (row 24) stays. The palette going with the box is deliberate: it is composer chrome, and
+      // issance draws its own for an omp pane from lib/agent-commands.ts's `omp` catalog, so keeping
+      // omp's here would draw a palette twice. (Before that catalog existed `commandsFor("omp")`
+      // returned [] and composer.tsx hid the button — this strip took the palette and gave back
+      // nothing, which is the Tier-0 regression the catalog closes.)
+      expect(stripped).toHaveLength(25);
+      expect(lineText(stripped[24]!).trim()).toBe("✔ New session started");
+    },
+  );
+
+  // The nine omp 18.10 Ask captures end with a file newline, which reads as one trailing blank row, and
+  // dropping that row is chrome stripping, not a bug: the same-reference contract is for captures whose
+  // last row is already content.
+  const ENDS_IN_CONTENT = NON_BOX_COMPOSER_FIXTURES.filter(
+    (name) => lineText(fixtureLines(name).at(-1)!).trim() !== "",
+  );
+
+  it.each(ENDS_IN_CONTENT)(
+    "%s: returns the SAME reference when there is no chrome to strip",
+    (name) => {
+      // The conservatism contract: callers may treat `result === lines` as "nothing was removed".
+      // Every modal capture qualifies — no composer box at the tail, and no trailing blank run
+      // either, so not a single line is dropped.
+      const original = fixtureLines(name);
+      expect(stripChrome(original)).toBe(original);
+    },
+  );
+
+  it("returns the SAME reference for an empty buffer", () => {
+    // The contract's degenerate end. Nothing can have been removed from `[]`, so `result === lines`
+    // has to hold there too — it used to hand back a fresh array via `lines.slice(0, 0)`, quietly
+    // telling every caller that chrome had been stripped off an empty buffer.
+    const empty: StyledLine[] = [];
+    expect(stripChrome(empty)).toBe(empty);
+    // An all-blank buffer really does lose every row, so that one must NOT be the same reference.
+    const blanks = lines("\n\n\n");
+    expect(stripChrome(blanks)).not.toBe(blanks);
+    expect(stripChrome(blanks)).toHaveLength(0);
+  });
+
+  it("never removes content above the box", () => {
+    const buffer = lines(["● Wrote the file", "  ⎿  done", "", ...boxRows("")].join("\n"));
+    expect(stripChrome(buffer).map(lineText)).toEqual(["● Wrote the file", "  ⎿  done"]);
+  });
+});
+
+// A NON-clustering width table — the shape used by wcwidth/wcswidth, go-runewidth and Rust's
+// unicode-width, i.e. by essentially every TUI: sum each code point independently instead of scoring a
+// grapheme cluster by its base. Built from text-width.ts's OWN range tables so the only modelled
+// difference is the clustering, and used below to pad a box exactly as a terminal on that table would.
+// `displayWidth` says 2 for `👨‍💻` where this says 4, and 2 for `👨‍👩‍👧‍👦` where this says 8.
+function perCodePointWidth(text: string): number {
+  const inRanges = (cp: number, ranges: ReadonlyArray<readonly [number, number]>): boolean => {
+    for (const [lo, hi] of ranges) {
+      if (cp < lo) return false;
+      if (cp <= hi) return true;
+    }
+    return false;
+  };
+  let w = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0)!;
+    if (inRanges(cp, COMBINING_RANGES)) continue;
+    w += inRanges(cp, WIDE_RANGES) ? 2 : 1;
+  }
+  return w;
+}
+
+/** omp's composer, padded to `cols` by the table above rather than by ours — the whole point being
+ *  that the scanner must not care which of the two drew it. */
+function boxRowsPaddedLikeATerminal(
+  status: string,
+  draftTail: string,
+  cont: string[] = [],
+  cols = 189,
+): string[] {
+  const fill = (open: string, body: string, close: string, filler: string): string =>
+    open +
+    body +
+    filler.repeat(
+      cols - perCodePointWidth(open) - perCodePointWidth(body) - perCodePointWidth(close),
+    ) +
+    close;
+  return [
+    fill("╭── ", `${status} `, "╮", "─"),
+    ...cont.map((c) => fill("│  ", c, "  │", " ")),
+    fill("╰─ ", draftTail, " ─╯", " "),
+  ];
+}
+
+// The false-NULL direction, which is the one that costs the user everything: locateComposer answering
+// null on a screen that plainly has the composer on it means no statusline strip, no stranded-draft
+// chip, `composerReady` false forever, and every reply refused with "the input box isn't on screen"
+// while no dialog exists. Every case here is a box omp padded with a per-code-point table; the round
+// that compared measured widths (even slackened by an "error bar") returned null on all five.
+describe("locateComposer — Unicode anywhere in the box must never produce a null", () => {
+  const STATUS = "Auto > ~/scratchpad/omp-sandbox > master > 11.5%/200K";
+  const CASES: Array<[string, string, string, string[]]> = [
+    // A ZWJ sequence in the statusline template: 2 columns for us, 4 for the terminal that padded it.
+    ["ZWJ emoji in the statusline", `👨‍💻 ${STATUS}`, "ship the release notes", []],
+    ["skin-tone emoji in the statusline", `👋🏽 ${STATUS}`, "ship the release notes", []],
+    // The operator simply typed emoji into their own message. Nothing configurable about it.
+    [
+      "ZWJ + skin-tone emoji in the user's own draft",
+      STATUS,
+      "shipping 🎉 nice work 👍🏽👍🏽 great job 👨‍💻👨‍💻 all done 👋🏽👋🏽",
+      [],
+    ],
+    // Six clusters' worth of divergence on a CONTINUATION row: the walk must not end early there,
+    // which would strand the scan mid-box and fail the top-border step on a composer that is there.
+    [
+      "a family emoji on a wrapped draft's continuation row",
+      STATUS,
+      "and finally print the total count",
+      ["the standup went well today 👨‍👩‍👧‍👦 everyone showed up and we closed the sprint"],
+    ],
+    ["wide CJK in both borders", "作業中 > ~/scratchpad > master", "これはプルリクエストです", []],
+    ["nerd-font PUA and ambiguous arrows", `  ${STATUS} `, "→→→ ship it →→→", []],
+    ["combining marks, decomposed", `café ${STATUS}`, "résumé the run", []],
+    ["a regional-indicator flag", `🇯🇵 ${STATUS}`, "ship it", []],
+  ];
+
+  it.each(CASES)("%s", (_name, status, draftTail, cont) => {
+    const buffer = lines(
+      [" ✔ New session started", "", ...boxRowsPaddedLikeATerminal(status, draftTail, cont)].join("\n"),
+    );
+    const box = locateComposer(buffer);
+    expect(box).not.toBeNull();
+    expect(box!.top).toBe(2);
+    expect(box!.bottom).toBe(3 + cont.length);
+    expect(hasComposer(buffer)).toBe(true);
+  });
+
+  it("a keycap in the statusline — the case an error bar built from these tables cannot even see", () => {
+    // The cluster is `1` + VS16 + U+20E3. Any bar that short-circuits on the ASCII base scores it as
+    // certain ASCII; every terminal that honours VS16 draws it at two columns.
+    const buffer = lines(boxRowsPaddedLikeATerminal("1️⃣ deploy > master", "ship it").join("\n"));
+    expect(locateComposer(buffer)).not.toBeNull();
+  });
+});
+
+describe("locateComposer — OMP 18.1.2's open-ended prompt row", () => {
+  // OMP 18.10.1, harness canary 2026-10-12: a multi-line draft keeps its first line on the prompt
+  // row and paints the rest UNDER it behind a three-space gutter. Read as autocomplete, those rows
+  // were dropped from the draft, so the reply guard never saw the message's tail and every
+  // multi-line send stalled; a blank line in the draft refused the composer outright.
+  describe("OMP 18.10's later draft lines under the prompt row", () => {
+    const status = " π > ⬢ sonnet > ⑂ master ▶───5%────128K─";
+    const composerWith = (...below: string[]) => lines(["transcript", "", status, "╰─ Reply with only OK.", ...below].join("\n"));
+
+    it("reads every later line, a blank line and a pasted rule included", () => {
+      const buffer = composerWith("   ──────────", "   some text", "", "   end");
+      expect(locateComposer(buffer)).toEqual({ top: 2, firstDraftRow: 3, bottom: 3, suggestEnd: 8, draftEnd: 8 });
+      expect(hasComposer(buffer)).toBe(true);
+      expect(extractInputDraft(buffer)).toBe("Reply with only OK. ────────── some text end");
+      expect(extractStatusLines(buffer).map(lineText)).toEqual([status]);
+    });
+
+    it("a blank row straight under the prompt is a blank line of the draft", () => {
+      expect(extractInputDraft(composerWith("", "   A paragraph after a blank line."))).toBe(
+        "Reply with only OK. A paragraph after a blank line.",
+      );
+    });
+
+    it("takes omp's suggestion off the last line only", () => {
+      const ghosted = lines(
+        [status, "╰─ Reply with only OK.", "   \u001b[38;2;229;229;231mend\u001b[38;2;107;114;128mpoint\u001b[0m"].join("\n"),
+      );
+      expect(extractInputDraft(ghosted)).toBe("Reply with only OK. end");
+    });
+
+    it("a box under the prompt still declines, with or without a blank before it", () => {
+      expect(locateComposer(composerWith("", "╭─ Switch Model ──────╮"))).toBeNull();
+      expect(locateComposer(composerWith("   some text", "╭─ Switch Model ──────╮"))).toBeNull();
+    });
+
+    it("a trailing blank run is padding, not a draft line", () => {
+      expect(extractInputDraft(composerWith("   some text", "", ""))).toBe("Reply with only OK. some text");
+    });
+
+    // The bridge matches the binding against NON-blank rows only, so blank lines in the draft must not
+    // count toward its tail window: seven rows under the prompt, four of them text, still bind.
+    it("binds the prompt row when the draft's blank lines are what make it tall", () => {
+      const buffer = composerWith("   a", "", "   b", "", "   c", "", "   d");
+      expect(composerPrompt(buffer)).toBe("╰─ Reply with only OK.");
+    });
+
+    // The real screens, from the harness canary on OMP 18.10.1 (fixtures README).
+    it.each([
+      ["omp--v18-10-draft-two-lines.txt", "Reply with only OK. Second line of the message."],
+      ["omp--v18-10-draft-blank-line.txt", "Reply with only OK. A paragraph after a blank line."],
+      ["omp--v18-10-draft-indented.txt", "Reply with only OK. indented code line another indented line"],
+    ])("%s reads the whole draft and binds the prompt row", (name, draft) => {
+      const buffer = fixtureLines(name);
+      expect(hasComposer(buffer)).toBe(true);
+      expect(extractInputDraft(buffer)).toBe(draft);
+      expect(composerPrompt(buffer)).toBe("╰─ Reply with only OK.");
+    });
+
+    it("takes the unbound write once six later lines hold text, as for a long palette", () => {
+      const rows = ["   1", "   2", "   3", "   4", "   5"];
+      expect(composerPrompt(composerWith(...rows))).toBe("╰─ Reply with only OK.");
+      expect(composerPrompt(composerWith(...rows, "   6"))).toBeNull();
+    });
+  });
+
+  it("locates the live two-row shape and re-surfaces its status and draft", () => {
+    const status = " idle  GPT-5.6-Sol ────────2%────────1M─";
+    const buffer = lines(["transcript", "", status, `╰─ draft-probe${" ".repeat(80)}`].join("\n"));
+
+    expect(locateComposer(buffer)).toEqual({
+      top: 2,
+      firstDraftRow: 3,
+      bottom: 3,
+      suggestEnd: 4,
+      draftEnd: 4,
+    });
+    expect(hasComposer(buffer)).toBe(true);
+    expect(extractInputDraft(buffer)).toBe("draft-probe");
+    expect(extractStatusLines(buffer).map(lineText)).toEqual([status]);
+    expect(composerPrompt(buffer)).toBe("╰─ draft-probe");
+    expect(stripChrome(buffer).map(lineText)).toEqual(["transcript"]);
+  });
+
+  it("recognises the same shape with an empty draft", () => {
+    const buffer = lines(["status", `╰─ ${" ".repeat(80)}`].join("\n"));
+    expect(hasComposer(buffer)).toBe(true);
+    expect(extractInputDraft(buffer)).toBeNull();
+  });
+});
+
+describe("locateComposer — what it must decline", () => {
+  it("declines a `╰─ … ─╯` with no `╭…╮` above it", () => {
+    expect(locateComposer(lines(["some output", boxRows("hi")[1]!].join("\n")))).toBeNull();
+  });
+
+  it("declines omp's other panels, which all close corner-to-corner", () => {
+    // This is what actually keeps the pickers out, and it is a literal rather than a measurement: the
+    // one-space gutters in `╰─ … ─╯` are the composer's alone. A `/model`-shaped box drawn at the
+    // composer's own width — which is what omp really does — is declined for the same reason every
+    // modal capture is.
+    const picker = [
+      "╭──" + "─".repeat(55) + "╮",
+      "│  ❯ 1. claude-opus" + " ".repeat(60 - 21) + "  │",
+      "╰──" + "─".repeat(55) + "╯",
+    ];
+    expect(locateComposer(lines(picker.join("\n")))).toBeNull();
+    expect(hasComposer(lines(picker.join("\n")))).toBe(false);
+  });
+
+  it("does not let a picker stacked directly above the composer become its top border", () => {
+    // The walk stops on the composer's OWN `╭─…─╮`, because the picker's bottom border is not a
+    // continuation row. Nothing here depends on the picker being narrower than the composer.
+    const buffer = lines(
+      [
+        "╭─ oh-my-pi " + "─".repeat(86) + "╮",
+        "│  press ? for help" + " ".repeat(80) + "  │",
+        "╰─" + "─".repeat(96) + "─╯",
+        ...boxRowsPaddedLikeATerminal("Auto > master", "ship it"),
+      ].join("\n"),
+    );
+    const box = locateComposer(buffer);
+    expect(box).not.toBeNull();
+    expect(box!.top).toBe(3); // the composer's own border, not the panel's
+  });
+
+  it("declines a BLANK row between the box and the tail", () => {
+    const palette = " ".repeat(59) + "│";
+    expect(locateComposer(lines([...boxRows(""), "", palette].join("\n")))).toBeNull();
+  });
+
+  it("declines a run below the box taller than MAX_SUGGESTION_ROWS", () => {
+    // 64 rows — the cap is deliberately set above every viewport height in the corpus (59), so this
+    // boundary is only ever reached by a buffer no real omp pane can paint. See chrome.ts for why
+    // being too LOW is the unsafe direction (a blocked send on an ordinary screen).
+    const paletteRow = "❯ some command" + " ".repeat(60 - 15) + "│";
+    const run = Array.from({ length: 64 }, () => paletteRow);
+    expect(locateComposer(lines([...boxRows(""), ...run].join("\n")))).toBeNull();
+    // …and accepts one row fewer, so the cap is what rejected it rather than the shape.
+    expect(locateComposer(lines([...boxRows(""), ...run.slice(1)].join("\n")))).not.toBeNull();
+  });
+
+  it("KNOWN COST: a non-blank, non-box row below the box is claimed as chrome, whatever it says", () => {
+    // The run below the bottom border used to have to measure the box's width, which on a padded
+    // capture meant "reaches the right edge". That check is gone — it is a false NULL the moment a
+    // palette row carries a glyph our table and omp's disagree about, and it only ever held on the two
+    // palette captures because omp paints a scrollbar column there. What it bought was this: on a torn
+    // frame the strip takes real transcript off the mirror along with the box. Bounded by
+    // MAX_SUGGESTION_ROWS and pinned here rather than hidden. What it does NOT cost is a modal going
+    // missing off the mirror or a wrong `hasComposer`: every widget omp can draw over the composer is
+    // a box, and the case below pins that a box in this run is refused outright.
+    const box = locateComposer(lines([...boxRows(""), "● Wrote the file"].join("\n")));
+    expect(box).not.toBeNull();
+    expect(box!.bottom).toBe(1);
+    expect(box!.suggestEnd).toBe(3); // …past the output row, which the strip therefore swallows
+  });
+
+  it("declines a draft taller than MAX_DRAFT_ROWS", () => {
+    const cont = Array.from({ length: 101 }, (_, i) => `line ${i}`);
+    expect(locateComposer(lines(boxRows("tail", { cont }).join("\n")))).toBeNull();
+    expect(locateComposer(lines(boxRows("tail", { cont: cont.slice(1) }).join("\n")))).not.toBeNull();
+  });
+
+  it("declines an empty buffer and a buffer of nothing but blanks", () => {
+    expect(locateComposer([])).toBeNull();
+    expect(locateComposer(lines("\n\n\n"))).toBeNull();
+  });
+});
+
+describe("the tail anchor — a modal drawn UNDER the composer means the composer has no keyboard", () => {
+  // The rule this whole block exists for: `hasComposer` must answer "is the composer taking keys
+  // NOW", not "is a composer border somewhere in the last 64 rows". The run below the bottom border
+  // is allowed to hold omp's slash palette and nothing else that omp itself draws — and everything
+  // omp draws over a composer is a BOX. Before the box rule, the only thing separating these screens
+  // from an ordinary idle composer was the blank row omp happens to paint above a dialog.
+
+  const askDialog = (width: number): string[] => {
+    const fill = (open: string, body: string, close: string, filler: string): string =>
+      open + body + filler.repeat(Math.max(0, width - open.length - body.length - close.length)) + close;
+    return [
+      fill("╭─ Ask ", "", "╮", "─"),
+      fill("│ ", "Delete every file in /?", " │", " "),
+      fill("├", "", "┤", "─"),
+      fill("│ ", "❯ ○ Yes", " │", " "),
+      fill("│ ", "  ○ No", " │", " "),
+      fill("├", "", "┤", "─"),
+      fill("│ ", "Enter select · n note · ↑/↓ move · Esc cancel", " │", " "),
+      fill("╰", "", "╯", "─"),
+    ];
+  };
+
+  it("declines a composer with a dialog ABUTTING it, blank separator or not", () => {
+    const withGap = lines([...boxRows("leftover"), "", ...askDialog(60)].join("\n"));
+    const abutting = lines([...boxRows("leftover"), ...askDialog(60)].join("\n"));
+    // The blank row was already enough on its own; that is exactly the problem — it is a row omp
+    // happens to emit, so it was carrying a safety property nothing tested.
+    expect(hasComposer(withGap)).toBe(false);
+    expect(hasComposer(abutting)).toBe(false);
+    expect(locateComposer(abutting)).toBeNull();
+  });
+
+  it("declines the REAL Ask dialog stacked onto the REAL composer, from corpus bytes", () => {
+    // The two halves are verbatim rows of two captures: `omp--draft-single.txt` through its composer
+    // (which holds the draft "list the files in this repo"), then the live `ask` screen out of
+    // `omp--select-multi.txt` — the one whose options include a free-text "Other (type your own)".
+    const composer = fixtureLines("omp--draft-single.txt").slice(0, 28);
+    const dialog = fixtureLines("omp--select-multi.txt").slice(47, 59);
+    const spliced = [...composer, ...dialog];
+    expect(hasComposer(spliced)).toBe(false);
+    expect(extractInputDraft(spliced)).toBeNull();
+    expect(extractStatusLines(spliced)).toEqual([]);
+    // …and the dialog stays on the mirror, where the user can read and answer it. A `true` here used
+    // to cut 15 rows — the whole dialog — out of the raw block.
+    expect(stripChrome(spliced)).toBe(spliced);
+  });
+
+  it("declines a two-row labelled box in ordinary output that has a dialog under it", () => {
+    // omp draws `╭─── ✘ Error: … ───╮` / `╰────╯` at column 0 at the composer's own width
+    // (omp--select-multi.txt:40-41). Give that widget a label in its BOTTOM border and it is spelled
+    // exactly like a composer. What refuses it here is not the shape of the box — it is the live
+    // dialog underneath, which says the screen belongs to something else.
+    const spliced = [
+      ...fixtureLines("omp--select-multi.txt").slice(30, 40),
+      ...lines(
+        [
+          "╭─── ✘ Error: No question provided " + "─".repeat(153) + "╮",
+          "╰─ retry with /model " + " ".repeat(165) + "─╯",
+        ].join("\n"),
+      ),
+      ...fixtureLines("omp--select-multi.txt").slice(47, 59),
+    ];
+    expect(hasComposer(spliced)).toBe(false);
+    expect(stripChrome(spliced)).toBe(spliced);
+  });
+
+  it("still accepts omp's slash palette, which is what the run below the box is FOR", () => {
+    // The two palette captures are the reason the run is tolerated at all; the box rule must not cost
+    // them. Their rows open with `❯ ` or a two-space gutter — omp reserves column 0 for boxes.
+    for (const name of ["omp--slash-palette.txt", "omp--slash-palette--filtered.txt"]) {
+      expect(hasComposer(fixtureLines(name))).toBe(true);
+    }
+  });
+
+  it("rejects on the box glyph itself, at column 0, whichever corner it is", () => {
+    for (const opener of ["╭", "│", "├", "╰", "┌", "└", "─"]) {
+      const buffer = lines([...boxRows(""), opener + " something".padEnd(58) + "│"].join("\n"));
+      expect(hasComposer(buffer)).toBe(false);
+    }
+    // …and a row that merely CONTAINS one is ordinary output, not a box being opened.
+    expect(hasComposer(lines([...boxRows(""), " a tree: ├── src"].join("\n")))).toBe(true);
+  });
+});
+
+describe("locateComposer — U+2028/U+2029 are glyphs like any other", () => {
+  // `.` in a JS regex excludes them. `rstrip` only takes them off the END of a row, so one anywhere
+  // else survives into `lineText` and used to decline the row silently — a permanent null: no
+  // statusline, no draft, the box duplicated on the mirror, and every reply refused with "the input
+  // box isn't on screen" while no dialog exists. They arrive by paste (PDF, Word, a JS string
+  // literal); nothing on the send path normalises text.
+  const SEPARATORS = { "U+2028 LINE SEPARATOR": "\u2028", "U+2029 PARAGRAPH SEPARATOR": "\u2029" };
+
+  for (const [name, ch] of Object.entries(SEPARATORS)) {
+    it(`locates a box with ${name} on the bottom border`, () => {
+      const buffer = lines(boxRows(`here is the paragraph${ch}please review it`).join("\n"));
+      expect(locateComposer(buffer)).not.toBeNull();
+      expect(extractInputDraft(buffer)).toBe(`here is the paragraph${ch}please review it`);
+    });
+
+    it(`locates a box with ${name} on a continuation row and in the statusline`, () => {
+      const buffer = lines(
+        boxRows("tail", {
+          cont: [`first${ch}fragment`],
+          status: ` Auto${ch}> master `,
+        }).join("\n"),
+      );
+      const box = locateComposer(buffer);
+      expect(box).not.toBeNull();
+      expect(box!.top).toBe(0);
+      expect(box!.bottom).toBe(2);
+    });
+  }
+});
+
+describe("composerPrompt — the region a destructive write is bound to", () => {
+  it("is the composer's own `╰─ … ─╯` row, verbatim minus trailing padding", () => {
+    const buffer = fixtureLines("omp--draft-single.txt");
+    const row = composerPrompt(buffer);
+    expect(row).not.toBeNull();
+    expect(row).toBe(lineText(buffer[locateComposer(buffer)!.bottom]!).replace(/\s+$/, ""));
+    expect(row).toContain("list the files in this repo");
+    expect(row!.startsWith("╰─ ")).toBe(true);
+    expect(row!.endsWith("─╯")).toBe(true);
+  });
+
+  it("is null on exactly the screens composerReady refuses", () => {
+    for (const name of NON_BOX_COMPOSER_FIXTURES) {
+      expect(composerPrompt(fixtureLines(name))).toBeNull();
+    }
+    for (const name of BOX_COMPOSER_FIXTURES) {
+      expect(composerPrompt(fixtureLines(name))).not.toBeNull();
+    }
+  });
+
+  // The palette omp paints BELOW the box is what pushes its own bottom border up, and
+  // MAX_SUGGESTION_ROWS admits 64 rows of it while the bridge accepts a binding only within the last
+  // 6 non-blank rows. The committed captures show 5 rows at most — i.e. ZERO margin — so the very
+  // next row omp draws down there turns every destructive sweep into a permanent 409 ("The input box
+  // changed while clearing it") on a screen where nothing is wrong. Declining the region instead is
+  // an UNBOUND write: the sweep is still gated by the reply pre-flight, exactly as it was before this
+  // adapter named a region at all.
+  it("declines the region when the palette pushes the row out of the bridge's tail window", () => {
+    const palette = (n: number) => Array.from({ length: n }, (_, i) => `❯ /command-${i}  a suggestion`);
+    const withPalette = (n: number) => lines([...boxRows("list the files"), ...palette(n)].join("\n"));
+
+    // 5 rows below: the row is the 6th-from-last non-blank, the last position the bridge accepts.
+    expect(hasComposer(withPalette(5))).toBe(true);
+    expect(composerPrompt(withPalette(5))).toContain("list the files");
+
+    // 6 rows below: one too many. `composerReady` still says yes — the composer plainly has the
+    // keyboard — but there is no region the bridge could bind to, so none is named.
+    expect(hasComposer(withPalette(6))).toBe(true);
+    expect(composerPrompt(withPalette(6))).toBeNull();
+    expect(composerPrompt(withPalette(20))).toBeNull();
+  });
+
+  it("declines the region on omp 18.6.1's ten-row palette, and still finds the box and its one status row", () => {
+    const PINNED_TALL = [
+      { fixture: "omp--v18-6-slash-mod-partial--w120.txt", top: 17, bottom: 18, suggestEnd: 29 },
+      { fixture: "omp--v18-6-slash-model-list--w120.txt", top: 17, bottom: 18, suggestEnd: 29 },
+      { fixture: "omp--v18-6-slash-model-list--w80.txt", top: 18, bottom: 19, suggestEnd: 30 },
+      { fixture: "omp--v18-11-nerd-skill-and-command--w130.txt", top: 14, bottom: 15, suggestEnd: 26 },
+      { fixture: "omp--v18-11-nerd-slash-model--w130.txt", top: 14, bottom: 15, suggestEnd: 26 },
+      { fixture: "omp--v18-11-nerd-slash-model--w80.txt", top: 15, bottom: 16, suggestEnd: 27 },
+    ];
+    expect(PINNED_TALL.map((p) => p.fixture)).toEqual(TALL_PALETTE_FIXTURES);
+    for (const { fixture, top, bottom, suggestEnd } of PINNED_TALL) {
+      const buffer = fixtureLines(fixture);
+      expect(locateComposer(buffer), fixture).toEqual({ top, firstDraftRow: top + 1, bottom, suggestEnd, draftEnd: bottom + 1 });
+      expect(hasComposer(buffer), fixture).toBe(true);
+      expect(extractStatusLines(buffer), fixture).toHaveLength(1);
+      expect(composerPrompt(buffer), fixture).toBeNull();
+    }
+  });
+
+  it("sits inside the tail window the bridge will accept a binding within", () => {
+    // bridge/prompt-binding.ts requires the bound region to still match within the last
+    // DEFAULT_PROMPT_TAIL_LINES (6) NON-BLANK rows of a fresh read, so a region with more rows than
+    // that below it would refuse legitimate sweeps. omp paints at most the slash palette down there.
+    const BRIDGE_TAIL_LINES = 6;
+    for (const name of BOX_COMPOSER_FIXTURES) {
+      const buffer = fixtureLines(name);
+      const box = locateComposer(buffer)!;
+      const below = buffer
+        .slice(box.bottom + 1)
+        .filter((l) => lineText(l).trim().length > 0).length;
+      expect(below).toBeLessThan(BRIDGE_TAIL_LINES);
+    }
+  });
+});

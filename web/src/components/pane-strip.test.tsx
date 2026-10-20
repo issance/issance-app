@@ -1,0 +1,298 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+import { PaneStrip } from "./pane-strip";
+import type { AgentView } from "@/lib/types";
+
+function pane(
+  paneId: string,
+  agent: string,
+  kind: "agent" | "shell" = "agent",
+  extra: Partial<AgentView> = {},
+): AgentView {
+  return {
+    paneId,
+    workspaceId: "w1",
+    workspaceLabel: "proj",
+    workspaceNumber: 1,
+    tabId: "w1:t1",
+    agent,
+    status: "idle",
+    cwd: "/home/proj",
+    focused: false,
+    kind,
+    ...extra,
+  };
+}
+
+describe("PaneStrip", () => {
+  it("renders nothing when the tab holds fewer than two panes", () => {
+    const { container } = render(
+      <PaneStrip panes={[pane("w1:p1", "claude")]} currentPaneId="w1:p1" onSelect={vi.fn()} />,
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("passes a saved copy to the sheet: a long-press shows a note in place of Rename and Close", () => {
+    render(
+      <PaneStrip
+        panes={[pane("w1:p1", "claude"), pane("w1:p2", "codex")]}
+        currentPaneId="w1:p1"
+        onSelect={vi.fn()}
+        savedCopy
+        onRenamed={vi.fn()}
+        onClosed={vi.fn()}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByRole("button", { name: /codex/ }));
+    expect(screen.getByText("Saved copy. Reconnect to make changes.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Close pane" })).toBeNull();
+  });
+
+  it("carries an accessible name, so the row of pills is not an unnamed run of buttons", () => {
+    render(
+      <PaneStrip
+        panes={[pane("w1:p1", "claude"), pane("w1:p2", "codex")]}
+        currentPaneId="w1:p1"
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("navigation", { name: "Panes" })).toBeInTheDocument();
+  });
+
+  it("lists every pane in the tab and marks the current one", () => {
+    render(
+      <PaneStrip
+        panes={[pane("w1:p1", "claude"), pane("w1:p2", "codex"), pane("w1:p3", "shell", "shell")]}
+        currentPaneId="w1:p2"
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("claude")).toBeInTheDocument();
+    expect(screen.getByText("codex")).toBeInTheDocument();
+    expect(screen.getByText("shell")).toBeInTheDocument(); // shell panes show a "shell" label
+    // The current pane (codex / w1:p2) is the one marked active.
+    expect(screen.getByRole("button", { name: /codex/ })).toHaveAttribute("aria-current", "true");
+    expect(screen.getByRole("button", { name: /claude/ })).not.toHaveAttribute("aria-current");
+  });
+
+  // ── A PILL IS NUMBERED ONLY WHEN IT HAS TO BE ───────────────────────────────
+  // Every pill used to carry the multiplexer's pane id suffix (`p1`, `p3`), whether or not there was
+  // anything to tell apart. Altan, reading his own phone: "idk what pN means". The suffix is gone; a
+  // pill now carries its 1-based place in the row, and only when a neighbour reads the same.
+  it("numbers nothing when every pill already reads differently", () => {
+    render(
+      <PaneStrip
+        panes={[pane("w1:p1", "claude"), pane("w1:p3", "codex")]}
+        currentPaneId="w1:p1"
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "claude" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "codex" })).toBeInTheDocument();
+    // And no pane id anywhere on the row.
+    expect(screen.queryByText(/^p\d+$/)).toBeNull();
+  });
+
+  it("numbers two pills that would otherwise read the same, by their place in the row", () => {
+    render(
+      <PaneStrip
+        panes={[pane("w1:p1", "claude"), pane("w1:p4", "claude"), pane("w1:p9", "codex")]}
+        currentPaneId="w1:p1"
+        onSelect={vi.fn()}
+      />,
+    );
+    // The position in the row, which is what the reader can see — never the id suffix `p4`.
+    expect(screen.getByRole("button", { name: "claude 1" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "claude 2" })).toBeInTheDocument();
+    // The odd one out keeps its clean name: the number answers a question only the twins raise.
+    expect(screen.getByRole("button", { name: "codex" })).toBeInTheDocument();
+    expect(screen.queryByText("p4")).toBeNull();
+  });
+
+  it("shows Claude's /rename session name on a pill when no user label is set", () => {
+    render(
+      <PaneStrip
+        panes={[
+          pane("w1:p1", "claude", "agent", { sessionName: "auth-refactor" }),
+          // A user label still wins over the session name.
+          pane("w1:p2", "claude", "agent", { sessionName: "ignored", paneLabel: "deploy" }),
+        ]}
+        currentPaneId="w1:p1"
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("auth-refactor")).toBeInTheDocument();
+    expect(screen.getByText("deploy")).toBeInTheDocument();
+    expect(screen.queryByText("ignored")).toBeNull();
+  });
+
+  // A tmux pane keeps its title after the program that printed it exits, so a bare shell can carry a
+  // finished agent's sentence. The pill has one line and it is the pane's NAME, so a stale title has
+  // no business on it — the row falls back to what it would say with no title at all.
+  it("never names a pill after a stale terminal title", () => {
+    render(
+      <PaneStrip
+        panes={[
+          pane("w1:p1", "shell", "shell", {
+            terminalTitle: "\u2733 waiting for soak time",
+            terminalTitleStale: true,
+          }),
+          // The control: the same title, still being written by a live program, IS the pill's name.
+          pane("w1:p2", "shell", "shell", { terminalTitle: "vim notes.md" }),
+        ]}
+        currentPaneId="w1:p1"
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText(/waiting for soak time/)).toBeNull();
+    expect(screen.getByText("shell")).toBeInTheDocument();
+    expect(screen.getByText("vim notes.md")).toBeInTheDocument();
+  });
+
+  it("fires onSelect with the pane id when a pane is tapped", async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    render(
+      <PaneStrip
+        panes={[pane("w1:p1", "claude"), pane("w1:p2", "codex")]}
+        currentPaneId="w1:p1"
+        onSelect={onSelect}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /codex/ }));
+    expect(onSelect).toHaveBeenCalledExactlyOnceWith("w1:p2");
+  });
+
+  // A long-press on a pill reaches the DOM as a `contextmenu` event (Android Chrome / right-click);
+  // with the write actions wired it opens the actions sheet. This is the path the on-device bug broke.
+  it("opens the actions sheet on a long-press (contextmenu) when actions are wired", () => {
+    render(
+      <PaneStrip
+        panes={[pane("w1:p1", "claude"), pane("w1:p2", "codex")]}
+        currentPaneId="w1:p1"
+        onSelect={vi.fn()}
+        onRenamed={vi.fn()}
+        onClosed={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
+    fireEvent.contextMenu(screen.getByRole("button", { name: /codex/ }));
+    expect(screen.getByRole("button", { name: "Rename" })).toBeInTheDocument();
+  });
+
+  it("stays inert on contextmenu when the write actions are not wired", () => {
+    render(
+      <PaneStrip
+        panes={[pane("w1:p1", "claude"), pane("w1:p2", "codex")]}
+        currentPaneId="w1:p1"
+        onSelect={vi.fn()}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByRole("button", { name: /codex/ }));
+    expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
+  });
+
+  // Tapping the already-active pill used to be a dead re-navigate (onSelect with the same id it's
+  // already on). With actions wired, that tap now opens the same sheet a long-press would — so the
+  // pill is never a dead tap.
+  it("opens the actions sheet on a plain tap of the ACTIVE pill when actions are wired", async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    render(
+      <PaneStrip
+        panes={[pane("w1:p1", "claude"), pane("w1:p2", "codex")]}
+        currentPaneId="w1:p1"
+        onSelect={onSelect}
+        onRenamed={vi.fn()}
+        onClosed={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: /claude/ }));
+    expect(screen.getByRole("button", { name: "Rename" })).toBeInTheDocument();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("still navigates on a tap of an INACTIVE pill even when actions are wired", async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    render(
+      <PaneStrip
+        panes={[pane("w1:p1", "claude"), pane("w1:p2", "codex")]}
+        currentPaneId="w1:p1"
+        onSelect={onSelect}
+        onRenamed={vi.fn()}
+        onClosed={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /codex/ }));
+    expect(onSelect).toHaveBeenCalledExactlyOnceWith("w1:p2");
+    expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
+  });
+
+  it("a tap of the ACTIVE pill still just re-selects (no-op) when actions are NOT wired", async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    render(
+      <PaneStrip
+        panes={[pane("w1:p1", "claude"), pane("w1:p2", "codex")]}
+        currentPaneId="w1:p1"
+        onSelect={onSelect}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /claude/ }));
+    expect(onSelect).toHaveBeenCalledExactlyOnceWith("w1:p1");
+  });
+
+  // iOS Safari does not scroll a `pointer-events: none` scroller from a `pointer-events: auto`
+  // child (https://bugs.webkit.org/show_bug.cgi?id=183870): the row looked fine and did not move
+  // under a thumb. jsdom cannot scroll, so this pins the cause: nothing from the scroller down to
+  // a pill may opt out of hit-testing, and no z-index lifts any part of the row: nothing of the row
+  // overhangs the content below it any more (see the hit-box test beside this one).
+  it("lets the scroller take a touch itself, so a sideways swipe scrolls the row on iOS", () => {
+    render(
+      <PaneStrip
+        panes={[pane("w1:p1", "claude"), pane("w1:p2", "codex")]}
+        currentPaneId="w1:p1"
+        onSelect={vi.fn()}
+      />,
+    );
+    const nav = screen.getByRole("navigation", { name: "Panes" });
+    const pill = screen.getByRole("button", { name: /claude/ });
+    const scroller = nav.querySelector<HTMLElement>(".overflow-x-auto")!;
+    for (let el: HTMLElement | null = pill; el && el !== nav.parentElement; el = el.parentElement) {
+      expect(el.className).not.toMatch(/(?:^|\s)pointer-events-none(?=\s|$)/);
+    }
+    expect(nav.className).not.toMatch(/(?:^|\s)z-\[/);
+    expect(scroller.firstElementChild!.className).not.toMatch(/(?:^|\s)z-\[/);
+    expect(scroller.firstElementChild!.contains(pill)).toBe(true);
+  });
+
+  // THE STRIP MAY NOT OVERHANG THE CONTENT. A pill's `::before` reach used to hang 18px below the
+  // row (`before:-bottom-5`, in an 18px `pb`/`-mb` clip room), which put it over the first lines of
+  // the chat or terminal and took the tap off a file-path link there (measured 2026-10-07 with
+  // `elementFromPoint`). jsdom has no layout, so this pins the classes that made it: the reach is
+  // the row's own 26px (`-inset-y-[2px]` against the pill's padding box), and the scroller has no
+  // bottom padding or negative bottom margin to extend a clip box below the row.
+  it("keeps every pill's hit box inside the 26px row, never over the content below", () => {
+    render(
+      <PaneStrip
+        panes={[pane("w1:p1", "claude"), pane("w1:p2", "codex")]}
+        currentPaneId="w1:p1"
+        onSelect={vi.fn()}
+      />,
+    );
+    const nav = screen.getByRole("navigation", { name: "Panes" });
+    const scroller = nav.querySelector<HTMLElement>(".overflow-x-auto")!;
+    for (const pill of screen.getAllByRole("button")) {
+      const cls = pill.className;
+      expect(cls).toMatch(/(?:^|\s)before:-inset-y-\[2px\](?=\s|$)/);
+      expect(cls).not.toMatch(/before:-inset-y-\[7px\]/);
+      expect(cls).not.toMatch(/before:-bottom-/);
+      expect(cls).not.toMatch(/before:z-/);
+    }
+    expect(scroller.className).not.toMatch(/(?:^|\s)(?:pb-|-mb-)/);
+  });
+});

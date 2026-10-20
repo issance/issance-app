@@ -1,0 +1,851 @@
+import { basename, dirname, join } from "node:path";
+
+import { BEACON_HOOKS, type HookRegistration } from "./beacon.ts";
+import { cmdCodexHooksInstall, cmdCodexHooksUninstall, codexHooksStatusLine } from "./codex-hooks.ts";
+import { hookTargetsDir } from "../bridge/beacon/hook-targets.ts";
+import type { JsonObject, JsonValue } from "../bridge/json.ts";
+import type { CliContext } from "./context.ts";
+import { publishedBinary } from "./install-kind.ts";
+import { EXIT, type Io } from "./io.ts";
+import { type LinkReader, linkPath, resolveLinkTarget } from "./link.ts";
+import type { Files } from "./sys.ts";
+import { collieBinary } from "./unit.ts";
+import { HOLD_VERB, holdCommandIn } from "./hold-entry.ts";
+import { loadProfiles } from "../web/src/lib/surface/profile.ts";
+import { compareSemver } from "../web/src/lib/semver.ts";
+import { binaryVersion } from "../bridge/surface/binary-version.ts";
+
+// `issance hooks install claude` / `uninstall claude` / `status` — putting the beacon emitter into the
+// agent's own settings, and taking it back out.
+//
+// ── THE SCOPE IS GLOBAL, AND THAT IS THE MILESTONE'S PREMISE ──────────────────────────────────────
+//
+// The targets are `~/.claude/settings.json` and the same file in every `CLAUDE_CONFIG_DIR` profile
+// the journal registry already knows about (issue #92). PROJECT SETTINGS ARE NEVER WRITTEN — not
+// `.claude/settings.json`, not `.claude/settings.local.json`. The operator adopts panes *anywhere on
+// the host*, so a per-project install would make a pane's identity depend on which directory the
+// agent happened to be started in, which is precisely the fragility beacons exist to remove. The cost
+// of the global scope is one process spawn per hook event outside a multiplexer, and `beacon emit`'s
+// environment gate makes that cost nothing.
+//
+// ── THREE GUARDS, EACH EARNED FROM A REAL FAILURE (Ark0N/Codeman) ─────────────────────────────────
+//
+//  1. MERGE BY A VERSION-PREFIXED OWNERSHIP MARKER. Claude Code merges hook entries across settings
+//     levels rather than replacing them, so an operator's own hooks sit in the same arrays as ours.
+//     Every entry we write carries {@link HOOK_MARKER}; an entry without one is never touched, read
+//     or reordered, and `uninstall` removes only marked entries. A marker at a DIFFERENT version is
+//     replaced in place — that is the self-heal, and it is why the version is in the marker at all.
+//  2. REFUSE A SYMLINKED SETTINGS FILE; RESOLVE A SYMLINKED SETTINGS DIRECTORY. A rename onto a
+//     symlinked FILE (home-manager's read-only Nix store profile) replaces the link with a plain
+//     file — an installer editing something the operator did not mean — so that still refuses. A
+//     symlinked DIRECTORY (stow, chezmoi pointing the whole `~/.claude` elsewhere) is not the same
+//     shape: every write inside it lands in the real directory, exactly how `open`/`rename` already
+//     resolve every non-final path component, so refusing it bought nothing but a false alarm
+//     (issue #190). {@link realpathVia} resolves it instead, and the write happens at the real path
+//     underneath; only a directory link that resolves to NOTHING, or to somewhere this process
+//     cannot write, is refused — worded in one line, never a raw filesystem error.
+//  3. WRITE ATOMICALLY, AND BACK UP ONCE. Temp file plus rename, and a `.issance-backup` beside the
+//     file before the first modification, so a bad merge is one `mv` from undone.
+//
+// Installing twice changes no bytes: the second run serialises the same document and writes nothing.
+// "Already installed" is decided by COMPARING THE BYTES, never by finding a marker and stopping — so
+// when a registration joins {@link BEACON_HOOKS} (as `SessionStart` did), the next `hooks install`
+// adds that one event to a file that already carries the others, leaves every entry beside it where
+// it was, and is a no-op on the run after. That is why growing the set needs no marker bump: the
+// version says what the COMMAND looks like, and the command did not change. The same rule healed an
+// entry installed before `timeout: 10` existed: `ourGroup` always rebuilds the whole entry object, so
+// an old one missing the field gets it back the next time bytes are compared — no marker bump, because
+// the command string is still exactly what it was.
+
+/**
+ * The harnesses that have an emitter. Claude takes the hooks in its settings files; Codex takes one
+ * notify command in its config.toml (cli/codex-hooks.ts, M56 spec 13).
+ */
+export const HOOK_HARNESSES = ["claude", "codex"] as const;
+
+/** The `hooks` sub-verbs, in the order the usage block prints them. */
+export const HOOKS_SUBCOMMANDS = ["install", "uninstall", "status"] as const;
+
+/**
+ * The ownership marker's version. Bump it when the COMMAND we write has to change shape; every
+ * installed entry then heals itself on the next `hooks install`.
+ */
+export const HOOK_MARKER_VERSION = 1;
+
+/** What makes an entry ours — at any version, which is what lets a stale one be recognised. */
+export const HOOK_MARKER_PREFIX = "# issance-beacon v";
+
+/**
+ * The marker this build writes — `# issance-beacon v1` today.
+ *
+ * A shell comment, so the command string stays a command string: Claude Code hands it to a shell,
+ * and a trailing comment changes nothing about what runs (probed 2026-08-20 — the hook still runs as
+ * a direct child of `claude`, which is what `beacon emit`'s pid depends on).
+ */
+export const HOOK_MARKER = `${HOOK_MARKER_PREFIX}${HOOK_MARKER_VERSION}`;
+
+/** The marker's version in a command string, or null when the command is not ours. */
+export function markerVersionOf(command: string): number | null {
+  const found = new RegExp(`${HOOK_MARKER_PREFIX}(\\d+)`, "u").exec(command);
+  const digits = found?.[1];
+  return digits === undefined ? null : Number(digits);
+}
+
+// ── The command we write ─────────────────────────────────────────────────────
+
+/**
+ * Which absolute name the hook was pinned to. Reported by `status` (and by `doctor`, M11/05).
+ *
+ * `install-current` exists because a binary install has a THIRD stable name — `<root>/current/bin/issance`,
+ * the symlink `update` flips — and calling that "the checkout" would print a remedy (`issance link`
+ * here) for a shape that has no checkout.
+ */
+export type HookCommandSource = "path-link" | "install-current" | "checkout";
+
+export interface HookCommand {
+  readonly binary: string;
+  readonly source: HookCommandSource;
+  /** Exactly what goes into `settings.json`, marker included. */
+  readonly command: string;
+}
+
+/**
+ * What follows the binary in every command we write. One constant, so the writer below and
+ * {@link hookBinaryOf} — which reads an INSTALLED command back — cannot drift apart.
+ */
+const HOOK_VERB = " beacon emit ";
+
+/**
+ * The absolute name an installed entry runs, or null when the command is not shaped like ours.
+ *
+ * `doctor` asks this (M11/05): a hook pinned to a checkout that has since moved still parses, still
+ * carries our marker, and simply never runs — the silent failure the verb exists to catch. The
+ * answer comes from the string in the settings file, never from what an install would write today.
+ */
+export function hookBinaryOf(command: string): string | null {
+  const at = command.indexOf(HOOK_VERB);
+  return at <= 0 ? null : command.slice(0, at);
+}
+
+/** How many links a chain may follow before {@link realpathVia} gives up. `ELOOP`, without the errno. */
+const SYMLINK_HOPS = 32;
+
+/**
+ * `realpath(3)` over the {@link LinkReader} seam — every component resolved, not just the last one.
+ *
+ * The last component is not where the indirection is. A binary install publishes
+ * `~/.local/bin/issance` → `<root>/current/bin/issance`, and `current` is a DIRECTORY symlink: probing
+ * the full path finds a regular file and learns nothing. So each ancestor is resolved before the
+ * component below it, which is the only way `current` and `versions/X.Y.Z` are ever seen to be the
+ * same file. A path nobody can resolve comes back as itself — that is what a dangling link is, and
+ * the caller wants to compare it, not to fail on it.
+ */
+export function realpathVia(fs: LinkReader, path: string, hops = { left: SYMLINK_HOPS }): string {
+  const parent = dirname(path);
+  // The root is its own parent — that is the recursion's floor, and it needs no probe.
+  const here = parent === path ? path : join(realpathVia(fs, parent, hops), basename(path));
+  const probe = fs.probe(here);
+  if (probe.kind !== "symlink" || hops.left <= 0) return here;
+  hops.left -= 1;
+  return realpathVia(fs, resolveLinkTarget(here, probe.target), hops);
+}
+
+/**
+ * The command an entry runs — ALWAYS an absolute path, and always one that SURVIVES AN UPDATE.
+ *
+ * A hook does not run under the operator's login shell (the same trap as a Hangar plugin action), so a
+ * bare `issance` can simply not be found. But an absolute path is not enough on its own: a binary
+ * install runs from `<root>/versions/X.Y.Z/bin/issance`, and `update` keeps only the previous version
+ * — so a hook pinned to the version directory dangles silently after one or two updates, with every
+ * pane quietly reading as a shell again. That is the bug this order exists to make impossible, and
+ * the version directory is never written here.
+ *
+ * The preference, in order:
+ *
+ *  1. `~/.local/bin/issance`, when it RESOLVES to the binary this install publishes. By ADR 0021 that
+ *     name is a symlink, never a copy, so it survives a rebuild, a version flip and a checkout that
+ *     moves house. Both sides are realpath'd ({@link realpathVia}) before they are compared, because
+ *     the link points at `<root>/current/bin/issance` while the running process was launched from
+ *     `<root>/versions/X.Y.Z/bin/issance` — the same file under two names, and a string comparison
+ *     calls them different (the whole cause of the dangling-hook bug).
+ *  2. Whatever {@link publishedBinary} says this install publishes — `<root>/current/bin/issance` on a
+ *     binary install (the symlink `update` itself flips, so it is valid at every version), and the
+ *     checkout's own `bin/issance` on a git checkout, which is exactly the old behaviour there.
+ */
+export function resolveHookCommand(ctx: CliContext, fs: LinkReader): HookCommand {
+  const own = publishedBinary(ctx.root, fs);
+  const published = linkPath(ctx.home);
+  const probe = fs.probe(published);
+  const linked =
+    probe.kind === "symlink" &&
+    realpathVia(fs, resolveLinkTarget(published, probe.target)) === realpathVia(fs, own);
+  const fallback: HookCommandSource = own === collieBinary(ctx.root) ? "checkout" : "install-current";
+  const source: HookCommandSource = linked ? "path-link" : fallback;
+  const binary = linked ? published : own;
+  return { binary, source, command: `${binary}${HOOK_VERB}${HOOK_MARKER}` };
+}
+
+/** What each source is called in one phrase — `hooks status`'s parenthetical. */
+const SOURCE_NAME = {
+  "path-link": "the published PATH name",
+  "install-current": "this install's `current` symlink",
+  checkout: "this checkout",
+} satisfies Record<HookCommandSource, string>;
+
+/** The line `hooks install` prints under the events — what the pin costs, and how to improve it. */
+const PINNED_NOTE = {
+  "path-link": "Pinned to the published name (a symlink, never a copy), so a rebuild needs no re-install.",
+  // Never the version directory: `update` keeps only the previous version, so a hook pinned there
+  // dangles after one or two updates. `current` is the symlink `update` flips, valid at every version.
+  "install-current":
+    "Pinned to this install's `current` symlink, so it survives every `issance update` — never a version directory.",
+  checkout: "Pinned to this checkout — re-run after `issance link` to pin to ~/.local/bin instead.",
+} satisfies Record<HookCommandSource, string>;
+
+// ── The targets ──────────────────────────────────────────────────────────────
+
+export interface HookTarget {
+  /** The Claude config dir — `~/.claude`, or a `CLAUDE_CONFIG_DIR` profile's own. */
+  readonly dir: string;
+  /** The settings file inside it. */
+  readonly path: string;
+}
+
+/** `<path>.issance-backup` — written once, before the first modification. */
+export const backupPath = (target: HookTarget): string => `${target.path}.issance-backup`;
+
+/**
+ * Every settings file this install writes to.
+ *
+ * `~/.claude` always, plus the parent of each configured Claude journal root — the bridge resolves
+ * those from `ISSANCE_TRANSCRIPT_ROOT` (a comma-separated list, because `CLAUDE_CONFIG_DIR` gives each
+ * profile its own tree, issue #92), and a profile's `settings.json` sits beside its `projects/`. So
+ * the set of homes issance can already READ a journal from is exactly the set it installs hooks into;
+ * a profile issance cannot read is a profile a beacon would not help.
+ *
+ * It asks for the two fields it reads rather than the whole {@link CliContext}, because the BRIDGE
+ * asks the same question — "are these hooks installed", which decides whether the beacon decorator
+ * lifts its capabilities (M11/03, `bridge/beacon-io.ts`) — and the answer must be computed from one
+ * rule. A second implementation over there would drift silently, and a drifted answer is a
+ * capability declared over beacons that will never be written.
+ */
+export function claudeSettingsTargets(ctx: Pick<CliContext, "home" | "env">): HookTarget[] {
+  const dirs = [join(ctx.home, ".claude")];
+  for (const root of (ctx.env.ISSANCE_TRANSCRIPT_ROOT ?? "").split(",")) {
+    const trimmed = root.trim();
+    if (trimmed !== "") dirs.push(dirname(trimmed));
+  }
+  return [...new Set(dirs)].map((dir) => ({ dir, path: join(dir, "settings.json") }));
+}
+
+// ── The merge ────────────────────────────────────────────────────────────────
+
+function asObject(value: JsonValue | undefined): JsonObject | null {
+  return value instanceof Object && !Array.isArray(value) ? value : null;
+}
+
+function asArray(value: JsonValue | undefined): JsonValue[] | null {
+  return Array.isArray(value) ? value : null;
+}
+
+/**
+ * The command of the marked entry inside one registration group, or null when the group is not ours.
+ *
+ * `String()` is total over every value `JSON.parse` can produce, and an object stringifies to
+ * something that contains no marker — so a group is classified without asserting anything about the
+ * shapes inside it.
+ */
+export function markedCommandIn(group: JsonValue): string | null {
+  const row = asObject(group);
+  const entries = asArray(row?.hooks) ?? [];
+  for (const entry of entries) {
+    const command = asObject(entry)?.command;
+    if (command === undefined || command === null) continue;
+    const text = String(command);
+    if (text.includes(HOOK_MARKER_PREFIX)) return text;
+  }
+  return null;
+}
+
+/**
+ * One entry per {@link BEACON_HOOKS} registration, in order: the command WE own on that event, or
+ * null where the event carries none of ours.
+ *
+ * The single reading of "what is installed in this file", and both readers use it — `hooks status`
+ * below and `issance doctor` (M11/05). A second walk of the same document is a second thing to drift,
+ * and a doctor that disagrees with its own verb is worse than no doctor (cli/doctor.ts's rule).
+ */
+export function markedCommandsByEvent(document: JsonValue | null): (string | null)[] {
+  const section = asObject(asObject(document)?.hooks) ?? {};
+  return BEACON_HOOKS.map((registration) => {
+    const groups = asArray(section[registration.event]) ?? [];
+    // A group of ours with another matcher than this build writes counts as missing: since M56 spec 11
+    // the Notification entry has no matcher, and an older `idle_prompt` one never sends the dialog
+    // kinds. So such a file reads as partly installed, and `install` heals it in place.
+    const current = groups.filter((group) => matcherOf(group) === registration.matcher);
+    return current.map((group) => markedCommandIn(group)).find((found) => found !== null) ?? null;
+  });
+}
+
+/** A group's `matcher` as text, or undefined when it has none. */
+function matcherOf(group: JsonValue): string | undefined {
+  const matcher = asObject(group)?.matcher;
+  return matcher === undefined || matcher === null ? undefined : String(matcher);
+}
+
+export type HookDocument =
+  | { readonly kind: "document"; readonly document: JsonObject }
+  /** The file is not one we may edit, and `reason` is the whole sentence the operator reads. */
+  | { readonly kind: "refuse"; readonly reason: string };
+
+/**
+ * One registration group, as we write it. `matcher` is dropped by `JSON.stringify` when absent.
+ *
+ * `timeout: 10` (seconds) rides beside `command` on every entry, same as the Hangar row above it.
+ * Without it Claude Code's own default — 60 s — applies, and a hung `beacon emit` would stall the
+ * agent for a full minute; the emitter is one small file write and must finish in well under 10 s
+ * (`cli/beacon.ts`'s own budget note: `SessionEnd` gets 1.5 s from Claude Code itself). This is a
+ * sibling field on the same command, not a change to the command string, so it needs no marker bump
+ * — `installDocument` rebuilds the group from scratch on every run, so an entry installed before this
+ * field existed gains it the next time `hooks install` runs, purely from the byte comparison already
+ * in place.
+ */
+function ourGroup(registration: HookRegistration, command: string): JsonObject {
+  return {
+    matcher: registration.matcher,
+    hooks: [{ type: "command", command, timeout: 10 }],
+  };
+}
+
+/**
+ * The event's array with our entry merged in — replacing OUR previous entry in place, and leaving
+ * every unmarked entry exactly where it was.
+ *
+ * In place, rather than "remove and append", so a self-heal (`v1` → `v2`) does not silently reorder
+ * the operator's hooks around it. Ordering matters to them: hooks in one array run in sequence.
+ */
+function mergeGroups(groups: readonly JsonValue[], ours: JsonObject): JsonValue[] {
+  const kept = groups.filter((group) => markedCommandIn(group) === null);
+  const at = groups.findIndex((group) => markedCommandIn(group) !== null);
+  if (at < 0) return [...kept, ours];
+  // `at` counts only unmarked entries before it (it is the FIRST marked one), so it indexes `kept`
+  // at the same position. A second marked entry — someone's copy-paste — is dropped by the filter.
+  return [...kept.slice(0, at), ours, ...kept.slice(at)];
+}
+
+// ── The permission hold (M56 spec 12) ────────────────────────────────────────
+
+/** The flag that adds the permission hold: `issance hooks install claude --hold-permissions`. */
+export const HOLD_FLAG = "--hold-permissions";
+
+/** The two entries the hold adds: the hold itself, and the tool edge that ends a "Sent" card. */
+export interface HoldInstall {
+  /** The hold event (`PermissionRequest`) and its command, `<binary> beacon hold <marker>`. */
+  readonly event: string;
+  readonly holdCommand: string;
+  /** The seconds the harness gives the hold command, from the profile. Above the hold limit. */
+  readonly timeoutS: number;
+  /** The tool event (`PostToolUse`) and the emitter command. */
+  readonly toolEvent: string;
+  readonly emitCommand: string;
+}
+
+/** The hold entries for this binary, from the harness profile, or null when the profile holds nothing. */
+export function holdInstallFor(harness: string, binary: string): HoldInstall | null {
+  const hold = loadProfiles().get(harness)?.hold;
+  if (hold === undefined) return null;
+  return {
+    event: hold.event,
+    holdCommand: `${binary}${HOLD_VERB}${HOOK_MARKER}`,
+    timeoutS: hold.hookTimeoutS,
+    toolEvent: hold.toolEvent,
+    emitCommand: `${binary}${HOOK_VERB}${HOOK_MARKER}`,
+  };
+}
+
+/** The two events a hold install writes, for the strip when the flag is absent. */
+function holdEvents(harness: string): string[] {
+  const hold = loadProfiles().get(harness)?.hold;
+  return hold === undefined ? [] : [hold.event, hold.toolEvent];
+}
+
+/**
+ * The settings document with every {@link BEACON_HOOKS} registration present, or a refusal.
+ *
+ * With `hold`, the permission hold and the tool edge are merged in too. Without it, any marked entry
+ * under `stripEvents` (the hold's two events) is removed, so an install without the flag takes the
+ * hold back out: permissions return to screen asks at once (the agent reloads its hooks).
+ */
+export function installDocument(current: JsonValue | null, command: string, hold: HoldInstall | null = null, stripEvents: readonly string[] = []): HookDocument {
+  const root = current === null ? {} : asObject(current);
+  if (root === null) return { kind: "refuse", reason: "its top level is not a JSON object" };
+  const section = root.hooks === undefined ? {} : asObject(root.hooks);
+  if (section === null) return { kind: "refuse", reason: "its `hooks` is not a JSON object" };
+
+  const hooks: JsonObject = { ...section };
+  for (const registration of BEACON_HOOKS) {
+    const existing = section[registration.event];
+    const groups = existing === undefined ? [] : asArray(existing);
+    if (groups === null) {
+      return { kind: "refuse", reason: `its \`hooks.${registration.event}\` is not a JSON array` };
+    }
+    hooks[registration.event] = mergeGroups(groups, ourGroup(registration, command));
+  }
+  const holdGroups: [string, JsonObject][] =
+    hold === null
+      ? []
+      : [
+          [hold.event, { hooks: [{ type: "command", command: hold.holdCommand, timeout: hold.timeoutS }] }],
+          [hold.toolEvent, { hooks: [{ type: "command", command: hold.emitCommand, timeout: 10 }] }],
+        ];
+  for (const [event, group] of holdGroups) {
+    const existing = section[event];
+    const groups = existing === undefined ? [] : asArray(existing);
+    if (groups === null) return { kind: "refuse", reason: `its \`hooks.${event}\` is not a JSON array` };
+    hooks[event] = mergeGroups(groups, group);
+  }
+  if (hold === null) {
+    for (const event of stripEvents) {
+      const groups = asArray(section[event]);
+      if (groups === null) continue;
+      const kept = groups.filter((group) => markedCommandIn(group) === null);
+      if (kept.length > 0) hooks[event] = kept;
+      else delete hooks[event];
+    }
+  }
+  return { kind: "document", document: { ...root, hooks } };
+}
+
+/**
+ * The settings document with every marked entry removed, or a refusal.
+ *
+ * An array we empty is deleted (we are the only reason it existed); an unmarked entry is left alone,
+ * so an operator who wrote their own `Stop` hook keeps it.
+ */
+export function uninstallDocument(current: JsonValue | null): HookDocument {
+  const root = current === null ? {} : asObject(current);
+  if (root === null) return { kind: "refuse", reason: "its top level is not a JSON object" };
+  const section = root.hooks === undefined ? {} : asObject(root.hooks);
+  if (section === null) return { kind: "refuse", reason: "its `hooks` is not a JSON object" };
+
+  const hooks: JsonObject = {};
+  for (const [event, value] of Object.entries(section)) {
+    const groups = asArray(value);
+    if (groups === null) {
+      hooks[event] = value;
+      continue;
+    }
+    const kept = groups.filter((group) => markedCommandIn(group) === null);
+    if (kept.length > 0) hooks[event] = kept;
+  }
+  const document: JsonObject = { ...root, hooks };
+  // A `hooks` we emptied entirely is removed rather than left as `{}` — there is nothing of the
+  // operator's in it, and an empty section is a leftover, not a setting.
+  if (Object.keys(hooks).length === 0) delete document.hooks;
+  return { kind: "document", document };
+}
+
+/** How a settings file is serialised. Two-space JSON with a trailing newline, as Claude Code writes it. */
+export function serializeSettings(document: JsonObject): string {
+  return `${JSON.stringify(document, null, 2)}\n`;
+}
+
+// ── The verbs ────────────────────────────────────────────────────────────────
+
+export interface HooksDeps {
+  readonly ctx: CliContext;
+  readonly io: Io;
+  readonly files: Files;
+  /** `lstat` without following — the symlink refusal, and how the published PATH name is recognised. */
+  readonly fs: LinkReader;
+  /** The installed version of a harness, or null when it cannot be read. Defaults to its profile's version command. */
+  readonly harnessVersion?: (harness: string) => string | null;
+}
+
+/** The harness's installed version, read through its profile's version command. */
+function readHarnessVersion(harness: string): string | null {
+  const profile = loadProfiles().get(harness);
+  return profile === undefined ? null : binaryVersion(profile);
+}
+
+/**
+ * Why {@link resolveTarget} refused this target — named so the message can say the link, where it
+ * points, and the remedy, rather than a raw filesystem error surfacing later out of
+ * {@link writeSettings}.
+ */
+export type TargetRefusal =
+  | { readonly kind: "file-symlink"; readonly path: string }
+  | { readonly kind: "dangling-dir"; readonly link: string; readonly points: string }
+  | { readonly kind: "unwritable-dir"; readonly link: string; readonly points: string };
+
+export type ResolvedTarget =
+  | { readonly kind: "ok"; readonly target: HookTarget }
+  | { readonly kind: "refused"; readonly refusal: TargetRefusal };
+
+/**
+ * `dir`, followed through every symlink on the way ({@link realpathVia}) — stow and chezmoi point
+ * the whole config directory elsewhere, and a write underneath it lands in the real place regardless,
+ * the same as any other path's non-final components. Only two shapes refuse: the link resolves to
+ * nothing (dangling), or it resolves to a directory this process cannot write into (mounted from a
+ * read-only Nix store, say). An ordinary directory that simply does not exist YET — no symlink
+ * anywhere on the path — is left alone; {@link writeSettings} creates it, same as always.
+ */
+function resolveTargetDir(deps: HooksDeps, dir: string): { dir: string } | { refusal: TargetRefusal } {
+  const resolved = realpathVia(deps.fs, dir);
+  if (resolved === dir) return { dir };
+  const probe = deps.fs.probe(resolved);
+  if (probe.kind === "absent") return { refusal: { kind: "dangling-dir", link: dir, points: resolved } };
+  if (deps.files.writable(resolved) === false) {
+    return { refusal: { kind: "unwritable-dir", link: dir, points: resolved } };
+  }
+  return { dir: resolved };
+}
+
+/**
+ * The settings path this target actually reads and writes, every guard applied: the directory
+ * resolved through its own symlinks ({@link resolveTargetDir}), then the settings file inside it
+ * refused if THAT is a symlink — a rename onto a symlinked file replaces the link (home-manager's
+ * read-only profile), which resolving the directory never does.
+ *
+ * The one resolver `cmdHooksInstall`, `cmdHooksUninstall` and `targetState` all call, so `hooks
+ * status` and `issance doctor`'s `beacon-hooks-claude` (M11/05, which already reads straight through
+ * `claudeSettingsTargets`'s path) never disagree about which bytes on disk are "the settings file".
+ */
+function resolveTarget(deps: HooksDeps, target: HookTarget): ResolvedTarget {
+  const dir = resolveTargetDir(deps, target.dir);
+  if ("refusal" in dir) return { kind: "refused", refusal: dir.refusal };
+  const path = join(dir.dir, "settings.json");
+  if (deps.fs.probe(path).kind === "symlink") {
+    return { kind: "refused", refusal: { kind: "file-symlink", path } };
+  }
+  return { kind: "ok", target: { dir: dir.dir, path } };
+}
+
+/** The fact half of a refusal — what `hooks status` prints after "refused — ". */
+function refusalFact(refusal: TargetRefusal): string {
+  switch (refusal.kind) {
+    case "file-symlink":
+      return `${refusal.path} is a symlink`;
+    case "dangling-dir":
+      return `${refusal.link} is a symlink to ${refusal.points}, which does not exist`;
+    case "unwritable-dir":
+      return `${refusal.link} is a symlink to ${refusal.points}, which this process cannot write to`;
+  }
+}
+
+/** The remedy half — always "fix the link or its target, then re-run install". */
+function refusalRemedy(refusal: TargetRefusal): string {
+  switch (refusal.kind) {
+    case "file-symlink":
+      return "Replace it with the real file (or point the profile at the real one), then re-run `issance hooks install claude`.";
+    case "dangling-dir":
+      return `Create ${refusal.points}, or point ${refusal.link} at a directory that exists, then re-run \`issance hooks install claude\`.`;
+    case "unwritable-dir":
+      return `Point ${refusal.link} at a directory this process can write to, then re-run \`issance hooks install claude\`.`;
+  }
+}
+
+/** Prints a refusal the way every other guard here does — the fact, then the remedy, never a stack trace. */
+function printRefusal(deps: HooksDeps, refusal: TargetRefusal): void {
+  deps.io.err(`error: ${refusalFact(refusal)} — refusing to write there.`);
+  deps.io.err(`  ${refusalRemedy(refusal)}`);
+}
+
+/** The file's contents parsed, `null` for an absent file, or a refusal for one we cannot read. */
+function readSettings(deps: HooksDeps, target: HookTarget): { text: string | null; value: JsonValue | null } | null {
+  const text = deps.files.read(target.path);
+  if (text === null) return { text: null, value: null };
+  if (text.trim() === "") return { text, value: null };
+  try {
+    return { text, value: JSON.parse(text) };
+  } catch {
+    return null;
+  }
+}
+
+/** Temp file, then rename — and the one-time backup, taken before the first modification. */
+function writeSettings(deps: HooksDeps, target: HookTarget, previous: string | null, text: string): void {
+  if (previous !== null && !deps.files.exists(backupPath(target))) {
+    deps.files.write(backupPath(target), previous, 0o600);
+  }
+  const temp = `${target.path}.issance-tmp`;
+  try {
+    deps.files.write(temp, text, 0o600);
+    deps.files.rename(temp, target.path);
+  } catch (err) {
+    deps.files.remove(temp);
+    throw err;
+  }
+}
+
+/** The harness argument, or null when it was missing or unknown. */
+function readHarness(deps: HooksDeps, args: readonly string[], verb: string): string | null {
+  const name = args[0];
+  if (name !== undefined && HOOK_HARNESSES.some((h) => h === name)) return name;
+  deps.io.err(`usage: issance hooks ${verb} {${HOOK_HARNESSES.join("|")}}`);
+  if (name !== undefined && name !== "") {
+    deps.io.err(`  \`${name}\` has no beacon emitter — only ${HOOK_HARNESSES.join(", ")} does.`);
+  }
+  return null;
+}
+
+/** `issance hooks install claude` — merge every registration into every target, adding what is missing. */
+export function cmdHooksInstall(deps: HooksDeps, args: readonly string[]): number {
+  const harness = readHarness(deps, args, "install");
+  if (harness === null) return EXIT.USAGE;
+  const unknown = args.slice(1).filter((arg) => arg !== HOLD_FLAG);
+  if (unknown.length > 0) {
+    deps.io.err(`error: unknown option \`${unknown[0]!}\`. The one option is \`${HOLD_FLAG}\`.`);
+    return EXIT.USAGE;
+  }
+  const { command, binary, source } = resolveHookCommand(deps.ctx, deps.fs);
+  const wantsHold = args.includes(HOLD_FLAG);
+  if (harness === "codex") {
+    // Codex has no permission hook to hold: its install writes the notify hook only.
+    if (wantsHold) {
+      deps.io.err(`error: \`codex\` has no permission hold. Run \`issance hooks install codex\` without \`${HOLD_FLAG}\`.`);
+      return EXIT.USAGE;
+    }
+    return cmdCodexHooksInstall(deps, binary, PINNED_NOTE[source]);
+  }
+  const hold = wantsHold ? holdInstallFor(harness, binary) : null;
+  if (wantsHold && hold === null) {
+    deps.io.err(`error: \`${harness}\` has no permission hold.`);
+    return EXIT.USAGE;
+  }
+  // An older harness never runs the hold event: the install would promise a hold that never comes.
+  const minVersion = hold === null ? null : (loadProfiles().get(harness)?.hold?.minVersion ?? null);
+  const version = minVersion === null ? null : (deps.harnessVersion ?? readHarnessVersion)(harness);
+  if (minVersion !== null && version !== null && compareSemver(version, minVersion) < 0) {
+    deps.io.err(`error: ${harness} ${version} does not run the ${hold!.event} hook. The hold needs ${minVersion} or later.`);
+    deps.io.err(`  Update ${harness}, or run the install without \`${HOLD_FLAG}\`.`);
+    return EXIT.FAIL;
+  }
+  let failed = false;
+
+  for (const rawTarget of claudeSettingsTargets(deps.ctx)) {
+    const resolved = resolveTarget(deps, rawTarget);
+    if (resolved.kind === "refused") {
+      printRefusal(deps, resolved.refusal);
+      failed = true;
+      continue;
+    }
+    const target = resolved.target;
+    const settings = readSettings(deps, target);
+    if (settings === null) {
+      deps.io.err(`error: ${target.path} is not valid JSON — leaving it alone.`);
+      deps.io.err("  Fix it (or move it aside), then re-run; a merge into a file we cannot read would lose it.");
+      failed = true;
+      continue;
+    }
+    const outcome = installDocument(settings.value, command, hold, holdEvents(harness));
+    if (outcome.kind === "refuse") {
+      deps.io.err(`error: ${target.path} cannot be merged into — ${outcome.reason}.`);
+      failed = true;
+      continue;
+    }
+    const text = serializeSettings(outcome.document);
+    if (text === settings.text) {
+      deps.io.out(`${target.path} already has them — no bytes changed.`);
+      continue;
+    }
+    try {
+      writeSettings(deps, target, settings.text, text);
+    } catch (err) {
+      deps.io.err(`error: could not write ${target.path} — ${err instanceof Error ? err.message : String(err)}`);
+      failed = true;
+      continue;
+    }
+    deps.io.out(`✓ ${target.path}`);
+  }
+
+  if (failed) return EXIT.FAIL;
+  deps.io.out(`  ${BEACON_HOOKS.map((r) => r.event).join(", ")} → \`${binary} beacon emit\``);
+  deps.io.out(`  ${PINNED_NOTE[source]}`);
+  deps.io.out("  Outside a multiplexer the hook exits at once and writes nothing. In Hangar it writes hook edges only.");
+  deps.io.out(`  Hook edges go to each running bridge listed in ${hookTargetsDir(deps.ctx.env, deps.ctx.home)}.`);
+  deps.io.out("  With no bridge listed there, they go to the default state dir.");
+  deps.io.out("  A running agent reloads its hooks on its own. If no edges come, restart it.");
+  if (hold !== null) {
+    deps.io.out(`  ${hold.event} → \`${binary} beacon hold\`: a permission waits for a tap on the phone.`);
+    if (version === null) deps.io.out(`  issance could not read the ${harness} version. The hold needs ${minVersion ?? "a recent version"} or later.`);
+    deps.io.out("  With no issance listening, or on any error, the hook prints nothing and the dialog shows as before.");
+  } else {
+    deps.io.out(`  No permission hold. Add \`${HOLD_FLAG}\` to hold permissions for the phone.`);
+  }
+  return EXIT.OK;
+}
+
+/** `issance hooks uninstall claude` — remove only what carries the marker. */
+export function cmdHooksUninstall(deps: HooksDeps, args: readonly string[]): number {
+  const harness = readHarness(deps, args, "uninstall");
+  if (harness === null) return EXIT.USAGE;
+  if (harness === "codex") return cmdCodexHooksUninstall(deps);
+  let failed = false;
+  let removed = 0;
+
+  for (const rawTarget of claudeSettingsTargets(deps.ctx)) {
+    const resolved = resolveTarget(deps, rawTarget);
+    if (resolved.kind === "refused") {
+      printRefusal(deps, resolved.refusal);
+      failed = true;
+      continue;
+    }
+    const target = resolved.target;
+    const settings = readSettings(deps, target);
+    if (settings === null || settings.text === null) continue;
+    const outcome = uninstallDocument(settings.value);
+    if (outcome.kind === "refuse") continue;
+    const text = serializeSettings(outcome.document);
+    if (text === settings.text) continue;
+    try {
+      writeSettings(deps, target, settings.text, text);
+    } catch (err) {
+      deps.io.err(`error: could not write ${target.path} — ${err instanceof Error ? err.message : String(err)}`);
+      failed = true;
+      continue;
+    }
+    deps.io.out(`✓ ${target.path} — removed the marked entries; every other hook is untouched.`);
+    removed += 1;
+  }
+
+  if (failed) return EXIT.FAIL;
+  if (removed === 0) deps.io.out("nothing to remove — no settings file here carries a issance-beacon entry.");
+  return EXIT.OK;
+}
+
+/**
+ * What ONE settings file carries, as a verdict rather than a sentence.
+ *
+ * `status` renders these into its lines; `--check` branches on them. One reading, two readers — the
+ * same rule {@link markedCommandsByEvent} exists for, one level up.
+ */
+export type HookTargetState =
+  | { readonly kind: "refused"; readonly refusal: TargetRefusal }
+  | { readonly kind: "unreadable" }
+  | { readonly kind: "absent" }
+  | { readonly kind: "not-installed" }
+  /** Ours, and missing at least one registration this build knows — the shape a grown set leaves. */
+  | { readonly kind: "partial"; readonly at: string; readonly present: number }
+  /** Ours, complete, but written by a build whose marker was a different version. */
+  | { readonly kind: "stale"; readonly at: string }
+  | { readonly kind: "installed"; readonly at: string };
+
+function targetState(deps: HooksDeps, target: HookTarget): HookTargetState {
+  const resolved = resolveTarget(deps, target);
+  if (resolved.kind === "refused") return { kind: "refused", refusal: resolved.refusal };
+  const settings = readSettings(deps, resolved.target);
+  if (settings === null) return { kind: "unreadable" };
+  if (settings.text === null) return { kind: "absent" };
+  const versions = new Set<string>();
+  let present = 0;
+  for (const command of markedCommandsByEvent(settings.value)) {
+    if (command === null) continue;
+    present += 1;
+    versions.add(String(markerVersionOf(command)));
+  }
+  if (present === 0) return { kind: "not-installed" };
+  const at = `v${[...versions].join("/")}`;
+  if (present < BEACON_HOOKS.length) return { kind: "partial", at, present };
+  return versions.has(String(HOOK_MARKER_VERSION)) && versions.size === 1
+    ? { kind: "installed", at }
+    : { kind: "stale", at };
+}
+
+/**
+ * Is any settings file BEHIND this build — carrying our entries, but not all of them, or at a marker
+ * version this build no longer writes?
+ *
+ * "Behind" is deliberately narrower than "install would change something". A file with none of our
+ * entries is not behind, it OPTED OUT, and nothing should nag about it. Absent, unreadable and
+ * refused files are not behind either: they are `doctor`'s business, not an afterthought's.
+ *
+ * This is the question `issance update` asks — of the NEWLY installed binary, never in-process, since
+ * {@link BEACON_HOOKS} is compiled in and the old build's copy is exactly the stale thing.
+ */
+export function hooksAreBehind(deps: HooksDeps): boolean {
+  return claudeSettingsTargets(deps.ctx)
+    .map((target) => targetState(deps, target))
+    .some((state) => state.kind === "partial" || state.kind === "stale");
+}
+
+/**
+ * `issance hooks status` — READ-ONLY. It reports; it never repairs.
+ *
+ * `--check` is the same verdict for a caller with no eyes: nothing on stdout, and the exit code IS
+ * the answer — `EXIT.STATE` ("the local state says no", `cli/io.ts`) when {@link hooksAreBehind},
+ * `EXIT.OK` otherwise. `issance update` runs it on the binary it just installed; keeping it a flag on
+ * the existing verb means the two answers cannot drift, and it leaves `status`'s own contract alone.
+ */
+export function cmdHooksStatus(deps: HooksDeps, args: readonly string[] = []): number {
+  if (args.includes("--check")) return hooksAreBehind(deps) ? EXIT.STATE : EXIT.OK;
+  const { binary, source } = resolveHookCommand(deps.ctx, deps.fs);
+  deps.io.out(`would install: ${binary} beacon emit  (${SOURCE_NAME[source]})`);
+  for (const target of claudeSettingsTargets(deps.ctx)) {
+    deps.io.out(`${target.path}: ${describeTarget(deps, target)}`);
+  }
+  deps.io.out(codexHooksStatusLine(deps, binary));
+  return EXIT.OK;
+}
+
+/** Whether one settings file holds permissions (M56 spec 12). Read-only, like every status read. */
+function targetHolds(deps: HooksDeps, target: HookTarget): boolean {
+  const resolved = resolveTarget(deps, target);
+  if (resolved.kind === "refused") return false;
+  const settings = readSettings(deps, resolved.target);
+  if (settings === null) return false;
+  return HOOK_HARNESSES.some((harness) => holdEvents(harness).slice(0, 1).some((event) => holdCommandIn(settings.value, event) !== null));
+}
+
+function describeTarget(deps: HooksDeps, target: HookTarget): string {
+  const base = describeBeacons(deps, target);
+  return targetHolds(deps, target) ? `${base}, holds permissions` : base;
+}
+
+function describeBeacons(deps: HooksDeps, target: HookTarget): string {
+  const state = targetState(deps, target);
+  switch (state.kind) {
+    case "refused":
+      return `refused — ${refusalFact(state.refusal)}`;
+    case "unreadable":
+      return "unreadable — not valid JSON";
+    case "absent":
+      return "no settings file — `issance hooks install claude` creates one";
+    case "not-installed":
+      return "not installed";
+    // A file installed by an older build carries the events THAT build knew, which is what this reads
+    // like once the set grows. So the line names the remedy: install adds the missing ones in place.
+    case "partial":
+      return `partly installed (${state.at}, ${state.present}/${BEACON_HOOKS.length} events) — re-run install to add the rest`;
+    case "stale":
+      return `installed at ${state.at} — re-run install to heal it to v${HOOK_MARKER_VERSION}`;
+    case "installed":
+      return `installed (${state.at})`;
+  }
+}
+
+export function hooksUsage(): string {
+  return `usage: issance hooks {${HOOKS_SUBCOMMANDS.join("|")}}`;
+}
+
+/** The parent verb. Reached by a bare `issance hooks` or a misspelt sub-verb, as `cmdDevices` is. */
+export function cmdHooks(deps: HooksDeps, args: readonly string[]): number {
+  const [sub, ...rest] = args;
+  switch (sub) {
+    case "install":
+      return cmdHooksInstall(deps, rest);
+    case "uninstall":
+      return cmdHooksUninstall(deps, rest);
+    case "status":
+      return cmdHooksStatus(deps, rest);
+    default:
+      if (sub !== undefined && sub !== "" && sub !== "help") {
+        deps.io.err(`error: unknown hooks subcommand \`${sub}\``);
+      }
+      deps.io.err(hooksUsage());
+      deps.io.err("  install     register the beacon hooks: `hooks install claude` (add `--hold-permissions` to hold permissions), or `hooks install codex`");
+      deps.io.err("  uninstall   remove only the entries issance owns: `hooks uninstall claude`, or `hooks uninstall codex`");
+      deps.io.err("  status      what each settings file carries right now (reads only)");
+      return EXIT.USAGE;
+  }
+}

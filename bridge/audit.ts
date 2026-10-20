@@ -1,0 +1,379 @@
+import type { JsonObject, JsonValue } from "./json.ts";
+import { appendFile, rename, stat } from "node:fs/promises";
+
+// Append-only audit trail of write-level actions (a socket call can type into a real terminal, so
+// who-did-what-when is worth recording). One JSONL line per action at `<stateDir>/audit.log`
+// (created 0600 — it may echo reply text). The line format is a pure, tested function; the writer
+// takes an injectable append so the disk side is decoupled from `bun test`. Crucially, an audit
+// failure must NEVER fail the user's action — record() swallows and logs, never throws.
+
+/** Cap on any single string value written into a line — a 2 000-char reply becomes a 120-char preview. */
+const MAX_STR = 120;
+
+/**
+ * How much of a value's CONTENT the trail keeps.
+ *
+ * - `preview` (default, unchanged behaviour): a bounded, single-line preview.
+ * - `none`: nothing. Every string inside `detail` becomes `⟨redacted⟩` unless its key names an
+ *   action parameter ({@link METADATA_KEYS}).
+ *
+ * `none` exists for deployments where the audit trail is wanted but the message bodies are not:
+ * under `tailscale serve` the operator's replies and, via the prompt binding, a slice of whatever
+ * was on the terminal both land in this file. Booleans, numbers and the whole envelope
+ * (ts, action, paneId, session, device) are untouched either way — the point is to keep answering
+ * "who typed into what, when" without also keeping "what they said".
+ */
+export type AuditContent = "preview" | "none";
+
+/**
+ * The metadata allowlist for `none` mode, matched by key name at ANY depth inside `detail`.
+ *
+ * A string survives only if its key names an action PARAMETER — a key name, an id, an enum-ish
+ * outcome, a server-generated filename. Anything screen- or operator-originated must not be listed:
+ * `text` is what the operator typed and `promptBinding.expected` is a slice of the pane screen.
+ *
+ * ⛔ The direction of the default is the whole feature. A detail field added later under a new name
+ * redacts until someone deliberately adds it here, so a content-bearing field can never leak into a
+ * redacted trail by being forgotten. Members of an array inherit the array's own key.
+ *
+ * `keys` is deliberately NOT listed: Type mode turns typed text into one key per character, so the
+ * array can carry a body. It gets its own rule, {@link sanitizeKeys}, which keeps only named keys.
+ */
+const METADATA_KEYS: ReadonlySet<string> = new Set([
+  "checked",
+  "passed",
+  "reason",
+  // A worktree create's id (ADR 0089): a UUID the phone mints, never typed by a person.
+  "requestId",
+  "saved",
+  "sent",
+  "size",
+  "styled",
+  "submit",
+  "submitted",
+  "tabId",
+  "textDelivered",
+  "workspaceId",
+]);
+
+/** One write-level action worth recording. `ts` is stamped by {@link formatAuditLine}, not here. */
+export interface AuditEntry {
+  /** The action performed, e.g. "reply" / "keys" / "upload" / "tab.create" / "pane.close". */
+  action: string;
+  /** The outermost component of the `(host, session, paneId)` address triple (CREW_PROTOCOL.md §4):
+   *  the crew member the action targeted. Absent (not null) when the action targeted this issance
+   *  itself, exactly as `session` is absent on pre-multi-session lines (CREW_PROTOCOL.md §11). */
+  host?: string;
+  /** Target pane, when the action is pane-scoped. */
+  paneId?: string;
+  /** The herdr session the action targeted (registry name); absent on pre-multi-session lines. */
+  session?: string;
+  /** Attributed device (from the per-device auth header), or null/absent when the feature is off. */
+  device?: string | null;
+  /**
+   * How the action arrived. Absent ⇒ the phone talked to THIS issance directly (every pre-crew line,
+   * and every line on a solo instance). `"crew"` ⇒ it arrived over a crew link, i.e. a lead forwarded
+   * it (CREW_PROTOCOL.md §12) — written on the PEER, whose terminals actually moved.
+   */
+  via?: "crew";
+  /**
+   * Who forwarded it: the originating crew member id, as proven by the link's two factors (§8.1).
+   * Peer-side counterpart of {@link AuditEntry.host}, which is what the LEAD writes on the same event
+   * — the two logs are independent records, so neither machine needs the other's disk (§12).
+   */
+  from?: string;
+  /** Truncated, newline-safe parameters — reply text, key names, filename+size, labels, etc. */
+  detail?: AuditDetail;
+}
+
+/**
+ * What a `detail` value may be: JSON, plus the shapes a caller can actually hand over. A
+ * function-valued property (a smuggled `toJSON`) is precisely what {@link sanitize} exists to drop,
+ * so this type must NOT pretend one cannot arrive — the redaction tests plant exactly that.
+ */
+export type AuditDetailValue =
+  | JsonValue
+  | undefined
+  | ((...args: never[]) => JsonValue | undefined)
+  | AuditDetailValue[]
+  | { [key: string]: AuditDetailValue };
+
+/** Truncated, newline-safe parameters — reply text, key names, filename+size, labels, etc. */
+export type AuditDetail = { [key: string]: AuditDetailValue };
+
+/** The message of a thrown value, without assuming it was an Error. */
+function errorText<T>(err: T): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Delivers one formatted line (newline included) to its destination. Injectable for tests. */
+export type AppendFn = (line: string) => void | Promise<void>;
+
+/**
+ * A named key is a key NAME ("Enter", "ctrl+c", "Escape", "Up"), not typed text: longer than one
+ * character. A single character is always a body.
+ *
+ * ⛔ "Space" and "Tab" are bodies too. Type mode maps a typed space and a typed tab to those two
+ * names (`textToKeySequence`), so keeping them literal would write the word boundaries of a password.
+ */
+export function isNamedKey(key: string): boolean {
+  if (key === "Space" || key === "Tab") return false;
+  return Array.from(key).length > 1;
+}
+
+/**
+ * The `keys` array of a `keys` action, which can be a key list OR typed text.
+ *
+ * Type mode (`textToKeySequence` in the web app) sends one key per character, and ADR 0017 sends a
+ * password down that path. So a single-character key, "Space" or "Tab" is a body:
+ * - `none`: each one becomes `⟨redacted⟩`; named keys stay literal.
+ * - `preview`: each run of single characters collapses into one string of `•` (one per character,
+ *   cut at {@link MAX_STR}), so the line records how many were typed and which named keys followed,
+ *   never the characters themselves.
+ */
+function sanitizeKeys(keys: AuditDetailValue[], content: AuditContent): JsonValue[] {
+  const out: JsonValue[] = [];
+  let run = 0;
+  const flush = () => {
+    if (run === 0) return;
+    const masked = "•".repeat(run);
+    out.push(masked.length > MAX_STR ? `${masked.slice(0, MAX_STR)}…` : masked);
+    run = 0;
+  };
+  for (const key of keys) {
+    if (typeof key !== "string" || isNamedKey(key)) {
+      flush();
+      out.push(sanitize(key, content, true) ?? null);
+    } else if (content === "none") {
+      out.push("⟨redacted⟩");
+    } else {
+      run += 1;
+    }
+  }
+  flush();
+  return out;
+}
+
+/**
+ * Collapse newlines and truncate long strings so every value is a single-line, bounded preview.
+ * JSON.stringify already escapes a literal newline to `\n` (keeping the output single-line), but we
+ * still fold embedded newlines to a space so a multi-line reply reads as one legible preview rather
+ * than a wall of `\n`. Recurses into arrays/objects so `detail` can nest (e.g. a key-name array).
+ *
+ * `allowed` carries the enclosing key's verdict against {@link METADATA_KEYS}: an object re-decides
+ * per key, an array hands its own verdict to every member. It is false at the root, so a `detail`
+ * that is somehow a bare string redacts rather than passing through unnamed.
+ *
+ * ⛔ Function-valued properties are DROPPED, in both modes. Copying them through means
+ * `JSON.stringify` later CALLS a copied own `toJSON`, which re-injects its return value into the
+ * line — past the preview cap, and past every redaction decision made here.
+ */
+function sanitize(
+  value: AuditDetailValue,
+  content: AuditContent = "preview",
+  allowed = false,
+): JsonValue | undefined {
+  if (typeof value === "function") return null;
+  if (typeof value === "string") {
+    // ⛔ A constant, never `⟨n chars⟩`. An exact length is itself content — a 9-character redaction
+    // next to a password prompt narrows the secret — and "was anything sent" is already answered by
+    // the entry existing at all.
+    if (content === "none" && !allowed) return "⟨redacted⟩";
+    const oneLine = value.replace(/[\r\n]+/g, " ");
+    return oneLine.length > MAX_STR ? `${oneLine.slice(0, MAX_STR)}…` : oneLine;
+  }
+  // `?? null` only names what `JSON.stringify` already does with an `undefined` array slot, so the
+  // rendered line is byte-identical; it keeps the element type JSON rather than JSON-or-undefined.
+  if (Array.isArray(value)) return value.map((v) => sanitize(v, content, allowed) ?? null);
+  if (value !== null && typeof value === "object") {
+    const out: JsonObject = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (typeof v === "function") continue;
+      out[k] = k === "keys" && Array.isArray(v) ? sanitizeKeys(v, content) : sanitize(v, content, METADATA_KEYS.has(k));
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Render one entry to a single JSONL line (no trailing newline). Stable field order
+ * (ts, action, host?, paneId?, session?, device?, via?, from?, detail) — `host` sits right after
+ * `action` since it is the outermost component of the `(host, session, paneId)` triple
+ * (CREW_PROTOCOL.md §4), and `via`/`from` sit next to `device` because all three answer "who did
+ * this" — so lines are grep/diff-friendly; optional attribution is omitted (not null) when absent,
+ * keeping a zero-peer line byte-identical to today's (CREW_PROTOCOL.md §11). Pure — `now` (epoch ms)
+ * is injected so tests are deterministic.
+ */
+export function formatAuditLine(
+  entry: AuditEntry,
+  now: number,
+  content: AuditContent = "preview",
+): string {
+  const line: JsonObject = { ts: new Date(now).toISOString(), action: entry.action };
+  if (entry.host !== undefined) line.host = entry.host;
+  if (entry.paneId !== undefined) line.paneId = entry.paneId;
+  if (entry.session !== undefined) line.session = entry.session;
+  if (entry.device != null) line.device = entry.device;
+  if (entry.via !== undefined) line.via = entry.via;
+  if (entry.from !== undefined) line.from = entry.from;
+  line.detail = sanitize(entry.detail ?? {}, content);
+  return JSON.stringify(line);
+}
+
+/**
+ * Cap on the live `audit.log` before it rotates.
+ *
+ * The trail records lines that no factor has authenticated yet — a refused crew call is written
+ * before the link's factors pass (`bridge/crew/router.ts`), which is the point: a refusal nobody can
+ * see is not an audit trail. But it also means anyone who can reach the listener can make this file
+ * grow, so its growth must be bounded here rather than by who is calling. Not an env var and not a
+ * config key: a knob whose only wrong setting is "unbounded" is not a choice worth offering.
+ */
+export const AUDIT_MAX_BYTES = 5 * 1024 * 1024;
+
+/** The filesystem operations the appender needs, injected so rotation is testable without a disk. */
+export interface AuditFileIo {
+  /** Size of the file in bytes, or 0 when it does not exist. */
+  size(path: string): Promise<number>;
+  /** Replace `to` with `from`. Rejects like `rename(2)`. */
+  rotate(from: string, to: string): Promise<void>;
+  /** Append to the file, creating it owner-only (0600) — it may echo reply text. */
+  append(path: string, line: string): Promise<void>;
+}
+
+/** The real filesystem. A missing file is size 0, not an error — the first line creates it. */
+export function fsAuditFileIo(): AuditFileIo {
+  return {
+    async size(path) {
+      try {
+        return (await stat(path)).size;
+      } catch (err) {
+        if (err instanceof Error && "code" in err && err.code === "ENOENT") return 0;
+        throw err;
+      }
+    },
+    rotate: (from, to) => rename(from, to),
+    append: (path, line) => appendFile(path, line, { mode: 0o600 }),
+  };
+}
+
+/**
+ * A real fs appender for `<stateDir>/audit.log`, size-capped at {@link AUDIT_MAX_BYTES} with exactly
+ * one rotated generation: at the cap the live file becomes `audit.log.1`, replacing any previous one,
+ * and the line lands in a fresh `audit.log`.
+ *
+ * Appends are chained for the same reason `push.ts` chains its writes: the size is tracked in memory
+ * (seeded by one `stat`, incremented per write) rather than `stat`ed per line, and interleaved writes
+ * would make that counter fiction. A rejected link never wedges the next one.
+ *
+ * ⛔ A failed rotation still appends. An oversized trail beats a missing line — the cap is a bound on
+ * disk, not a reason to drop the record of an action that happened.
+ */
+export function fileAuditAppender(
+  path: string,
+  io: AuditFileIo = fsAuditFileIo(),
+  maxBytes: number = AUDIT_MAX_BYTES,
+): AppendFn {
+  // null ⇒ unknown (start of process, or a failed rotation left the size in doubt): re-`stat`.
+  let bytes: number | null = null;
+  let chain: Promise<void> = Promise.resolve();
+
+  const write = async (line: string): Promise<void> => {
+    if (bytes === null) {
+      try {
+        bytes = await io.size(path);
+      } catch {
+        bytes = 0; // Can't measure it — write the line rather than lose it.
+      }
+    }
+    if (bytes >= maxBytes) {
+      try {
+        await io.rotate(path, `${path}.1`);
+        bytes = 0;
+      } catch (err) {
+        bytes = null;
+        console.warn(`[audit] could not rotate ${path}: ${errorText(err)}`);
+      }
+    }
+    await io.append(path, line);
+    if (bytes !== null) bytes += Buffer.byteLength(line, "utf8");
+  };
+
+  return (line) => {
+    const next = chain.then(
+      () => write(line),
+      () => write(line),
+    );
+    // The caller sees this line's own failure; the chain forgets it so the next line still runs.
+    chain = next.catch(() => {});
+    return next;
+  };
+}
+
+/**
+ * The write side of the audit trail. `record()` is fire-and-forget: it formats the line and hands it
+ * to the injected append, swallowing any failure (format or write) so a full disk or a bad entry can
+ * never break the user action it was auditing.
+ */
+export class AuditLog {
+  private readonly now: () => number;
+  private readonly content: AuditContent;
+  private readonly defaults: Readonly<Partial<AuditEntry>>;
+
+  // Everything past `append` arrives in an options object, not a positional slot: the same slot is
+  // claimed by different arguments on different branches, and a silently-transposed `now`/`content`
+  // is a redaction quietly turning itself off.
+  constructor(
+    private readonly append: AppendFn,
+    opts: {
+      now?: () => number;
+      content?: AuditContent;
+      /**
+       * Fields stamped on every entry this instance records. Empty for the process-wide log, which
+       * is why a solo line is byte-identical to a pre-crew one — see {@link AuditLog.scoped}.
+       */
+      defaults?: Readonly<Partial<AuditEntry>>;
+    } = {},
+  ) {
+    this.now = opts.now ?? Date.now;
+    this.content = opts.content ?? "preview";
+    this.defaults = opts.defaults ?? {};
+  }
+
+  /**
+   * A view of this log that stamps `defaults` onto every entry.
+   *
+   * Exists for exactly one caller: the peer's crew dispatch, which hands the *unmodified* handler
+   * closures an audit log that already knows the action arrived over a crew link (§12). The handlers
+   * therefore need no `via` parameter and cannot forget to pass one — a route reachable from both a
+   * browser and a lead audits correctly in both directions with one code path.
+   */
+  scoped(defaults: Readonly<Partial<AuditEntry>>): AuditLog {
+    return new AuditLog(this.append, {
+      now: this.now,
+      content: this.content,
+      defaults: { ...this.defaults, ...defaults },
+    });
+  }
+
+  record(entry: AuditEntry): void {
+    let line: string;
+    try {
+      line = formatAuditLine({ ...this.defaults, ...entry }, this.now(), this.content);
+    } catch (err) {
+      console.warn(`[audit] could not format ${entry.action}: ${errorText(err)}`);
+      return;
+    }
+    // A failed append is logged and dropped — an audit write must never fail the action it records.
+    // One catch covers BOTH a rejection and a synchronous throw from the sink (which `await` turns
+    // into a rejection), exactly as the `.catch()` + surrounding `try` this replaces did.
+    void (async () => {
+      try {
+        await this.append(`${line}\n`);
+      } catch (err) {
+        console.warn(`[audit] write failed: ${errorText(err)}`);
+      }
+    })();
+  }
+}

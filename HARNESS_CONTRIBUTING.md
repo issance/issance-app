@@ -1,0 +1,316 @@
+# Adding a harness adapter
+
+issance up-levels an agent's terminal dialogs (permission prompts, AskUserQuestion menus, plan
+approvals, …) into native phone buttons. The per-agent knowledge that makes this safe lives in a
+**harness adapter**. Claude Code is the one verified adapter today; this is how you add another
+(codex, pi, opencode, …).
+
+Read first: [`ARCHITECTURE.md`](./ARCHITECTURE.md) (the interaction loop + security model),
+[`HERDR_API.md`](./HERDR_API.md) (the verified socket + `pane.send_keys` key grammar), and
+[`web/src/fixtures/panes/README.md`](./web/src/fixtures/panes/README.md) (the fixture corpus).
+
+## Architecture in one paragraph
+
+An adapter is a [`HarnessAdapter`](./web/src/lib/harness/types.ts) —
+`{ agent, buildBlocks, extractStatusLines, extractInputDraft }` — registered by its Hangar `agent`
+string in [`web/src/lib/harness/registry.ts`](./web/src/lib/harness/registry.ts). The registry is the
+single decision site for "which agents get grammars"; every agent absent from it keeps the universal
+raw terminal mirror. Claude is the reference adapter, under
+[`web/src/lib/harness/claude/`](./web/src/lib/harness/claude/): its detectors (prompt-select, wizard,
+preview-select, chrome, markers) are **pure functions over `StyledLine[]`** — no pane access, no
+network. Detection only says "this dialog is on screen"; the keystroke recipes and the race-guard
+that actually types live elsewhere. [`guard.ts`](./web/src/lib/harness/guard.ts) is the **only** module
+in `harness/` allowed to touch the network (it re-fetches the pane before a guarded keystroke) — a
+**capability fence** (see below) enforces that every other harness module stays I/O-pure, because a
+socket call types into a live terminal.
+
+## Which side parses a pane
+
+**The phone parses what the phone draws. The bridge parses only what the bridge must act on without
+a phone attached.** Every grammar in this document is client-side for that reason, and a pull
+request that moves one into the bridge, or that adds a parsed field to `/api/snapshot` so the client
+does not have to look, will be declined.
+
+The bridge holds exactly one pane grammar today, `extractClaudeSessionName` in
+[`bridge/state-engine.ts`](./bridge/state-engine.ts). It is there because the BRIDGE consumes it: the
+name lands on `AgentView` and labels a pane for push notifications and the dashboard, which have to
+work when nobody has the app open. That is the whole test, and it is a narrow one.
+
+Three things follow, and they are why the seam sits here rather than the other way round:
+
+- **A wire field cannot carry what the client needs.** `extractStatusLines` returns `StyledLine[]`,
+  because a statusline separates its fields by colour and flattening it to text loses what makes it
+  readable at a glance. Publishing it means inventing a styled wire format nobody else needs.
+- **An older bridge sends nothing.** A crew member runs whatever release it is on. A client that
+  trusted a new field would go blank against a peer one version behind, so it needs the local parse
+  anyway — and then there are two parsers for one screen, which will drift.
+- **"Parse once" is not at stake.** The client already walks the pane's tail once per poll. A new
+  region found in that same walk costs nothing extra.
+
+If you need something on screen that the client cannot reach, the answer is a new probe on
+`HarnessAdapter`, not a new field on the snapshot.
+
+## Fixtures-first workflow
+
+Detectors are developed and gated entirely against **byte-faithful pane captures** — never guessed
+from screenshots. The loop:
+
+1. In a **sandbox pane** (a scratch agent, never a real work session), drive the agent into the dialog
+   state you want to lift.
+2. Capture it byte-for-byte:
+   ```sh
+   scripts/capture-fixture.sh <paneId> <name>   # paneIds: GET /api/snapshot
+   ```
+   Reads need the pairing token. The script sends `ISSANCE_TOKEN` when it is set (a paired device's
+   token). Otherwise it sends the bridge's own read credential from `$ISSANCE_STATE_DIR/local-secret`
+   (default `~/.local/state/issance`), which works on the host. For a second instance, set
+   `ISSANCE_STATE_DIR` and `ISSANCE_PORT` to that instance's.
+   The capture is real terminal output and **this repo is public** — review every file for secrets
+   before `git add` (`less -R`), per
+   [`web/src/fixtures/panes/README.md`](./web/src/fixtures/panes/README.md).
+3. Write a **pure detector** over `StyledLine[]` and test it against the fixture through the real
+   `parseAnsi → splitLines` pipeline (copy the shape of
+   [`claude/prompt-select.test.ts`](./web/src/lib/harness/claude/prompt-select.test.ts)). Anchor
+   detection on the **buffer tail** — a dialog that has scrolled up (real output below it) must not
+   match. That tail invariant is the core false-positive guard.
+
+## The capability tier ladder
+
+An adapter earns capability incrementally. Ship a lower tier first; each is independently useful.
+
+- **Tier 0 — raw mirror.** Every agent gets this for free: the colored terminal mirror + slash palette
+  + special-keys pad. No adapter needed. It already works.
+- **Tier 1 — read-only lift.** Chrome/status/draft extraction (`extractStatusLines`,
+  `extractInputDraft`) plus **detection of a NEW, not-yet-wired block kind** — recognised and drawn,
+  but with no keystroke recipe behind it, so taps send **no keystrokes**. Mergeable **from fixtures
+  alone**: a mis-parse only costs cosmetics because there is no send path to fire into a terminal.
+  **Caveat:** this holds only for a brand-new kind. If your adapter emits an EXISTING interactive kind
+  (`prompt-select` / `wizard` / `multi-select`), its keystroke recipe is already live, so those taps
+  go hot the moment your detector matches — that is automatically **Tier 2** and must clear the full
+  Tier-2 bar below (corpus, notes, conformance, live-verification), not the read-only one.
+- **Tier 2 — interactive.** Wiring taps to keystrokes (the buttons go hot). This is the bar that types
+  into a real shell, so it requires **all** of:
+  - a **dated fixture corpus** covering the dialog's states,
+  - a **choreography notes file** documenting the verified keystroke recipe (à la
+    [`web/src/lib/grammar/WIZARD_NOTES.md`](./web/src/lib/grammar/WIZARD_NOTES.md)),
+  - a green **`describeAdapterConformance`** run (the CI gate, below), and
+  - **maintainer live-verification against a real pane** before the send path is enabled.
+
+### `cancelKey` — the way out of a modal you never taught issance to read
+
+**Declare the key your harness's own modals print as the way OUT of them**, as
+`cancelKey` on your adapter, beside `composerReady`. It is a Hangar key token (`"Escape"`,
+`"ctrl+c"`), and a comment at the line must cite the capture or notes file you read it from.
+
+It buys one thing: when every grammar you wrote declines a screen, your `composerReady` still
+answers a definite `false`, and the pane is not blank, issance draws the **unread-dialog card** over
+the raw mirror — one button, that key, under "issance cannot read this dialog"
+([ADR 0053](./.adr/0053-an-unread-dialog-still-has-a-way-out.md)). The card is built by a post-pass
+OUTSIDE every adapter, so nothing about your fail-closed contract is loosened to make one, and it
+reads nothing off the screen: a declaration cannot be fooled by a phrase, which is the failure the
+card exists for.
+
+**Do not assume Escape.** On grok, Escape opens the scrollback view and `Ctrl+c` is the cancel. On
+Muse, Escape steps back rather than dismisses — still the right key, and the reason the card names
+the key and never a verb.
+
+**Declaring nothing is a supported answer, and it has a visible cost:** no card for that agent, ever,
+so an unread modal leaves the operator with the raw mirror and the Keys pad. Take it when your
+`composerReady` has a false-negative mode you do not trust and you have no positive evidence of a
+modal to put beside it. `omp` had that problem: one ZWJ emoji in a statusline template makes its
+composer scanner return null on every frame, so `composerReady` would be false forever on a healthy
+pane and the card would paint itself permanently over a live composer. It now declares `cancelKey`
+together with `modalOnScreen`, which reads its own key-hint footer at the buffer tail
+([ADR 0076](./.adr/0076-the-omp-resume-picker-is-lifted-and-every-omp-modal-has-a-way-out.md)); a
+composer prints no such footer, so the false negative can no longer paint the card.
+
+**Optionally declare `modalOnScreen(lines)` too**: positive evidence that one of your harness's
+modals is up. No input box is also what a shell prompt looks like while your agent starts or exits,
+and Hangar reports the agent in both windows, so without it the card can flash over the shell. When
+declared, the card needs it to answer `true`. Claude's answer is "one of the last six non-blank rows
+names a key"; omp's is stricter, a footer row at the tail whose last hint is its own way out, in the six
+spellings it prints. Codex's is a row that names `esc`; Grok's is a `Key:verb │ Key:verb` footer;
+Muse's is its own bottom rule and statusline. Pin yours against the card's allow-list test
+(`unread-dialog.test.ts`).
+
+### The fail-closed contract (non-negotiable)
+
+**A detector MUST return `null` on anything it does not confidently recognise.** A partial lift is a
+bug, not a nicety — it types a keystroke into a live terminal. When in doubt, fall back to the raw
+mirror; the user can always drive Tier 0 by hand. Never up-level a dialog you can't fully model (e.g.
+a menu numbered past 9, whose option would need the unsendable key `"10"` — bail to raw instead).
+
+## Menus (generic modals)
+
+Not every modal is a dialog you can model. A **menu** is the last-resort shape: a full-screen picker
+(Claude's `/model` and its kin) with no numbered-option recipe, driven entirely by the keys the screen
+printed in **its own footer** — `Enter to set as default · s to use this session only · Esc to cancel`.
+Lifting one is what stops a composer send typing the user's reply into the picker.
+
+The model and the derivation are **harness-neutral**, so an adapter implements menus by following
+types, not by reading Claude's code:
+
+- [`harness/menu-model.ts`](./web/src/lib/harness/menu-model.ts) — `MenuModel` / `MenuAction` /
+  `MenuNav` (the `menu` Block's payload; the renderer and the race guard know only these).
+- [`harness/menu-hints.ts`](./web/src/lib/harness/menu-hints.ts) — the shared derivation:
+  `parseKeyHintFooter`, the key-token whitelist `menuKeyFor`, label capitalisation, the `←/→ to
+  <verb>` row grammar, and the arrow key constants.
+- [`harness/claude/menu.ts`](./web/src/lib/harness/claude/menu.ts) — the reference implementation.
+  It contributes only Claude's own conventions: where the region starts, its tail anchor, and the
+  input-box gate.
+
+What your adapter must satisfy (all pinned by `describeAdapterConformance`):
+
+1. Every action key comes from `menuKeyFor` — the screen's own footer, nothing inferred. The only
+   additions are the arrows the screen **advertised** (a highlight row for Up/Down, an `←/→ to <verb>`
+   row for Left/Right, whose leading text is the live value the arrows adjust).
+2. **Never a digit**, however tempting the numbered rows look —
+   [ADR 0009](./.adr/0009-a-generic-menu-is-driven-by-the-keys-it-names.md) records why (in `/model`
+   a digit confirms *and* rewrites the user's default).
+3. A non-empty `signature` over the region that **changes when the region's text does** — Hangar's
+   `revision` is a stub, so it is the entire race guard (the generic one — see the next section).
+4. Menu detection runs **last**, after every specific grammar you have, and must decline a screen with
+   a live input box; your `composerReady` must answer `false` while the modal is up.
+5. **When the screen prints the WHOLE scale the arrows move along, put it in
+   `nav.leftRight.values`** — the values in the order the screen printed them on one row, with
+   `label` one of them. The card then renders one tappable chip per value and sends a tap as the
+   delta in presses of the arrow the footer named, so the operator sees every option and reaches one
+   in a single tap. Set it only where the screen really printed the scale: a row that shows the
+   current value alone (Claude's `/model` picker) leaves it undefined and keeps the plain arrows.
+   The scale is part of menu identity, so it must be stable across polls
+   ([ADR 0054](./.adr/0054-a-printed-scale-is-tappable.md)). **A narrow pane wraps that scale**, so
+   read the footer as the rows the terminal wrapped it onto (`readKeyHintFooter` in
+   `web/src/lib/harness/menu-hints.ts`, which joins them) and rebuild each value from its head and
+   the fragment printed under it, in the same column; merge only when every fragment lines up, and
+   decline the screen when a merge makes anything but one word.
+6. **A footer phrase may never be the whole reason a grammar declines.** Menu detection stands down
+   when a family classifier says another grammar owns the screen, so that classifier must be
+   answerable from the dialog it names, its title or its body, not from one line any screen may
+   print. Claude's `/effort` slider prints "Enter to confirm", was filed as the folder-trust prompt
+   on that phrase alone, and lost every button it had
+   ([ADR 0053](./.adr/0053-an-unread-dialog-still-has-a-way-out.md)).
+7. **A POINTED list is walked, not numbered.** The same arithmetic covers a modal that prints a
+   column of unnumbered rows with a `❯` on one of them and a commit key in its footer: a tap is the
+   arrow walk from the pointed row to the target row, then that commit key. The action layer does
+   not send that plan as one batch: it splits it with `splitWalk` (`(Up|Down|Left|Right)* Enter`, so a
+   row of chips walks `Right` the way a column walks `Down`), sends the arrows bound to the
+   tapped screen, sends the commit key only after a fresh read shows the pointer on the tapped row,
+   and binds that key to the read ([ADR 0080](./.adr/0080-a-pointed-list-is-walked-verified-then-confirmed.md)).
+   Build the plan with `pointerWalk`, carry the pointer verbatim in `signature` and blank it in
+   `coreSignature`, and never shape a plan to survive a race: the action layer does that for every
+   harness. If the pointer is only a style (a background colour), the signature cannot carry it, so
+   the plans do: `promptsEqual` compares them exactly, and the verify read on the phone is the guard.
+   **A grammar whose pointer or current dialog step is identified only by style MUST set
+   `styledSignature`**: the canonical styled lines of the same rows as `signature`, from
+   `canonicalStyledLines` in `web/src/lib/styled-region.ts`
+   (call it on the region's StyledLines, never hand-roll a projection). The bridge's text binding
+   cannot see a colour, so the phone sends `styledSignature` as `expected_styled` and the bridge
+   compares the colours of the very read it is about to answer
+   ([ADR 0080](./.adr/0080-a-pointed-list-is-walked-verified-then-confirmed.md) point 7). The
+   conformance suite enforces it for style-only pointer walks: for every declared walk pair whose
+   two `signature` strings are equal, both models must carry different `styledSignature` values,
+   and the bridge verifier must accept each in its raw capture and refuse the other capture. A
+   style-only step, such as the active OMP Ask tab, also needs an identical-text/different-step
+   regression. A glyph pointer needs no styled binding unless another identity cue is style-only.
+   An older bridge ignores the field and an older phone sends none, so a mixed pair still works.
+   **A grammar that reads its dialog from part of each row, because
+   something beside it on the same rows moves on its own, sets `bindColumns`** (the columns it read,
+   `web/src/lib/column-range.ts`), and `signature` holds exactly those columns of each row. The phone
+   sends it as `expected_columns`, and the bridge cuts its read to the same columns before it
+   compares. Oh My Pi's side panel is the one case today (`pi/panel.ts`, `pi/index.ts`), and the
+   conformance suite checks that the bridge's own verifier finds such a region in its raw capture.
+   An older bridge ignores the field and compares whole rows, which refuses the tap.
+   **`coreSignature` must blank everything the pointer's own move changes**: the glyph, and
+   any text that follows the pointer, such as a detail row under the list, a description of the
+   highlighted row or a "(n/m)" position counter. Text that follows the pointer makes the verify step
+   see another dialog after every walk, so a walked tap answers `changed` and never commits (the omp
+   `/switch` picker did exactly this). The corpus must prove it: capture the dialog twice with the
+   pointer on different rows and declare the pair in `web/src/lib/harness/walk-pairs.ts`. The
+   conformance suite checks that every grammar with walked plans has such a pair, or a listed gap.
+   Text that changes with the clock when the screen redraws, such as a relative age (`1 minute ago`),
+   is the same class: blank it in `coreSignature`, and only there, so `signature` stays verbatim and
+   the entry guard still refuses a screen whose age ticked. Blank the one token your own row parse
+   found, not a pattern over the whole region (the two `/resume` grammars are the reference).
+   **Twin rows keep their ages:** when two or more rows are identical in title AND in the rest of
+   their meta row apart from the age, the age is all that tells them apart, so `coreSignature` keeps
+   the ages of THOSE rows verbatim (every other row still gets the token). A tick on a twin then
+   answers `changed`, the safe side, and a re-sort that swaps twins can never pass identity.
+   **Every blank is a safety decision**, because `coreSignature` is the only link between the dialog
+   the user tapped and the Enter that is committed after the walk. Ship mutation tests for both
+   directions, starting from a real capture and changing one thing: what the blank must HOLD (every
+   age shifted across a width change, a detail row replaced) and what it must REFUSE (a title, size,
+   id, badge or mark changed, a row removed, two rows swapped, an age-shaped string inside a title).
+   The three tests for `claude/resume.ts`, `omp/resume.ts` and `omp/switch.ts` are the reference. The
+   walk-pair gaps in `walk-pairs.ts` only shrink: the set of gap keys is pinned in
+   `conformance.test.ts`, so a new gap is a reviewed decision and a second capture is the fix.
+   Claude's folder-trust prompt is the reference case since 2.1.278 — it prints no digit, so none may
+   be synthesised, and ADR 0009 holds here exactly as it does above
+   ([ADR 0055](./.adr/0055-a-pointed-list-is-walked-then-confirmed.md)). Two things are load-bearing.
+   The arrow COUNT is a claim about where the pointer was, so the kind's committing comparator must
+   see the pointer row, or a highlight moved by a second device sends the wrong number of arrows.
+   And the row a bare commit key would take is the DEFAULT, which on the trust prompt quits the
+   agent, so the card has to show which row it is. This lift lives in Claude's prompt-select grammar
+   rather than in the generic menu, because a walk is only safe when the dialog is one you have
+   modelled; the menu's own bar (only the keys the footer named) is unchanged.
+
+## Every dialog model is a contract, and the race guard is generic
+
+Menus were the first grammar written this way; **all five now are**. Each block kind's payload lives
+in its own harness-neutral module — [`prompt-model.ts`](./web/src/lib/harness/prompt-model.ts),
+[`wizard-model.ts`](./web/src/lib/harness/wizard-model.ts),
+[`preview-model.ts`](./web/src/lib/harness/preview-model.ts),
+[`multi-select-model.ts`](./web/src/lib/harness/multi-select-model.ts),
+[`menu-model.ts`](./web/src/lib/harness/menu-model.ts) — alongside the **identity comparators** that
+say when two derivations are the same dialog. Those comparators are part of the contract, not an
+implementation detail: their per-kind nuances (a menu ARROW ignores the `←/→` label it is about to
+change; the multi-select Submit walk ignores the pointer it moves but *not* a checkbox flipped by a
+second device; the preview note flow ignores the note it is editing) are what keeps a guarded tap
+from being either unsafe or unusable. [`dialog-contract.ts`](./web/src/lib/harness/dialog-contract.ts)
+is the table that wires kind → `{commits, identity, signature, region}`.
+
+The consequence for you: **you write no race guard.** One generic guard
+([`lib/dialog-guard.ts`](./web/src/lib/dialog-guard.ts)) re-derives the fresh pane through
+`adapterFor(agent).buildBlocks` — your pipeline, not anyone's detector — and compares through the
+kind's contract before a key goes out. Emit a block kind and its guard, its renderer and its
+conformance invariants come with it; there is nothing per-harness left to implement, and nothing in
+`lib/` may import a `detect*` function again.
+
+What that costs you is one promise per model, pinned by `describeAdapterConformance`: a **non-empty
+signature that moves when a row the dialog was derived from changes** (Hangar's `revision` is a stub —
+this is the entire freshness check), and a non-empty region text that is literally on screen (the
+bridge binds the write to it).
+
+**The region must end inside the bridge's tail window, six non-blank rows.** When your harness paints
+live chrome of its own under a dialog (Hermes keeps a spinner, a countdown, a status bar and the input
+under every panel), never stretch the region down over rows that tick: every tap would then answer
+"changed". Bind the dialog alone, account for every row below it in the grammar, and declare the
+window with `bindTail` from `tailLinesFor` in `web/src/lib/tail-lines.ts`. The phone sends it as
+`expected_tail_lines`, which the bridge accepts from 6 to 12 rows
+([ADR 0108](./.adr/0108-a-dialog-over-live-chrome-declares-its-tail.md)). The conformance suite
+checks both that the declared window binds and that the default one would not.
+
+## The two gates
+
+- **CI gate — the conformance suite.**
+  [`web/src/lib/harness/conformance.ts`](./web/src/lib/harness/conformance.ts) exports
+  `describeAdapterConformance(adapter, { ownFixtures, foreignFixtures, neutralFixtures })`. Call it
+  from your adapter's `*.test.ts` (see
+  [`conformance.test.ts`](./web/src/lib/harness/conformance.test.ts)). It asserts: conservative
+  detection (raw-only on foreign + neutral buffers), tail-anchoring (a dialog lifts only
+  at the tail), the menu contract above (for any fixture that lifts one), the dialog-model contract
+  (for every kind you up-level: signature non-empty, text-sensitive, and its comparators agreeing —
+  a perturbed screen must fail the committing comparison), the composer-region pairing (if you supply
+  the optional `composerPrompt` — the on-screen row a destructive write is bound to via
+  `expected_prompt` — it must name a region on exactly the screens your `composerReady` approves), and
+  key-grammar validity (every emittable keystroke passes `isValidHerdrKey` — the
+  verified `pane.send_keys` grammar: single-digit only, `ctrl+c` not `C-c`, no
+  `PageUp`/`Home`/`End`/`Delete`).
+- **Safety gate — the capability fence.** The live enforcement is
+  [`web/src/lib/harness/fence.test.ts`](./web/src/lib/harness/fence.test.ts): it fails the build if any
+  module under `harness/` except `guard.ts` imports the network API (`@/lib/api` or a relative
+  `…/api`), matching the specifier anywhere in the file so a Prettier line-wrapped import can't slip
+  through. It runs under `bun run test` (which the pre-push hook runs). The `no-restricted-imports`
+  rule in [`web/eslint.config.mjs`](./web/eslint.config.mjs) encodes the same fence but is
+  **aspirational** — no ESLint runner is wired yet, so it does not execute; the test is the real gate.
+
+Run both — and the full suite — with `cd web && bun run test`; typecheck with `bunx tsc --noEmit`.

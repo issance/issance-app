@@ -1,0 +1,282 @@
+import { describe, expect, test } from "vitest";
+
+import { decidePush, hostSlot, localisedTitle, notificationPath, tagFor } from "@/lib/push-decision";
+import { scopeSearch } from "@/lib/scope";
+
+describe("decidePush", () => {
+  test("a clear retracts the slot regardless of client visibility", () => {
+    const expected = { kind: "clear", tag: "issance:herd" };
+    expect(decidePush({ type: "clear", tag: "issance:herd" }, false)).toEqual(expected);
+    expect(decidePush({ type: "clear", tag: "issance:herd" }, true)).toEqual(expected);
+  });
+
+  test("suppresses a show when a issance tab is visible", () => {
+    expect(decidePush({ title: "claude needs you", tag: "issance:herd" }, true)).toEqual({
+      kind: "suppress",
+    });
+  });
+
+  // A machine's sustained load is the one push no visible tab stands in for: the in-app status speaks
+  // for panes, not machines. It shows whether or not a issance tab is open, and carries the machine.
+  test("a machine alert is shown even while a issance tab is visible", () => {
+    const payload = {
+      type: "machine" as const,
+      title: "laptop: CPU high",
+      body: "94% for 5 min",
+      tag: "issance:machine@laptop",
+      renotify: true,
+      data: { target: "machine", machine: "laptop" },
+    };
+    const shown = {
+      kind: "show",
+      title: "laptop: CPU high",
+      body: "94% for 5 min",
+      tag: "issance:machine@laptop",
+      target: "machine",
+      machine: "laptop",
+      renotify: true,
+    };
+    expect(decidePush(payload, true)).toMatchObject(shown);
+    expect(decidePush(payload, false)).toMatchObject(shown);
+  });
+
+  test("other typed pushes are still suppressed by a visible tab", () => {
+    expect(decidePush({ type: "update", title: "update", tag: "issance:update" }, true)).toEqual({ kind: "suppress" });
+  });
+
+  test("shows with the bridge-provided tag, renotify, and deep-link paneId", () => {
+    expect(
+      decidePush(
+        {
+          title: "2 agents need you",
+          body: "claude, codex",
+          tag: "issance:herd",
+          renotify: true,
+          data: { paneId: "p1" },
+        },
+        false,
+      ),
+    ).toEqual({
+      kind: "show",
+      title: "2 agents need you",
+      body: "claude, codex",
+      tag: "issance:herd",
+      paneId: "p1",
+      renotify: true,
+    });
+  });
+
+  test("falls back to a per-pane tag, default title, empty body, and renotify off", () => {
+    expect(decidePush({ data: { paneId: "test" } }, false)).toEqual({
+      kind: "show",
+      title: "issance",
+      body: "",
+      tag: "issance:test",
+      paneId: "test",
+      renotify: false,
+    });
+  });
+
+  test("a push with no paneId and no tag shares the generic 'issance' slot", () => {
+    expect(decidePush({ title: "hi" }, false)).toMatchObject({
+      kind: "show",
+      tag: "issance",
+      paneId: undefined,
+    });
+  });
+
+  test("carries a settings target through so the tap can route there", () => {
+    expect(
+      decidePush(
+        {
+          title: "issance 0.12.0 available",
+          body: "issance-ctl.sh update",
+          data: { target: "settings" },
+        },
+        false,
+      ),
+    ).toMatchObject({
+      kind: "show",
+      title: "issance 0.12.0 available",
+      target: "settings",
+      paneId: undefined,
+    });
+  });
+
+  test("carries a peer's host through to the show decision, for the deep-link", () => {
+    expect(
+      decidePush(
+        {
+          title: "claude needs you",
+          tag: "issance:herd@box2",
+          data: { paneId: "w1:p1", host: "box2", session: "demo" },
+        },
+        false,
+      ),
+    ).toMatchObject({ kind: "show", tag: "issance:herd@box2", paneId: "w1:p1", host: "box2", session: "demo" });
+  });
+
+  test("a lead push carries no host — the pre-crew decision, unchanged", () => {
+    const decision = decidePush({ title: "claude needs you", data: { paneId: "w1:p1" } }, false);
+    // SAFETY: the case asserts a field the union's "show" arm does not declare — that ABSENCE is
+    // the invariant (a lead push carries no host), so it has to be read off the value to be pinned.
+    expect((decision as { host?: string }).host).toBeUndefined();
+  });
+
+  // The only new way to strand a notification forever: a retraction computing a different slot than
+  // the render did leaves it on the lock screen with nothing left that can ever close it.
+  test("a clear resolves the same host-qualified slot its render produced", () => {
+    const data = { paneId: "w1:p1", host: "box2" };
+    const shown = decidePush({ title: "claude needs you", data }, false);
+    const cleared = decidePush({ type: "clear", data }, true);
+    // SAFETY: `shown` is the "show" decision produced two lines above (the input carried a title,
+    // not `type: "clear"`), and every show decision carries a `tag`.
+    expect(cleared).toEqual({ kind: "clear", tag: (shown as { tag: string }).tag });
+    expect(cleared).toEqual({ kind: "clear", tag: "issance@box2:w1:p1" });
+    // …and the bridge-supplied tag still wins over the fallback, in both directions.
+    expect(decidePush({ type: "clear", tag: "issance:herd@box2", data }, false)).toEqual({
+      kind: "clear",
+      tag: "issance:herd@box2",
+    });
+  });
+
+  test("an agent push carries no target (defaults to the pane deep-link path)", () => {
+    const decision = decidePush({ title: "claude needs you", data: { paneId: "p1" } }, false);
+    expect(decision).toMatchObject({ kind: "show", paneId: "p1" });
+    // SAFETY: as above — the absence of `target` is what the case pins, so it must be read.
+    expect((decision as { target?: string }).target).toBeUndefined();
+  });
+});
+
+describe("localisedTitle — the headline in this device's language (ADR 0074)", () => {
+  const korean = { "agent.blocked": "{agent} 입력 대기", "herd.done": "에이전트 {count}개 작업 완료" };
+
+  test("a known code with a stored template is filled from the push's own detail", () => {
+    const push = { title: "claude needs you", titleCode: "agent.blocked", titleDetail: { agent: "claude" } };
+    expect(localisedTitle(push, korean)).toBe("claude 입력 대기");
+    expect(decidePush(push, false, korean)).toMatchObject({ kind: "show", title: "claude 입력 대기" });
+  });
+
+  test("a number fills its slot as written", () => {
+    const push = { title: "3 agents done", titleCode: "herd.done", titleDetail: { count: 3 } };
+    expect(decidePush(push, false, korean)).toMatchObject({ title: "에이전트 3개 작업 완료" });
+  });
+
+  test("every miss falls through to the bridge's English, never to a key or a blank", () => {
+    // No code: an older bridge, or a title the operator typed with `issance push-test`.
+    expect(decidePush({ title: "hello" }, false, korean)).toMatchObject({ title: "hello" });
+    // A code a newer bridge invented, which this build cannot know.
+    const newer = { title: "claude is thinking", titleCode: "agent.thinking", titleDetail: { agent: "claude" } };
+    expect(decidePush(newer, false, korean)).toMatchObject({ title: "claude is thinking" });
+    // A known code the stored table has no template for (the page has not run since install).
+    const unstored = { title: "claude is done", titleCode: "agent.done", titleDetail: { agent: "claude" } };
+    expect(decidePush(unstored, false, korean)).toMatchObject({ title: "claude is done" });
+    // No table at all: the call every existing caller makes.
+    expect(decidePush(unstored, false)).toMatchObject({ title: "claude is done" });
+  });
+
+  test("a retraction is untouched by a table", () => {
+    expect(decidePush({ type: "clear", tag: "issance:herd" }, false, korean)).toEqual({
+      kind: "clear",
+      tag: "issance:herd",
+    });
+  });
+});
+
+describe("tagFor", () => {
+  test("per-pane vs generic slot", () => {
+    expect(tagFor("p1")).toBe("issance:p1");
+    expect(tagFor(undefined)).toBe("issance");
+  });
+
+  // Two machines' identical pane ids must not coalesce into one slot, where a peer's alert would
+  // silently replace the lead's.
+  test("a peer's fallback slot is host-qualified; the lead's is untouched", () => {
+    expect(tagFor("p1", "box2")).toBe("issance@box2:p1");
+    expect(tagFor(undefined, "box2")).toBe("issance@box2");
+    expect(tagFor("p1", undefined)).toBe("issance:p1");
+    expect(tagFor("p1", "box2")).not.toBe(tagFor("p1", "box3"));
+  });
+});
+
+// The frontend half of bridge/crew/tags.ts. The bridge writes the tag on a render and this file
+// re-derives it on a fallback and on a retraction, so the two derivations must agree by
+// construction, not by two string templates that happen to match today.
+describe("hostSlot", () => {
+  test("reproduces the bridge's crew herd slots exactly", () => {
+    expect(hostSlot("issance:herd")).toBe("issance:herd"); // the lead's own — must never move
+    expect(hostSlot("issance:herd", "laptop")).toBe("issance:herd@laptop");
+    expect(`${hostSlot("issance:herd", "laptop")}:demo`).toBe("issance:herd@laptop:demo");
+  });
+
+  // The injectivity argument from bridge/crew/tags.ts, as a test: a member id can hold neither `@`
+  // nor `:`, so the character after the base discriminates a peer's slot from a local session's.
+  test("a local session cleverly named like a host cannot collide with that host's slot", () => {
+    expect(`${hostSlot("issance:herd")}:@laptop`).not.toBe(hostSlot("issance:herd", "laptop"));
+  });
+});
+
+describe("notificationPath — where a tap lands", () => {
+  test("a peer's pane deep-links to that machine, in the canonical param order", () => {
+    expect(notificationPath({ paneId: "w1:p1", host: "box2", session: "demo" })).toBe(
+      "/pane/w1%3Ap1?h=box2&s=demo",
+    );
+    expect(notificationPath({ paneId: "w1:p1", host: "box2" })).toBe("/pane/w1%3Ap1?h=box2");
+  });
+
+  // The whole backward-compatibility story in one assertion: nothing about a lead-only crew changed.
+  test("the lead emits today's bytes — no host param anywhere", () => {
+    expect(notificationPath({ paneId: "w1:p1" })).toBe("/pane/w1%3Ap1");
+    expect(notificationPath({ paneId: "w1:p1", session: "demo" })).toBe("/pane/w1%3Ap1?s=demo");
+    expect(notificationPath({})).toBe("/");
+    expect(notificationPath({ paneId: "test" })).toBe("/"); // the push-test payload
+  });
+
+  // The update push opens the UPDATES page, not Settings — that is where the check, the card, the
+  // peers and the one button live (M16/01). Unscoped on purpose: an update is about the machine
+  // the phone is talking to, and `host` must not send the tap somewhere else.
+  // A machine alert (ADR 0084) opens that machine's page, keyed by the crew member id in `host`.
+  test("a machine alert opens that machine, not a pane", () => {
+    expect(notificationPath({ target: "machine", machine: "laptop" })).toBe("/machines/laptop");
+    expect(notificationPath({ target: "machine", machine: "local" })).toBe("/machines/local");
+    expect(notificationPath({ target: "machine", machine: "a b/c" })).toBe("/machines/a%20b%2Fc");
+    expect(notificationPath({ target: "machine" })).toBe("/machines");
+  });
+
+  // `host` names where a PANE lives. A machine alert carries `machine`, and a stray `host` must not
+  // pick the page: it would send the tap to the wrong machine, or to a page for a pane's host.
+  test("a machine alert reads data.machine and never data.host", () => {
+    expect(notificationPath({ target: "machine", machine: "laptop", host: "box2" })).toBe("/machines/laptop");
+    expect(notificationPath({ target: "machine", host: "box2" })).toBe("/machines");
+  });
+
+  test("update push opens updates, unscoped", () => {
+    expect(notificationPath({ target: "settings", host: "box2" })).toBe("/settings/updates");
+  });
+
+  // The WIRE value stays `"settings"` while the destination moves. An old cached service worker
+  // holds its own copy of this function and lands on `/settings`, one row from the page it wanted;
+  // renaming the field would have sent it to `/` instead.
+  test("the wire spelling is unchanged, so an old SW degrades one row away", () => {
+    expect(notificationPath({ target: "settings" })).toBe("/settings/updates");
+    expect(notificationPath({ target: "updates" })).toBe("/");
+  });
+
+  // sw.ts compares the URL it builds against an open client's URL (`client.url !== url`) and
+  // navigates when they differ. A differently-ordered but semantically identical query would make
+  // every tap on an already-open pane re-navigate it, so the SW must not have its own builder — this
+  // pins that the query half IS scopeSearch's output.
+  test("the query is lib/scope's, byte for byte — no second builder in the SW", () => {
+    for (const scope of [
+      {},
+      { session: "demo" },
+      { host: "box2" },
+      { host: "box2", session: "demo" },
+      { host: "a b", session: "c&d" },
+    ]) {
+      expect(notificationPath({ paneId: "w1:p1", ...scope })).toBe(
+        `/pane/w1%3Ap1${scopeSearch(scope)}`,
+      );
+    }
+  });
+});

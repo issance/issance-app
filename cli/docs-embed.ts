@@ -1,0 +1,216 @@
+// The operator manual, embedded in the binary at build time.
+//
+// WHY EMBEDDED, AND NOT READ OFF DISK. A disk read has to resolve a checkout root, and
+// `bridge/root.ts` says what that costs: it needs the `herdr-plugin.toml` marker beside the
+// install. One install kind does not keep `docs/` under the install root at all — the Arch package
+// installs those pages to `/usr/share/doc/issance/docs`, on the stated assumption that nothing reads
+// them at run time. So a disk read is right on a checkout, right on the tarball, right on the Nix
+// build, and broken on that one. Embedding is right on all four, and it makes the printed text match
+// the binary's own version by construction.
+//
+// What `issance docs` prints is therefore a COMPILE-TIME SNAPSHOT, and that is intended. It reports
+// what this binary was built with, never the checkout on disk — which is the whole reason a packaged
+// install, where there is no checkout to read, answers at all. Nobody turns this back into a disk
+// read later.
+//
+// THIS IS THE ONLY MODULE THAT SPELLS A `docs/` PATH. `cli/docs-embed.test.ts` fails when a page
+// lands in `docs/` without a line below. The root contributor specifications are deliberately not
+// here: the largest of them is 194 KB on its own, and an agent that needs them has the checkout.
+
+import changes from "../docs/changes.md" with { type: "text" };
+import claudeCodeOnYourPhone from "../docs/claude-code-on-your-phone.md" with { type: "text" };
+import commands from "../docs/commands.md" with { type: "text" };
+import crew from "../docs/crew.md" with { type: "text" };
+import configure from "../docs/configure.md" with { type: "text" };
+import deployment from "../docs/deployment.md" with { type: "text" };
+import durableAgents from "../docs/durable-agents.md" with { type: "text" };
+import durableAgentsOnThePhone from "../docs/durable-agents-on-the-phone.md" with { type: "text" };
+import durableAgentsSecurity from "../docs/durable-agents-security.md" with { type: "text" };
+import durableAgentsTroubleshooting from "../docs/durable-agents-troubleshooting.md" with { type: "text" };
+import durableSdk from "../docs/durable-sdk.md" with { type: "text" };
+import durableWire from "../docs/durable-wire.md" with { type: "text" };
+import fiveMinuteInstall from "../docs/five-minute-install.md" with { type: "text" };
+import install from "../docs/install.md" with { type: "text" };
+import multiplexers from "../docs/multiplexers.md" with { type: "text" };
+import security from "../docs/security.md" with { type: "text" };
+import sessions from "../docs/sessions.md" with { type: "text" };
+import terminology from "../docs/terminology.md" with { type: "text" };
+import themes from "../docs/themes.md" with { type: "text" };
+import troubleshooting from "../docs/troubleshooting.md" with { type: "text" };
+import upgrading from "../docs/upgrading.md" with { type: "text" };
+import voiceAndPush from "../docs/voice-and-push.md" with { type: "text" };
+import walkyTalky from "../docs/walky-talky.md" with { type: "text" };
+import windows from "../docs/windows.md" with { type: "text" };
+
+// The agent-facing brief, which is not one of the pages: it is hand-written, it carries two
+// placeholder tokens `cli/docs.ts` fills at print time, and `issance skill` prints it alone.
+import SKILL_TEMPLATE from "./skill.md" with { type: "text" };
+
+// The walky talky skill an installer writes into a harness (`cli/skill-install.ts`). Its placeholders
+// are filled when it is rendered for a target, not when it is printed.
+import WALKY_TALKY_SKILL_TEXT from "./skills/walky-talky.md" with { type: "text" };
+
+/**
+ * The skill template with LF line ends. A Windows checkout with autocrlf hands the import CRLF, and a
+ * `\r` in the rendered text would break the trust lines and make every installed copy read `stale`.
+ * The template is written as text for a harness, so LF is its only form.
+ */
+const WALKY_TALKY_SKILL_TEMPLATE = WALKY_TALKY_SKILL_TEXT.replaceAll("\r\n", "\n");
+
+export { SKILL_TEMPLATE, WALKY_TALKY_SKILL_TEMPLATE };
+
+export interface DocPage {
+  /** The file stem, which is the name an operator types: `crew` for `docs/crew.md`. */
+  readonly name: string;
+  /** One line, for the table `issance skill` prints. The title comes from the page itself. */
+  readonly purpose: string;
+  /** The page, verbatim. */
+  readonly text: string;
+}
+
+/**
+ * Every page in an OPERATOR'S READING ORDER: the five-minute guide first, troubleshooting
+ * last — and never alphabetically. `issance docs` lists them in this order and `issance docs --all` prints them in it.
+ */
+export const DOC_PAGES: readonly DocPage[] = [
+  {
+    name: "five-minute-install",
+    purpose: "The recommended setup end to end: Tailscale, Hangar, issance, and a paired phone",
+    text: fiveMinuteInstall,
+  },
+  {
+    name: "install",
+    purpose: "Requirements, the two routes in, first run, and opening it on your phone",
+    text: install,
+  },
+  {
+    name: "windows",
+    purpose: "Windows 11 with Hangar: what is supported, the unsigned binary, updating, and the limits",
+    text: windows,
+  },
+  {
+    name: "claude-code-on-your-phone",
+    purpose: "One path end to end: Claude Code in a pane, answered from your phone",
+    text: claudeCodeOnYourPhone,
+  },
+  {
+    name: "changes",
+    purpose: "What an agent changed: the changed files, their diffs and the last commit, read-only",
+    text: changes,
+  },
+  {
+    name: "configure",
+    purpose: "The `.env`, your own commands, keys, quick replies, typefaces and language",
+    text: configure,
+  },
+  {
+    name: "commands",
+    purpose: "Every verb, putting `issance` on your PATH, and the Hangar actions that mirror them",
+    text: commands,
+  },
+  {
+    name: "crew",
+    purpose: "Several machines behind one URL: invite, join, deputy, failover",
+    text: crew,
+  },
+  {
+    name: "durable-agents",
+    purpose: "Show your own durable agent on your phone: attach it, its tokens, its files, its versions",
+    text: durableAgents,
+  },
+  {
+    name: "durable-agents-on-the-phone",
+    purpose: "What a durable agent's section, conversations, questions and receipts look like on the phone",
+    text: durableAgentsOnThePhone,
+  },
+  {
+    name: "durable-agents-troubleshooting",
+    purpose: "A durable agent that does not show up or says Unreachable: first checks, every reason, doctor rows, cases",
+    text: durableAgentsTroubleshooting,
+  },
+  {
+    name: "durable-agents-security",
+    purpose: "What a durable agent can and cannot do, the trust rules per transport, text cleaning, the audit log",
+    text: durableAgentsSecurity,
+  },
+  {
+    name: "durable-sdk",
+    purpose: "Every part of the npm package a durable agent uses: entries, panes, questions, hooks, caps",
+    text: durableSdk,
+  },
+  {
+    name: "durable-wire",
+    purpose: "What travels between issance and a durable agent: routes, hello, asks, transports, limits",
+    text: durableWire,
+  },
+  {
+    name: "upgrading",
+    purpose: "Update from the phone or the terminal, roll back, update a crew, cross a major",
+    text: upgrading,
+  },
+  {
+    name: "sessions",
+    purpose: "What a session is, and where sessions come from: a terminal or a durable agent",
+    text: sessions,
+  },
+  {
+    name: "multiplexers",
+    purpose: "Pointing issance at Hangar, tern, tmux, zellij or tuios, and what each terminal can answer",
+    text: multiplexers,
+  },
+  {
+    name: "walky-talky",
+    purpose: "Messages between agent sessions: who, send, reply, inbox, receipts, the phone, the skill and limits",
+    text: walkyTalky,
+  },
+  {
+    name: "voice-and-push",
+    purpose: "The microphone in the composer, and notifications when an agent waits on you",
+    text: voiceAndPush,
+  },
+  {
+    name: "themes",
+    purpose: "Pick, import, export and write a theme: colours, shape, look and terminal palette",
+    text: themes,
+  },
+  {
+    name: "security",
+    purpose: "What a issance exposes, the defences, and pairing a device as the write credential",
+    text: security,
+  },
+  {
+    name: "deployment",
+    purpose: "Front doors other than the default, and several Collies on one host",
+    text: deployment,
+  },
+  {
+    name: "terminology",
+    purpose: "issance's words in plain words, beside the names other tools use",
+    text: terminology,
+  },
+  {
+    name: "troubleshooting",
+    purpose: "Symptoms in the words you would actually search for",
+    text: troubleshooting,
+  },
+];
+
+/**
+ * Old names an operator may still type, each pointing at the page that carries the text now.
+ *
+ * `issance docs pack` printed the crew page for every release up to 1.6.0, and ADR 0038 keeps that
+ * name working until 2.0.0. An alias is deliberately NOT a `DOC_PAGES` entry: the registry is one
+ * row per file on disk, `cli/docs-embed.test.ts` asserts exactly that, and the table `issance skill`
+ * prints lists the name to learn, not the name to unlearn.
+ */
+export const DOC_PAGE_ALIASES = { pack: "crew" } as const satisfies Readonly<Record<string, string>>;
+
+function isDocPageAlias(name: string): name is keyof typeof DOC_PAGE_ALIASES {
+  return name in DOC_PAGE_ALIASES;
+}
+
+/** The page an operator asked for, by registry name or by an old name from `DOC_PAGE_ALIASES`. */
+export function findDocPage(name: string): DocPage | undefined {
+  const stem = isDocPageAlias(name) ? DOC_PAGE_ALIASES[name] : name;
+  return DOC_PAGES.find((p) => p.name === stem);
+}

@@ -1,0 +1,299 @@
+#!/usr/bin/env bun
+// harness-drift — compares each ledger agent's INSTALLED CLI version against the version issance's
+// readers were last verified on (`web/src/lib/harness/verified-versions.json`, M37 spec 01).
+//
+// 2026-09-26: Claude Code 2.1.283 and Codex 0.156.1 both broke dialog reading the same day they
+// updated, and every test stayed green because they run on frozen captures only. This is the
+// mechanical half of the fix — the ledger says what was verified, this prints what has moved.
+//
+// ONE ROW PER READER, not per agent (M41 spec 05). An agent has up to two readers of two different
+// things: the SCREEN grammar under `web/src/lib/harness/`, and the JOURNAL grammar under
+// `bridge/journal/` that Chat draws from. A vendor can change what it paints without changing what it
+// writes, or the other way about, so the two are verified apart and drift apart — one row could only
+// have reported one of them, and a `same` on the screen reader says nothing about Chat.
+//
+//   bun scripts/harness-drift.ts               table, one row per ledger reader, exit 0 always
+//   bun scripts/harness-drift.ts --json         the same rows as JSON
+//   bun scripts/harness-drift.ts --strict       exit 1 when any installed agent reads NEWER
+//   bun scripts/harness-drift.ts --agent a,b    only these ledger agents
+//   bun scripts/harness-drift.ts --strict --accept-drift claude=2.1.301
+//                                               name a drift on purpose (M44 spec 08, the soft release gate)
+//
+// THE SOFT RELEASE GATE. `--strict` exits 1 and names each agent that is newer than its ledger line.
+// `--accept-drift agent=version` lets one named drift pass: the version must be the INSTALLED one, so
+// a stale override covers nothing, and an override for one agent never covers another. A missing agent
+// never blocks. The gate starts no agent and makes no network call. It is a reminder, not proof: it
+// sees only the agents installed on this machine. `HARNESS_DRIFT_FAKE="claude=99.0.0"` stands in for
+// the installed version, for a rehearsal and for the tests.
+//
+// READ-ONLY. The only process this script starts is `<agent> --version`, bounded at
+// {@link VERSION_TIMEOUT_MS}. It opens no Hangar session, sends no keystroke, and runs no `issance`
+// verb — an agent absent from PATH just reads "not installed".
+
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { branchInClone } from "./harness-canary/lab/clone.ts";
+import { findRow, ledgerPath, readLedger } from "./harness-canary/lab/lab-ledger.ts";
+
+type How = "canary" | "live sweep" | "capture" | "unverified";
+
+/** One reader's line: the same three facts about a different grammar. */
+interface ReaderLine {
+  version: string;
+  verified: string;
+  how: How;
+  evidence: string;
+}
+
+interface LedgerEntry extends ReaderLine {
+  adapter: boolean;
+  /** The journal reader's line, present exactly where this build can read that agent's log. */
+  journal?: ReaderLine;
+}
+
+interface Ledger {
+  agents: Record<string, LedgerEntry>;
+}
+
+export type DriftState = "same" | "NEWER, run the canary" | "older" | "not installed";
+
+/** `agent=version` pairs, from a comma list. Throws on a pair that is not one. */
+export function parsePairs(text: string, what: string): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const part of text.split(",").map((piece) => piece.trim()).filter((piece) => piece.length > 0)) {
+    const at = part.indexOf("=");
+    const agent = at < 0 ? "" : part.slice(0, at);
+    const version = at < 0 ? "" : part.slice(at + 1);
+    if (agent.length === 0 || !VERSION_PATTERN.test(version) || version.split(".").length !== 3) {
+      throw new Error(`${what} takes agent=x.y.z pairs, not "${part}"`);
+    }
+    out.set(agent, version);
+  }
+  return out;
+}
+
+/**
+ * What the nightly lab (M56 spec 10) wrote for this pair, as one sentence, or null when it has no row
+ * or its ledger cannot be read. A pass says "merge the branch" only when the branch is in the lab's clone.
+ */
+export function labNote(agent: string, version: string, file: string = ledgerPath(), branchExists: (branch: string) => boolean = (branch) => branchInClone(branch)): string | null {
+  try {
+    const row = findRow(readLedger(file), agent, version);
+    if (row === undefined) return null;
+    if (row.result !== "pass") return `the lab ran ${agent} ${version} on ${row.date} and the result is ${row.result}: ${row.note ?? "no note"}`;
+    const branch = `harness-lab/${agent}-${version}`;
+    return branchExists(branch)
+      ? `the lab passed ${agent} ${version} on ${row.date}: merge the branch ${branch} to verify it`
+      : `the lab passed ${agent} ${version} on ${row.date}, and the branch ${branch} is not in the lab clone: delete the ledger row to run it again`;
+  } catch {
+    return null;
+  }
+}
+
+/** The one release-notes line for a drift that was accepted. */
+export function driftLine(agent: string, version: string): string {
+  return `${agent} ${version} is newer than its verified version: not verified`;
+}
+
+/** Which grammar a row is about: the pane mirror, or the agent's own session log. */
+export type Reader = "screen" | "journal";
+
+export interface DriftRow {
+  agent: string;
+  reader: Reader;
+  installed: string | null;
+  verified: string;
+  state: DriftState;
+}
+
+/** A `--version` probe must never leave this script hanging on a broken or interactive binary. */
+const VERSION_TIMEOUT_MS = 5_000;
+const VERSION_PATTERN = /\d+\.\d+\.\d+/;
+
+const LEDGER_PATH = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "web",
+  "src",
+  "lib",
+  "harness",
+  "verified-versions.json",
+);
+
+export function loadLedger(path: string = LEDGER_PATH): Ledger {
+  const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+  // SAFETY: `verified-versions.json` is a checked-in, hand-authored file whose shape is pinned by
+  // `verified-versions.test.ts` (every registered adapter plus pi and hermes, a `journal` block for
+  // every journal adapter, `how` in the allowed set, plain `x.y.z` versions, ISO dates) — this
+  // script does not itself validate the shape.
+  return parsed as Ledger;
+}
+
+/**
+ * `<agent> --version`, bounded at {@link VERSION_TIMEOUT_MS}. Null when the binary is not on PATH,
+ * the probe times out, or neither stream carries a plain `x.y.z` — any of which reads as
+ * "not installed" to the caller, since none of them is a version this script can compare against.
+ */
+export function installedVersion(agent: string, env: Readonly<Record<string, string | undefined>> = process.env): string | null {
+  const fake = env.HARNESS_DRIFT_FAKE;
+  if (fake !== undefined && fake.length > 0) {
+    const faked = parsePairs(fake, "HARNESS_DRIFT_FAKE").get(agent);
+    if (faked !== undefined) return faked;
+  }
+  const bin = Bun.which(agent);
+  if (bin === null) return null;
+  try {
+    const result = Bun.spawnSync([bin, "--version"], {
+      timeout: VERSION_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    if (result.exitedDueToTimeout) return null;
+    const text = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+    return VERSION_PATTERN.exec(text)?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Numeric, per-segment compare of two plain `x.y.z` strings. Negative when `a` is older than `b`. */
+export function compareVersions(a: string, b: string): number {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  const width = Math.max(pa.length, pb.length);
+  for (let i = 0; i < width; i += 1) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff !== 0) return diff > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+export function driftState(installed: string | null, verified: string): DriftState {
+  if (installed === null) return "not installed";
+  const cmp = compareVersions(installed, verified);
+  if (cmp === 0) return "same";
+  return cmp > 0 ? "NEWER, run the canary" : "older";
+}
+
+/**
+ * The rows for one ledger entry: the screen reader's, then the journal reader's where it has one.
+ *
+ * The `--version` probe runs ONCE per agent however many readers it has — it starts a process, and
+ * two rows about one binary must not disagree about what is installed.
+ */
+export function driftRows(
+  agent: string,
+  entry: LedgerEntry,
+  probe: (agent: string) => string | null = installedVersion,
+): DriftRow[] {
+  const installed = probe(agent);
+  const row = (reader: Reader, line: ReaderLine): DriftRow => ({
+    agent,
+    reader,
+    installed,
+    verified: line.version,
+    state: driftState(installed, line.version),
+  });
+  const rows = [row("screen", entry)];
+  if (entry.journal !== undefined) rows.push(row("journal", entry.journal));
+  return rows;
+}
+
+interface Args {
+  json: boolean;
+  strict: boolean;
+  agents: string[] | null;
+  /** `--accept-drift` pairs: agent to the installed version the operator names as not verified. */
+  accept: Map<string, string>;
+}
+
+export function parseArgs(argv: readonly string[]): Args {
+  const json = argv.includes("--json");
+  const strict = argv.includes("--strict");
+  const at = argv.indexOf("--agent");
+  const agents =
+    at === -1
+      ? null
+      : (argv[at + 1] ?? "")
+          .split(",")
+          .map((a) => a.trim())
+          .filter((a) => a.length > 0);
+  const acceptAt = argv.indexOf("--accept-drift");
+  const accept = acceptAt === -1 ? new Map<string, string>() : parsePairs(argv[acceptAt + 1] ?? "", "--accept-drift");
+  return { json, strict, agents, accept };
+}
+
+export interface GateRows {
+  readonly blocked: DriftRow[];
+  readonly accepted: DriftRow[];
+}
+
+/** The drifted rows the gate stops on, and the ones an override covers. A row is covered only when the override names its agent AND its installed version. */
+export function gateRows(rows: readonly DriftRow[], accept: ReadonlyMap<string, string>): GateRows {
+  const blocked: DriftRow[] = [];
+  const accepted: DriftRow[] = [];
+  for (const row of rows) {
+    if (row.state !== "NEWER, run the canary") continue;
+    (row.installed !== null && accept.get(row.agent) === row.installed ? accepted : blocked).push(row);
+  }
+  return { blocked, accepted };
+}
+
+function printTable(rows: readonly DriftRow[]): void {
+  const agentWidth = Math.max(5, ...rows.map((r) => r.agent.length));
+  const readerWidth = Math.max(6, ...rows.map((r) => r.reader.length));
+  const installedWidth = Math.max(9, ...rows.map((r) => (r.installed ?? "—").length));
+  const verifiedWidth = Math.max(8, ...rows.map((r) => r.verified.length));
+  console.log(
+    `${"agent".padEnd(agentWidth)}  ${"reader".padEnd(readerWidth)}  ${"installed".padEnd(installedWidth)}  ${"verified".padEnd(verifiedWidth)}  state`,
+  );
+  for (const row of rows) {
+    console.log(
+      `${row.agent.padEnd(agentWidth)}  ${row.reader.padEnd(readerWidth)}  ${(row.installed ?? "—").padEnd(installedWidth)}  ${row.verified.padEnd(verifiedWidth)}  ${row.state}`,
+    );
+  }
+}
+
+export function selectRows(ledger: Ledger, agents: string[] | null): DriftRow[] {
+  const wanted = agents ?? Object.keys(ledger.agents);
+  const rows: DriftRow[] = [];
+  for (const agent of wanted) {
+    const entry = Object.hasOwn(ledger.agents, agent) ? ledger.agents[agent] : undefined;
+    if (entry === undefined) {
+      console.error(`harness-drift: "${agent}" is not in the ledger (web/src/lib/harness/verified-versions.json)`);
+      process.exit(1);
+    }
+    for (const row of driftRows(agent, entry)) rows.push(row);
+  }
+  return rows;
+}
+
+function main(argv: readonly string[]): void {
+  const { json, strict, agents, accept } = parseArgs(argv);
+  const ledger = loadLedger();
+  const rows = selectRows(ledger, agents);
+
+  if (json) {
+    console.log(JSON.stringify(rows, null, 2));
+  } else {
+    printTable(rows);
+  }
+
+  if (!strict) return;
+  const { blocked, accepted } = gateRows(rows, accept);
+  for (const line of new Set(accepted.map((row) => driftLine(row.agent, row.installed ?? "")))) console.error(`harness-drift: accepted: ${line}`);
+  if (blocked.length > 0) {
+    for (const row of blocked) {
+      console.error(`harness-drift: ${row.agent} ${row.installed ?? ""} is newer than ${row.verified}, its verified ${row.reader} version`);
+      const lab = row.installed === null ? null : labNote(row.agent, row.installed);
+      if (lab !== null) console.error(`harness-drift: ${lab}`);
+    }
+    const first = blocked[0];
+    console.error(`harness-drift: run the lab, or name the drift on purpose: --accept-drift ${first?.agent ?? "agent"}=${first?.installed ?? "x.y.z"}`);
+    process.exit(1);
+  }
+}
+
+if (import.meta.main) {
+  main(process.argv.slice(2));
+}

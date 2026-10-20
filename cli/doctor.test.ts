@@ -1,0 +1,2907 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
+
+import { CREW_PROTOCOL_VERSION } from "../bridge/crew/enrollment.ts";
+import { leadStore, member, CREW, peerStore, T0 } from "../bridge/crew/fixtures.ts";
+import { HOST, hostFor } from "../bridge/host.ts";
+import { markerFor } from "../bridge/crew/staleness.ts";
+import { serializeTrustStore, TrustStore, type TrustStoreData, type TrustStoreIo } from "../bridge/crew/trust-store.ts";
+import { fakeBeaconReader, FAKE_BEACON_NOW, type FakeBeacon } from "../bridge/beacon/fake.ts";
+import { BEACON_SCHEMA_VERSION } from "../bridge/beacon/types.ts";
+import type { JsonObject } from "../bridge/json.ts";
+import { FakeDurableProgram, SOCKET_ONLY_SKIP } from "../bridge/mux/durable/fixture.ts";
+import { SYSTEM_PROBE, type SocketProbe } from "../bridge/mux/durable/client.ts";
+import { BEACON_HOOKS } from "./beacon.ts";
+import { durableFindings } from "./durable-findings.ts";
+import type { CliContext } from "./context.ts";
+import {
+  cmdDoctor,
+  type DoctorDeps,
+  type Finding,
+  LONG_PATHS_KEY,
+  secretsPrivate,
+  windowsLongPaths,
+  windowsTask,
+} from "./doctor.ts";
+import type { AclTool, SaveResult } from "../bridge/icacls.ts";
+import type { OwnerOnlyDeps } from "../bridge/owner-only.ts";
+import { HOOK_MARKER, HOOK_MARKER_PREFIX } from "./hooks.ts";
+import type { LinkProbe } from "./link.ts";
+import type { DoctorView, Ui } from "./render.ts";
+import {
+  capture,
+  context,
+  CONFIG,
+  fakeExec,
+  fakeFiles,
+  fakeLinkFs,
+  HOME,
+  ROOT,
+  type Scripted,
+  type SeededFiles,
+  STATE,
+} from "./fakes.ts";
+import { EXIT } from "./io.ts";
+import type { PairedDevice } from "../bridge/pairing.ts";
+import { POWERSHELL_UTF8 } from "./sys.ts";
+import { collieBinary } from "./unit.ts";
+import {
+  configFilePaths,
+  readConfigFilesSync,
+  type ConfigFileLayer,
+  type ConfigFileReader,
+} from "../bridge/config-source.ts";
+
+// `issance doctor`, against fakes for every seam. Like cli/crew.test.ts, NOTHING here reaches a
+// service manager, a tailnet, a real trust store or a network — and unlike it, there is nothing to
+// reach even in principle: `DoctorDeps` names no verb that could change something, so a test that
+// wanted to assert "doctor wrote nothing" is asserting a type, not a behaviour. It is asserted
+// anyway (the fake filesystem records every write), because the read-only contract is the reason
+// this verb is safe to run on a machine that is already misbehaving.
+
+const HANDLER = `${CONFIG}/tailscale-managed-handler`;
+/** The name `issance link` publishes, and the directory it lives in (ADR 0021). Built with `join`, as the code builds it. */
+const LINK_DIR = join(HOME, ".local", "bin");
+const LINK_AT = join(LINK_DIR, "issance");
+/** This checkout's compiled binary: `bin/issance` on POSIX, `bin/issance.exe` on Windows. */
+const OWN_BINARY = collieBinary(ROOT);
+const SOCKET = "/home/pat/.config/hangar/herdr.sock";
+const HOSTPORT = "laptop.tail.ts.net:443";
+const PROXY = "http://127.0.0.1:8787";
+
+/** A `tailscale serve status --json` in which issance's own root mount is live. */
+const SERVE_OK = JSON.stringify({
+  TCP: { "443": { HTTPS: true } },
+  Web: { [HOSTPORT]: { Handlers: { "/": { Proxy: PROXY } } } },
+});
+/** A netmap whose inbound packet filter admits somebody — the "can't disprove" case. */
+const NETMAP_OPEN = JSON.stringify({ PacketFilter: [{ IPProto: ["tcp"] }] });
+/** A netmap whose inbound packet filter is EMPTY — deny-all, the only thing this probe can prove. */
+const NETMAP_DENY = JSON.stringify({ PacketFilter: [] });
+
+/**
+ * The netmap probe is bounded through `timeout(1)` where it exists, and the fake `Exec` says every
+ * tool exists — so the call it actually makes is `timeout 3 /fake/tailscale debug netmap`. Both
+ * spellings are scripted, so the fixture does not silently stop matching if that bound is dropped.
+ */
+const netmapAnswers = (json: string): NonNullable<Scripted["answers"]> => [
+  ["timeout 3 /fake/tailscale debug netmap", { stdout: json }],
+  ["tailscale debug netmap", { stdout: json }],
+];
+
+/** `hangar integration status` on a host where every journalled agent's hook is current (issue #137). */
+const INTEGRATION_OK = [
+  "claude: installed (/home/pat/.claude/hooks/herdr-agent-state.sh)",
+  "codex: installed (/home/pat/.codex/herdr-agent-state.sh)",
+  "pi: installed (/home/pat/.pi/agent/extensions/herdr-agent-state.ts)",
+  "opencode: installed (/home/pat/.config/opencode/plugins/herdr-agent-state.js)",
+  "grok: installed (/home/pat/.grok/hooks/herdr-agent-state.sh)",
+].join("\n");
+
+const HEALTHY_ANSWERS: Scripted["answers"] = [
+  // At or above the Windows minimum (`HERDR_MIN_WINDOWS`), because this suite runs on the real host
+  // and a Windows run would otherwise warn on a healthy fixture.
+  ["herdr --version", { stdout: "herdr 0.9.3\n" }],
+  // A healthy checkout can say where it came from: `update` asserts `origin` against the configured
+  // update source before it fetches, so an origin-less checkout is a real (reported) problem.
+  [`git -C ${ROOT} remote get-url origin`, { stdout: "https://github.com/issance/issance-app.git\n" }],
+  [`git -C ${ROOT} symbolic-ref --short HEAD`, { stdout: "main\n" }],
+  ["herdr integration status", { stdout: INTEGRATION_OK }],
+  [
+    "tailscale status --json",
+    // `CertDomains` is what says this tailnet HAS https at all — without it the front-door check
+    // reports a tailnet that can carry no door (#172), which is not what these fixtures describe.
+    { stdout: JSON.stringify({ Self: { DNSName: "laptop.tail.ts.net." }, CertDomains: ["laptop.tail.ts.net"] }) },
+  ],
+  ["tailscale serve status --json", { stdout: SERVE_OK }],
+  ...netmapAnswers(NETMAP_OPEN),
+];
+
+/** A status that names no node but DOES name a certificate domain: no hostname, https available. */
+const CERTS_ONLY = JSON.stringify({ CertDomains: ["laptop.tail.ts.net"] });
+
+/**
+ * The files a healthy install has: a built bundle, a Hangar socket, an ownership record — and the
+ * agent's own settings carrying a current emitter entry pinned to a binary that exists.
+ *
+ * The emitter is in the BASELINE so the contract test above it can go on asserting that a healthy
+ * install warns about nothing. Its absence is a warn rather than an error (a Hangar operator never
+ * installs one), and that case is seeded explicitly by the tests that are about it.
+ */
+function healthyFiles(): SeededFiles {
+  return {
+    [SETTINGS]: settingsWith(hookCommand(OWN_BINARY)),
+    [OWN_BINARY]: "#!/bin/sh",
+    [`${ROOT}/web/dist/index.html`]: "<!doctype html>",
+    [`${ROOT}/web/dist/assets/app.js`]: "//",
+    [`${ROOT}/web/dist/build-info.json`]: JSON.stringify({ version: "1.0.0-alpha.12" }),
+    [SOCKET]: "",
+    [HANDLER]: `https:443|${HOSTPORT}|${PROXY}\n`,
+    // One journal root with something in it. In the BASELINE for the same reason the emitter is:
+    // `journal-roots` warns when no root is there at all, and the contract test above asserts a
+    // healthy install warns about nothing (issue #137).
+    [`${HOME}/.claude/projects/-home-pat-repo/9f3c.jsonl`]: "{}",
+    // One paired device. Pairing is always on (ADR 0086), so a healthy install has one: with none,
+    // `pairing` warns that every route but health and pair answers `device not paired`.
+    [PAIRED_DEVICES]: pairedRegistry([{ label: "phone" }]),
+  };
+}
+
+/** Where the bridge keeps its paired devices, under the fake state dir. */
+const PAIRED_DEVICES = `${STATE}/paired-devices.json`;
+
+/** A `paired-devices.json` body: hash-shaped entries only, never a real token. */
+function pairedRegistry(devices: { label: string; expiresAt?: number }[]): string {
+  return JSON.stringify({
+    devices: devices.map((d, i): PairedDevice => {
+      const row: PairedDevice = { label: d.label, tokenHash: String(i).repeat(64), createdAt: 1, lastSeenAt: 1 };
+      if (d.expiresAt !== undefined) row.expiresAt = d.expiresAt;
+      return row;
+    }),
+  });
+}
+
+/**
+ * The owner-only seams with no disk and no `icacls`. `trees[path]` is what `icacls /save /T` wrote
+ * for that folder (lines captured on the VM); a folder not named reads as a private profile folder.
+ * `absent` paths do not exist; a name ending in `.env`, `.json` or `.toml` is a file. `owners` is
+ * what one `Get-Acl` would answer. The repair and mkdir seams throw: doctor changes nothing.
+ */
+/** A `/save` that ran out of time, as the fake's answer for a folder. */
+const ACL_TIMED_OUT = "\u0000timed-out";
+/** A `/save` that wrote no list (FAT, exFAT, a share: simulated). */
+const ACL_NO_LIST = "\u0000no-list";
+
+function fakeOwnerOnly(
+  trees: Record<string, string>,
+  over: { absent?: readonly string[]; owners?: Record<string, string>; lists?: Record<string, string[]> } = {},
+): OwnerOnlyDeps {
+  const fail = (): never => {
+    throw new Error("doctor must never change an access list");
+  };
+  const acl: AclTool = {
+    save: (path) => {
+      const answer = trees[path] ?? `x\r\nD:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;${WIN_SID})\r\n`;
+      if (answer === ACL_TIMED_OUT) return { kind: "timed-out" } satisfies SaveResult;
+      return { kind: "ok", code: answer === ACL_NO_LIST ? 1 : 0, text: answer === ACL_NO_LIST ? "" : answer } satisfies SaveResult;
+    },
+    icacls: fail,
+    reset: fail,
+    whoami: () => ({ code: 0, stdout: `"pc\\pat","${WIN_SID}"\r\n`, timedOut: false }),
+    descriptors: (paths) => new Map(paths.flatMap((p) => (over.owners?.[p] === undefined ? [] : [[p, over.owners[p]!] as const]))),
+  };
+  return {
+    acl,
+    stat: (path) => ((over.absent ?? []).includes(path) ? null : { dir: !/(\.env|\.json|\.toml)$/.test(path), mode: 0o600, nlink: 1 }),
+    isLink: () => false,
+    realpath: (path) => path,
+    list: (path) => over.lists?.[path] ?? [],
+    mkdir: fail,
+    writeBackup: fail,
+    removeFile: fail,
+    env: { USERPROFILE: WIN_HOME, APPDATA: `${WIN_HOME}\\AppData\\Roaming`, LOCALAPPDATA: `${WIN_HOME}\\AppData\\Local`, SystemRoot: "C:\\Windows" },
+    home: WIN_HOME,
+    now: () => T0,
+  };
+}
+
+const WIN_HOME = "C:\\Users\\Rehearse Ünal";
+const WIN_SID = "S-1-5-21-1678274354-1849132225-3673151578-1000";
+
+interface Harness {
+  deps: DoctorDeps;
+  io: ReturnType<typeof capture>;
+  files: ReturnType<typeof fakeFiles>;
+  requests: string[];
+  /** Every request with the headers it carried — the identity `doctor` shows its own bridge (#238). */
+  sent: { url: string; headers: Record<string, string> }[];
+  /** Every `<tool> <args…>` this run spawned — how the mux probe's ONE invocation is pinned. */
+  calls: string[];
+}
+
+/**
+ * Build a harness. `initial` is the trust store on disk (`null` = never enrolled), `replies` answers
+ * each `hello` in order, and `over` replaces any seam or the seeded filesystem.
+ */
+/** What {@link fakeUi} hands back: the renderer seam, and the views it was handed. */
+interface FakeUi {
+  ui: Ui;
+  views: DoctorView[];
+}
+
+/**
+ * A recording stand-in for the terminal renderer. Its presence is the whole of the seam: `doctor`
+ * hands it the findings it would otherwise have formatted, and prints nothing itself.
+ */
+function fakeUi(): FakeUi {
+  const views: DoctorView[] = [];
+  return {
+    views,
+    ui: {
+      doctor: async (view) => void views.push(view),
+      status: async () => {},
+      crewMembers: async () => {},
+    },
+  };
+}
+
+/** The context overrides this harness passes through, built one property at a time. */
+function contextOver(over: {
+  root?: string;
+  configLayer?: ConfigFileLayer;
+}): Partial<CliContext> {
+  const out: Partial<CliContext> = { socket: SOCKET };
+  if (over.root !== undefined) out.root = over.root;
+  if (over.configLayer !== undefined) out.configLayer = over.configLayer;
+  return out;
+}
+
+function harness(
+  initial: TrustStoreData | null,
+  replies: (Response | Error)[] = [],
+  over: {
+    env?: Record<string, string | undefined>;
+    files?: Record<string, string>;
+    answers?: Scripted["answers"];
+    absent?: string[];
+    /** What is at `~/.local/bin/issance`; absent — nothing linked — is the default. */
+    link?: Record<string, LinkProbe>;
+    /** The beacon directory this host has right now; empty is the default. */
+    beacons?: FakeBeacon[];
+    /** The plugin root this issance resolved — a staged checkout's is a worktree under `versions/`. */
+    root?: string;
+    /** The two `config.toml` files this run read. No file at all is the default. */
+    configLayer?: ConfigFileLayer;
+  } = {},
+): Harness {
+  const contents = initial === null ? null : serializeTrustStore(initial);
+  const io: TrustStoreIo = {
+    read: async () => contents,
+    write: async () => {
+      throw new Error("doctor must never write the trust store");
+    },
+  };
+  const out = capture();
+  const files = fakeFiles(over.files ?? healthyFiles());
+  const exec = fakeExec({ answers: over.answers ?? HEALTHY_ANSWERS, absent: over.absent });
+  const requests: string[] = [];
+  const sent: { url: string; headers: Record<string, string> }[] = [];
+  let n = 0;
+  return {
+    deps: {
+      // As in cli/crew.test.ts: the peer client races the fake fetch against a REAL timer, so the
+      // budget is set far above anything this process could stall for.
+      ctx: context({ ISSANCE_CREW_TIMEOUT_MS: "60000", ...over.env }, contextOver(over)),
+      host: HOST,
+      io: out,
+      exec,
+      files,
+      link: fakeLinkFs(over.link),
+      store: new TrustStore(STATE, io),
+      fetch: async (url, init) => {
+        requests.push(url);
+        sent.push({ url, headers: Object.fromEntries(new Headers(init?.headers)) });
+        const reply = replies[n++];
+        if (reply === undefined) return hello();
+        if (reply instanceof Error) throw reply;
+        return reply;
+      },
+      // An in-memory beacon directory (bridge/beacon/fake.ts): no state directory, no live process,
+      // and — the point of the seam — nothing `doctor` could write even if it tried.
+      beacons: fakeBeaconReader(over.beacons ?? []),
+      now: () => T0,
+      // Every secret path present and owner-only. The `secrets-private` cases build their own.
+      ownerOnly: fakeOwnerOnly({}),
+    },
+    io: out,
+    files,
+    requests,
+    sent,
+    calls: exec.calls,
+  };
+}
+
+/** §5's body: the two required fields, and the version a member may or may not name. */
+interface HelloBody {
+  protocol: number;
+  member: string;
+  version?: string;
+  surfaceVersion?: number;
+}
+
+/** A `hello` answer: §6's two headers, the optional §5 `version`, and an HTTP `Date` the clock reads. */
+function hello(
+  over: { version?: string | null; date?: number | null; memberId?: string; surfaceVersion?: number } = {},
+): Response {
+  const headers = new Headers({
+    "content-type": "application/json",
+    "x-crew-protocol": String(CREW_PROTOCOL_VERSION),
+    "x-crew-member": over.memberId ?? "laptop",
+  });
+  if (over.date !== null) headers.set("date", new Date(over.date ?? T0).toUTCString());
+  const version = over.version === undefined ? "1.0.0-alpha.12" : over.version;
+  const body: HelloBody = { protocol: CREW_PROTOCOL_VERSION, member: over.memberId ?? "laptop" };
+  if (version !== null) body.version = version;
+  if (over.surfaceVersion !== undefined) body.surfaceVersion = over.surfaceVersion;
+  return new Response(JSON.stringify(body), { status: 200, headers });
+}
+
+/** A `--json` run read back: its exit code, its findings in order, and the same keyed by check. */
+interface JsonRun {
+  code: number;
+  byCheck: Map<string, Finding>;
+  raw: Finding[];
+}
+
+/** The `--json` findings, keyed by check. Every assertion below reads the contract, not the prose. */
+async function findings(h: Harness): Promise<JsonRun> {
+  const code = await cmdDoctor(h.deps, ["--json"]);
+  // SAFETY: `--json` prints exactly the `Finding[]` `cmdDoctor` serialised, on stdout, and nothing
+  // else — which is what the "prints an array on stdout and nothing else" test below pins. A run
+  // that printed anything else fails to parse here, which is the failure this suite wants.
+  const raw = JSON.parse(h.io.stdout.join("\n")) as Finding[];
+  return { code, byCheck: new Map(raw.map((f) => [f.check, f])), raw };
+}
+
+const LEAD = leadStore({ peers: [member({ memberId: "laptop" })] });
+
+/** A boot marker that matches a store exactly — the "the running bridge holds this roster" case. */
+const markerFile = (data: TrustStoreData): SeededFiles => ({
+  [`${STATE}/crew-runtime.json`]: JSON.stringify(markerFor(data, T0, 42)),
+});
+
+/** A seed with one path taken out of it — the "that file is simply not there" cases. */
+function without(files: SeededFiles, path: string): SeededFiles {
+  const rest = { ...files };
+  delete rest[path];
+  return rest;
+}
+
+// ── The contract ─────────────────────────────────────────────────────────────
+
+describe("issance doctor — the contract", () => {
+  test("a healthy solo install passes everything it can run, and exits 0", async () => {
+    const h = harness(null);
+    const { code, byCheck, raw } = await findings(h);
+    expect(code).toBe(EXIT.OK);
+    expect([...byCheck.keys()]).toEqual([
+      "issance",
+      "config-file",
+      "web-dist",
+      "path-link",
+      "install",
+      "versions",
+      "update-source",
+      "herdr-socket",
+      "bind",
+      "bind-wildcard",
+      "acl",
+      "front-door",
+      "pairing",
+      "mux",
+      // Windows only, and this suite runs on the real host.
+      ...(HOST.platform === "win32" ? ["windows-task", "windows-long-paths", "secrets-private"] : []),
+      "beacon-hooks-claude",
+      "beacons",
+      "skill-walky-talky",
+      "herdr-version",
+      "integration-claude",
+      "integration-codex",
+      "integration-grok",
+      "integration-hermes",
+      "integration-muse",
+      "integration-openclaw",
+      "integration-opencode",
+      "integration-pi",
+      "integration-omp",
+      // Not on Windows: Hangar's hooks there are PowerShell (M43 spec 08).
+      ...(HOST.platform === "win32" ? [] : ["hook-python3"]),
+      "agent-sessions",
+      "journal-roots",
+      "cache-claims",
+      "cache-rules",
+      "cache-env",
+      "restart-pending",
+      "clock",
+    ]);
+    expect(raw.filter((f) => f.status !== "ok" && f.status !== "skipped")).toEqual([]);
+  });
+
+  test("the FIRST finding is `issance`'s own version and platform — self-identifying, always ok", async () => {
+    const h = harness(null);
+    const { raw } = await findings(h);
+    expect(raw[0]?.check).toBe("issance");
+    expect(raw[0]?.status).toBe("ok");
+    expect(raw[0]?.remedy).toBeNull();
+    // "v1.0.0-beta.49 · linux-x64" (or "win32-x64") — a version and a platform, nothing else.
+    expect(raw[0]?.detail).toMatch(/^v\S+ · [a-z0-9]+-[a-z0-9]+$/);
+
+    const code = await cmdDoctor(h.deps, []);
+    expect(code).toBe(EXIT.OK);
+    const first = h.io.stdout.find((l) => l.includes("issance") && l.trim().startsWith("✓"));
+    expect(first).toBeDefined();
+    expect(first).toMatch(/v\S+ · [a-z0-9]+-[a-z0-9]+/);
+  });
+
+  test("`remedy` is null EXACTLY when the status is ok — including for a skipped check", async () => {
+    for (const h of [harness(null), harness(LEAD), harness(peerStore())]) {
+      const { raw } = await findings(h);
+      for (const f of raw) expect(f.remedy === null).toBe(f.status === "ok");
+    }
+  });
+
+  test("every non-✓ line names the verb that fixes it", async () => {
+    // A deliberately sick install: no bundle, no socket, a deny-all filter, no front door.
+    const h = harness(LEAD, [new Error("connection refused")], {
+      files: { [HANDLER]: "" },
+      answers: [
+        ["tailscale status --json", { stdout: CERTS_ONLY }],
+        ["tailscale serve status --json", { stdout: "{}" }],
+        ["tailscale debug netmap", { stdout: NETMAP_DENY }],
+      ],
+    });
+    const code = await cmdDoctor(h.deps, []);
+    expect(code).toBe(EXIT.FAIL);
+    for (const line of h.io.stdout) {
+      if (line.startsWith("  ✓") || !line.startsWith("  ")) continue;
+      // Every warn/error/skipped line carries its remedy, and every remedy names something runnable.
+      expect(line).toContain("→");
+      expect(/`issance |`hangar |`tailscale |`timedatectl |`python3|`ls |ISSANCE_/.test(line)).toBe(true);
+    }
+  });
+
+  test("warnings alone exit 0; one error is enough to exit 1", async () => {
+    // The hatch rides along because a wildcard bind on a SOLO issance is an ERROR without it (the
+    // bridge refuses to start) — and this test needs a run whose worst finding is a warning.
+    const warned = harness(null, [], {
+      env: { ISSANCE_HOST: "0.0.0.0", ISSANCE_ALLOW_NON_LOOPBACK_BIND: "1" },
+    });
+    const warnRun = await findings(warned);
+    expect(warnRun.byCheck.get("bind-wildcard")?.status).toBe("warn");
+    expect(warnRun.raw.some((f) => f.status === "error")).toBe(false);
+    expect(warnRun.code).toBe(EXIT.OK);
+
+    const broken = harness(null, [], { files: without(healthyFiles(), SOCKET) });
+    const badRun = await findings(broken);
+    expect(badRun.byCheck.get("herdr-socket")?.status).toBe("error");
+    expect(badRun.code).toBe(EXIT.FAIL);
+  });
+
+  test("--json prints an array on stdout and nothing else", async () => {
+    const h = harness(LEAD, [hello()], { files: { ...healthyFiles(), ...markerFile(LEAD) } });
+    const code = await cmdDoctor(h.deps, ["--json"]);
+    expect(code).toBe(EXIT.OK);
+    expect(h.io.stderr).toEqual([]);
+    // SAFETY: this test IS the check that stdout holds nothing but that array — `Array.isArray` on
+    // the next line and the key/status assertions below are what the assertion is being trusted for.
+    const parsed = JSON.parse(h.io.stdout.join("\n")) as Finding[];
+    expect(Array.isArray(parsed)).toBe(true);
+    for (const f of parsed) {
+      // Four keys on every finding, plus `scope` on a crew one and ONLY on a crew one (ADR 0050).
+      // Absent is the local answer, so a script written before the field keeps reading correctly.
+      const keys = Object.keys(f).toSorted();
+      expect(keys.filter((k) => k !== "scope")).toEqual(["check", "detail", "remedy", "status"]);
+      if (keys.includes("scope")) expect(f.scope).toBe("crew");
+      expect(["ok", "warn", "error", "skipped"]).toContain(f.status);
+    }
+  });
+
+  test("it writes nothing — no file, no store, no record", async () => {
+    const h = harness(LEAD, [hello()], { files: { ...healthyFiles(), ...markerFile(LEAD) } });
+    const before = new Map(h.files.entries);
+    await cmdDoctor(h.deps, []);
+    expect([...h.files.entries.keys()].toSorted()).toEqual([...before.keys()].toSorted());
+    expect(h.files.ops).toEqual([]);
+  });
+});
+
+// ── Sections ─────────────────────────────────────────────────────────────────
+
+describe("issance doctor — the section sets", () => {
+  test("solo prints ONE `no crew` line, never a column of padded skipped crew checks", async () => {
+    const h = harness(null);
+    await cmdDoctor(h.deps, []);
+    const text = h.io.stdout.join("\n");
+    expect(text).toContain("crew: none — this issance is not in a crew.");
+    expect(text).toContain("mode solo");
+    expect(text).not.toContain("member-reach");
+    expect(text).not.toContain("store-drift");
+  });
+
+  test("a lead runs `member-reach`; a peer runs `lead-reach`", async () => {
+    const lead = await findings(harness(LEAD, [hello()], { files: { ...healthyFiles(), ...markerFile(LEAD) } }));
+    expect(lead.byCheck.has("member-reach")).toBe(true);
+    expect(lead.byCheck.has("lead-reach")).toBe(false);
+
+    const peer = peerStore();
+    const asPeer = await findings(
+      harness(peer, [hello({ memberId: "desk" })], {
+        env: { ISSANCE_HOST: "laptop.tail.ts.net" },
+        files: without({ ...healthyFiles(), ...markerFile(peer) }, HANDLER),
+      }),
+    );
+    expect(asPeer.byCheck.has("lead-reach")).toBe(true);
+    expect(asPeer.byCheck.has("member-reach")).toBe(false);
+  });
+
+  // ── ADR 0050 ──────────────────────────────────────────────────────────────
+  // The renderer has always drawn these as two sections; the stamp is what lets a READER make the
+  // same split. `issance update --check` is the reader that needs it: a fault on another machine is
+  // not an answer to "can this machine take a new version".
+  test("every crew finding is stamped `scope: crew`, and every local one is not", async () => {
+    const lead = await findings(harness(LEAD, [hello()], { files: { ...healthyFiles(), ...markerFile(LEAD) } }));
+    const scopeOf = (check: string) => lead.byCheck.get(check)?.scope;
+    for (const check of ["member-reach", "secret-generation", "member-versions"]) {
+      if (lead.byCheck.has(check)) expect(scopeOf(check), check).toBe("crew");
+    }
+    // Absent, not `"local"`: absent is what every check answered before the field existed, and a
+    // reader that does not know the field must keep reading those as this machine's.
+    expect(scopeOf("issance")).toBeUndefined();
+    expect(scopeOf("web-dist")).toBeUndefined();
+  });
+
+  // ADR 0050 rests on a claim about which crew checks can be errors AT ALL, and a claim that only a
+  // comment holds is a claim that rots. This reads the source and fails the moment one of the two
+  // warn-only checks grows a `bad(` — which is the point where ADR 0050 asks for a fresh argument,
+  // not a silent downgrade to amber. The positive half keeps it from passing by extracting nothing.
+  test("`secret-generation` and `member-versions` cannot return an error", async () => {
+    // A Windows checkout may carry CRLF line endings; the body's closing brace is found on `\n}\n`.
+    const source = (await Bun.file(new URL("./doctor.ts", import.meta.url)).text()).replaceAll("\r\n", "\n");
+    const bodyOf = (name: string): string => {
+      const start = source.indexOf(`function ${name}(`);
+      expect(start, `${name} not found`).toBeGreaterThan(-1);
+      const end = source.indexOf("\n}\n", start);
+      expect(end, `${name} body not closed`).toBeGreaterThan(start);
+      return source.slice(start, end);
+    };
+    for (const name of ["secretGeneration", "memberVersions"]) {
+      const body = bodyOf(name);
+      expect(body, `${name} may not raise an error`).not.toContain("bad(");
+      expect(body, `${name} may not raise an error`).not.toContain('status: "error"');
+    }
+    // The control: the two that CAN be errors still are, so the extraction above is reading bodies.
+    for (const name of ["storeDrift", "reach"]) {
+      expect(bodyOf(name), `${name} should still be able to raise an error`).toContain("bad(");
+    }
+  });
+
+  // `store-drift` is RENDERED in the crew section and is NOT a crew fact. It compares this machine's
+  // running bridge to this machine's own trust store, needs no answer from anywhere else, and its
+  // remedy is `issance restart` here. Stamping it `crew` would make the preflight amber on a fault
+  // that is entirely local, and would print "the crew reports: store-drift" when nothing did.
+  test("`store-drift` is rendered with the crew and is not stamped as one", async () => {
+    const lead = await findings(harness(LEAD, [hello()], { files: { ...healthyFiles(), ...markerFile(LEAD) } }));
+    expect(lead.byCheck.has("store-drift")).toBe(true);
+    expect(lead.byCheck.get("store-drift")?.scope).toBeUndefined();
+  });
+});
+
+// ── The local checks ─────────────────────────────────────────────────────────
+
+describe("issance doctor — the local checks", () => {
+  test("web-dist: absent is an error naming `issance build`", async () => {
+    const files = healthyFiles();
+    delete files[`${ROOT}/web/dist/index.html`];
+    delete files[`${ROOT}/web/dist/assets/app.js`];
+    delete files[`${ROOT}/web/dist/build-info.json`];
+    const { code, byCheck } = await findings(harness(null, [], { files }));
+    expect(byCheck.get("web-dist")?.status).toBe("error");
+    expect(byCheck.get("web-dist")?.remedy).toContain("issance build");
+    expect(code).toBe(EXIT.FAIL);
+  });
+
+  // ── path-link (ADR 0021) ───────────────────────────────────────────────────
+  // Reported, never repaired: `doctor` holds a `LinkReader`, which has no way to publish or remove a
+  // name. Not being linked is an ordinary state, so it is `ok`; a name that reaches somewhere else is
+  // what earns a warning.
+  test("path-link: not linked is ok, and names the verb that would publish it", async () => {
+    const { code, byCheck } = await findings(harness(null));
+    const f = byCheck.get("path-link");
+    expect(f?.status).toBe("ok");
+    expect(f?.detail).toContain("not linked");
+    expect(f?.detail).toContain(LINK_AT);
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("path-link: linked here, with the directory on PATH, is ok", async () => {
+    const h = harness(null, [], {
+      env: { PATH: ["/usr/bin", LINK_DIR].join(delimiter) },
+      link: { [LINK_AT]: { kind: "symlink", target: OWN_BINARY } },
+    });
+    const f = (await findings(h)).byCheck.get("path-link");
+    expect(f?.status).toBe("ok");
+    expect(f?.detail).toContain("this checkout");
+  });
+
+  test("path-link: linked here but the directory is off PATH warns — the shell cannot find it", async () => {
+    const h = harness(null, [], {
+      env: { PATH: "/usr/bin" },
+      link: { [LINK_AT]: { kind: "symlink", target: OWN_BINARY } },
+    });
+    const f = (await findings(h)).byCheck.get("path-link");
+    expect(f?.status).toBe("warn");
+    expect(f?.remedy).toContain(LINK_DIR);
+  });
+
+  test("path-link: another checkout's link warns, naming the checkout a bare `issance` reaches", async () => {
+    const h = harness(null, [], {
+      link: { [LINK_AT]: { kind: "symlink", target: "/opt/issance-v1/bin/issance" } },
+    });
+    const f = (await findings(h)).byCheck.get("path-link");
+    expect(f?.status).toBe("warn");
+    expect(f?.detail).toContain("/opt/issance-v1/bin/issance");
+    expect(f?.remedy).toContain("issance link");
+  });
+
+  test("path-link: anything else at the name warns and is left alone", async () => {
+    const h = harness(null, [], { link: { [LINK_AT]: { kind: "other", what: "a regular file" } } });
+    const f = (await findings(h)).byCheck.get("path-link");
+    expect(f?.status).toBe("warn");
+    expect(f?.detail).toContain("a regular file");
+    expect(f?.detail).toContain("will not touch it");
+  });
+
+  test("herdr-socket: a missing socket is an error naming the path it looked for", async () => {
+    const files = healthyFiles();
+    delete files[SOCKET];
+    const { byCheck } = await findings(harness(null, [], { files }));
+    expect(byCheck.get("herdr-socket")?.status).toBe("error");
+    expect(byCheck.get("herdr-socket")?.detail).toContain(SOCKET);
+    expect(byCheck.get("herdr-socket")?.remedy).toContain("herdr status");
+  });
+
+  test("bind: a PEER on loopback is the #1 trap — an error naming the ISSANCE_HOST to set", async () => {
+    const peer = peerStore();
+    const { code, byCheck } = await findings(
+      harness(peer, [hello({ memberId: "desk" })], {
+        files: without({ ...healthyFiles(), ...markerFile(peer) }, HANDLER),
+      }),
+    );
+    const bind = byCheck.get("bind");
+    expect(bind?.status).toBe("error");
+    expect(bind?.detail).toContain("PEER");
+    // The tailnet name this host answers with is the address it suggests — not a placeholder.
+    expect(bind?.remedy).toContain("ISSANCE_HOST=laptop.tail.ts.net");
+    expect(code).toBe(EXIT.FAIL);
+  });
+
+  // ADR 0013's tunnel row: a peer that dials its lead on loopback is behind an operator-owned tunnel
+  // (or shares the lead's host), so the lead's dial lands on loopback too and the default bind is right.
+  test("bind: loopback on a PEER whose lead is dialled on loopback is a tunnel, not the trap", async () => {
+    for (const address of ["http://127.0.0.1:18787", "127.0.0.1:18787", "[::1]:8787", "https://localhost:8787"]) {
+      const peer = peerStore({ lead: member({ memberId: "desk", role: "lead", address }) });
+      const { byCheck } = await findings(
+        harness(peer, [hello({ memberId: "desk" })], {
+          files: without({ ...healthyFiles(), ...markerFile(peer) }, HANDLER),
+        }),
+      );
+      expect(byCheck.get("bind")?.status, address).toBe("ok");
+      expect(byCheck.get("bind")?.detail, address).toContain("reaches its lead on loopback too");
+    }
+  });
+
+  test("bind: loopback on a lead or solo is the RIGHT answer, not a finding", async () => {
+    const solo = await findings(harness(null));
+    expect(solo.byCheck.get("bind")?.status).toBe("ok");
+    const lead = await findings(harness(LEAD, [hello()], { files: { ...healthyFiles(), ...markerFile(LEAD) } }));
+    expect(lead.byCheck.get("bind")?.status).toBe("ok");
+  });
+
+  test("bind-wildcard: a wildcard warns, and a warning never fails the run", async () => {
+    // With the hatch set, so the only thing this run has to say about the bind is the warning.
+    const { code, byCheck } = await findings(
+      harness(null, [], { env: { ISSANCE_HOST: "", ISSANCE_ALLOW_NON_LOOPBACK_BIND: "1" } }),
+    );
+    expect(byCheck.get("bind-wildcard")?.status).toBe("warn");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  // The gate main brought (#129) and the crew carve-out that keeps it honest: a wide bind stops a
+  // SOLO issance from starting at all, so doctor says the same thing the bridge would — while a peer
+  // binds wide by construction and hears only the wildcard warning (ADR 0013).
+  test("bind: a wide bind is an ERROR on solo, cleared by the hatch, and never one on a peer", async () => {
+    const solo = await findings(harness(null, [], { env: { ISSANCE_HOST: "10.0.0.4" } }));
+    expect(solo.byCheck.get("bind")?.status).toBe("error");
+    expect(solo.byCheck.get("bind")?.remedy).toContain("ISSANCE_ALLOW_NON_LOOPBACK_BIND=1");
+    expect(solo.code).toBe(EXIT.FAIL);
+
+    const hatched = await findings(
+      harness(null, [], { env: { ISSANCE_HOST: "10.0.0.4", ISSANCE_ALLOW_NON_LOOPBACK_BIND: "1" } }),
+    );
+    expect(hatched.byCheck.get("bind")?.status).toBe("ok");
+  });
+
+  test("acl: an EMPTY inbound filter is an error; a non-empty one passes as `can't disprove`", async () => {
+    const denied = await findings(
+      harness(null, [], {
+        answers: [
+          ["tailscale status --json", { stdout: CERTS_ONLY }],
+          ["tailscale serve status --json", { stdout: SERVE_OK }],
+          ...netmapAnswers(NETMAP_DENY),
+        ],
+      }),
+    );
+    expect(denied.byCheck.get("acl")?.status).toBe("error");
+    expect(denied.byCheck.get("acl")?.remedy).toContain("ACL");
+    expect(denied.code).toBe(EXIT.FAIL);
+
+    // THE ASYMMETRY: a non-empty filter proves nothing, and the passing line says so out loud.
+    const open = await findings(harness(null));
+    expect(open.byCheck.get("acl")?.status).toBe("ok");
+    expect(open.byCheck.get("acl")?.detail).toContain("can't disprove");
+
+    // No `tailscale` at all is `skipped`, never a pass.
+    const none = await findings(harness(null, [], { absent: ["tailscale"] }));
+    expect(none.byCheck.get("acl")?.status).toBe("skipped");
+  });
+
+  test("front-door: a live mapping matching the record passes; a replaced one warns", async () => {
+    const live = await findings(harness(null));
+    expect(live.byCheck.get("front-door")?.status).toBe("ok");
+
+    const stolen = await findings(
+      harness(null, [], {
+        answers: [
+          ["tailscale status --json", { stdout: CERTS_ONLY }],
+          [
+            "tailscale serve status --json",
+            {
+              stdout: JSON.stringify({
+                TCP: { "443": { HTTPS: true } },
+                Web: { [HOSTPORT]: { Handlers: { "/": { Proxy: "http://127.0.0.1:9999" } } } },
+              }),
+            },
+          ],
+          ...netmapAnswers(NETMAP_OPEN),
+        ],
+      }),
+    );
+    // Reported, never touched (ADR 0001) — and a warning, because it is not ours to fix by force.
+    expect(stolen.byCheck.get("front-door")?.status).toBe("warn");
+  });
+
+  // ADR 0052: the door and the app must name one mount.
+  test("front-door: a door at the root while ISSANCE_BASE_PATH mounts the app elsewhere warns", async () => {
+    const { byCheck } = await findings(harness(null, [], { env: { ISSANCE_BASE_PATH: "/issance" } }));
+    expect(byCheck.get("front-door")?.status).toBe("warn");
+    expect(byCheck.get("front-door")?.detail).toContain("ISSANCE_BASE_PATH");
+    expect(byCheck.get("front-door")?.remedy).toContain("issance serve");
+  });
+
+  test("front-door: a door published at the mount the app is served under passes, and names it", async () => {
+    const files = healthyFiles();
+    const handler = Object.keys(files).find((p) => p.endsWith("tailscale-managed-handler"));
+    expect(handler).toBeDefined();
+    const mountedFiles = { ...files, [handler ?? ""]: `https:443|${HOSTPORT}|http://127.0.0.1:8787|/issance/\n` };
+    const { byCheck } = await findings(
+      harness(null, [], {
+        env: { ISSANCE_BASE_PATH: "/issance" },
+        files: mountedFiles,
+        answers: [
+          ["tailscale status --json", { stdout: CERTS_ONLY }],
+          [
+            "tailscale serve status --json",
+            {
+              stdout: JSON.stringify({
+                TCP: { "443": { HTTPS: true } },
+                Web: { [HOSTPORT]: { Handlers: { "/issance/": { Proxy: "http://127.0.0.1:8787" } } } },
+              }),
+            },
+          ],
+          ...netmapAnswers(NETMAP_OPEN),
+        ],
+      }),
+    );
+    expect(byCheck.get("front-door")?.status).toBe("ok");
+    expect(byCheck.get("front-door")?.detail).toContain("at /issance/");
+  });
+
+  test("front-door: a tailnet with no HTTPS certificates warns with the console pointer (#172)", async () => {
+    const { byCheck } = await findings(
+      harness(null, [], {
+        answers: [
+          ["tailscale status --json", { stdout: JSON.stringify({ Self: { DNSName: "laptop.tail.ts.net." } }) }],
+          ["tailscale serve status --json", { stdout: SERVE_OK }],
+          ...netmapAnswers(NETMAP_OPEN),
+        ],
+      }),
+    );
+    expect(byCheck.get("front-door")?.status).toBe("warn");
+    expect(byCheck.get("front-door")?.detail).toContain("no HTTPS certificates");
+    expect(byCheck.get("front-door")?.remedy).toContain("https://login.tailscale.com/admin/dns");
+  });
+
+  test("front-door: on a Windows host the no-certificates remedy names the by-hand command, not `issance serve` (#172)", async () => {
+    const answers: NonNullable<Scripted["answers"]> = [
+      ["tailscale status --json", { stdout: JSON.stringify({ Self: { DNSName: "laptop.tail.ts.net." } }) }],
+      ["tailscale serve status --json", { stdout: SERVE_OK }],
+      ...netmapAnswers(NETMAP_OPEN),
+    ];
+    const win = harness(null, [], { answers });
+    win.deps = { ...win.deps, host: hostFor("win32") };
+    const winFinding = (await findings(win)).byCheck.get("front-door")!;
+    expect(winFinding.status).toBe("warn");
+    expect(winFinding.detail).toContain("no HTTPS certificates");
+    expect(winFinding.remedy).toContain("https://login.tailscale.com/admin/dns");
+    expect(winFinding.remedy).toContain(`tailscale serve --bg --set-path=/ ${win.deps.ctx.port}`);
+    expect(winFinding.remedy).toContain(`tailscale serve --bg --http=80 --set-path=/ ${win.deps.ctx.port}`);
+    expect(winFinding.remedy).toContain("pair a device");
+    expect(winFinding.remedy).toContain("docs/windows.md");
+    expect(winFinding.remedy).not.toContain("issance serve");
+
+    const posix = harness(null, [], { answers });
+    posix.deps = { ...posix.deps, host: hostFor("linux") };
+    const posixFinding = (await findings(posix)).byCheck.get("front-door")!;
+    expect(posixFinding.remedy).toContain("issance serve");
+    expect(posixFinding.remedy).not.toContain("tailscale serve --bg");
+  });
+
+  test("front-door: on a Windows host a solo issance with no mapping is told the by-hand command, not `issance serve`", async () => {
+    const files = healthyFiles();
+    delete files[HANDLER];
+    const answers: NonNullable<Scripted["answers"]> = [
+      ["tailscale status --json", { stdout: CERTS_ONLY }],
+      ["tailscale serve status --json", { stdout: "{}" }],
+      ...netmapAnswers(NETMAP_OPEN),
+    ];
+    const win = harness(null, [], { files, answers });
+    win.deps = { ...win.deps, host: hostFor("win32") };
+    const winFinding = (await findings(win)).byCheck.get("front-door")!;
+    expect(winFinding.status).toBe("warn");
+    expect(winFinding.remedy).toContain(`tailscale serve --bg --set-path=/ ${win.deps.ctx.port}`);
+    expect(winFinding.remedy).toContain("pair a device");
+    expect(winFinding.remedy).toContain("ISSANCE_SKIP_SERVE=1");
+    expect(winFinding.remedy).not.toContain("issance serve");
+
+    const posix = harness(null, [], { files, answers });
+    posix.deps = { ...posix.deps, host: hostFor("linux") };
+    expect((await findings(posix)).byCheck.get("front-door")?.remedy).toContain("`issance serve` here");
+  });
+
+  test("front-door: on a Windows host a hand-made root mount that proxies to this issance passes; a POSIX host still warns", async () => {
+    const files = healthyFiles();
+    delete files[HANDLER];
+    const answers: NonNullable<Scripted["answers"]> = [
+      ["tailscale status --json", { stdout: CERTS_ONLY }],
+      ["tailscale serve status --json", { stdout: SERVE_OK }],
+      ...netmapAnswers(NETMAP_OPEN),
+    ];
+    const win = harness(null, [], { files, answers });
+    win.deps = { ...win.deps, host: hostFor("win32") };
+    const winFinding = (await findings(win)).byCheck.get("front-door")!;
+    expect(winFinding.status).toBe("ok");
+    expect(winFinding.detail).toContain(`proxies to http://127.0.0.1:${win.deps.ctx.port}`);
+    expect(winFinding.detail).toContain("published by hand");
+
+    const posix = harness(null, [], { files, answers });
+    posix.deps = { ...posix.deps, host: hostFor("linux") };
+    const posixFinding = (await findings(posix)).byCheck.get("front-door")!;
+    expect(posixFinding.status).toBe("warn");
+    expect(posixFinding.remedy).toContain("`issance serve` here");
+  });
+
+  test("front-door: on a Windows host a hand-made HTTP mount on :80 passes on a tailnet with no certificates (Headscale)", async () => {
+    const files = healthyFiles();
+    delete files[HANDLER];
+    const serveHttp80 = JSON.stringify({
+      TCP: { "80": { HTTP: true } },
+      Web: { "laptop.tail.ts.net:80": { Handlers: { "/": { Proxy: PROXY } } } },
+    });
+    const answers: NonNullable<Scripted["answers"]> = [
+      ["tailscale status --json", { stdout: JSON.stringify({ Self: { DNSName: "laptop.tail.ts.net." } }) }],
+      ["tailscale serve status --json", { stdout: serveHttp80 }],
+      ...netmapAnswers(NETMAP_OPEN),
+    ];
+    const win = harness(null, [], { files, answers });
+    win.deps = { ...win.deps, host: hostFor("win32") };
+    const winFinding = (await findings(win)).byCheck.get("front-door")!;
+    expect(winFinding.status).toBe("ok");
+    expect(winFinding.detail).toContain(`:80 proxies to http://127.0.0.1:${win.deps.ctx.port}`);
+
+    // A mount on :80 that proxies somewhere else is not ours: the certificate warning stays.
+    const elsewhere = harness(null, [], {
+      files,
+      answers: [
+        answers[0]!,
+        ["tailscale serve status --json", { stdout: serveHttp80.replace(PROXY, "http://127.0.0.1:9999") }],
+        ...netmapAnswers(NETMAP_OPEN),
+      ],
+    });
+    elsewhere.deps = { ...elsewhere.deps, host: hostFor("win32") };
+    const elsewhereFinding = (await findings(elsewhere)).byCheck.get("front-door")!;
+    expect(elsewhereFinding.status).toBe("warn");
+    expect(elsewhereFinding.detail).toContain("no HTTPS certificates");
+
+    const posix = harness(null, [], { files, answers });
+    posix.deps = { ...posix.deps, host: hostFor("linux") };
+    const posixFinding = (await findings(posix)).byCheck.get("front-door")!;
+    expect(posixFinding.status).toBe("warn");
+    expect(posixFinding.detail).toContain("no HTTPS certificates");
+  });
+
+  test("front-door: a LEAD with no mapping and no ISSANCE_SKIP_SERVE is an error", async () => {
+    const files = { ...healthyFiles(), ...markerFile(LEAD) };
+    delete files[HANDLER];
+    const lead = harness(LEAD, [hello()], {
+      files,
+      answers: [
+        ["tailscale status --json", { stdout: CERTS_ONLY }],
+        ["tailscale serve status --json", { stdout: "{}" }],
+        ...netmapAnswers(NETMAP_OPEN),
+      ],
+    });
+    // The remedy names `issance serve` on a POSIX host only; a Windows host is told the by-hand command.
+    lead.deps = { ...lead.deps, host: hostFor("linux") };
+    const { code, byCheck } = await findings(lead);
+    expect(byCheck.get("front-door")?.status).toBe("error");
+    expect(byCheck.get("front-door")?.remedy).toContain("issance serve");
+    expect(code).toBe(EXIT.FAIL);
+  });
+
+  test("front-door: a PEER with any mapping at all is an error (ADR 0013)", async () => {
+    const peer = peerStore();
+    const { byCheck } = await findings(
+      harness(peer, [hello({ memberId: "desk" })], {
+        env: { ISSANCE_HOST: "laptop.tail.ts.net" },
+        files: { ...healthyFiles(), ...markerFile(peer) },
+      }),
+    );
+    expect(byCheck.get("front-door")?.status).toBe("error");
+    expect(byCheck.get("front-door")?.remedy).toContain("issance unserve");
+  });
+
+  test("front-door: ISSANCE_SKIP_SERVE=1 with a leftover record warns; without one it passes", async () => {
+    const files = healthyFiles();
+    const withRecord = await findings(harness(null, [], { env: { ISSANCE_SKIP_SERVE: "1" }, files }));
+    expect(withRecord.byCheck.get("front-door")?.status).toBe("warn");
+
+    delete files[HANDLER];
+    const clean = await findings(harness(null, [], { env: { ISSANCE_SKIP_SERVE: "1" }, files }));
+    expect(clean.byCheck.get("front-door")?.status).toBe("ok");
+  });
+
+  test("restart-pending: skipped, because nothing the bridge writes names the code it is running", async () => {
+    const { code, byCheck } = await findings(harness(null));
+    const f = byCheck.get("restart-pending");
+    expect(f?.status).toBe("skipped");
+    expect(f?.detail).toContain("records no version");
+    expect(f?.remedy).toContain("issance restart");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  // ── install / update-source (M14/01 §4.3) ──────────────────────────────────
+  // Reported, never repaired, from the SAME classifier `issance update` forks on — so the two verbs
+  // cannot disagree about what they are looking at.
+
+  test("install: a linked clone names its branch and its origin", async () => {
+    const f = (await findings(harness(null))).byCheck.get("install");
+    expect(f?.status).toBe("ok");
+    expect(f?.detail).toContain("linked clone");
+    expect(f?.detail).toContain("branch main");
+    expect(f?.detail).toContain("issance/issance-app");
+  });
+
+  test("install: a Hangar-managed checkout is named as one", async () => {
+    const h = harness(null, [], {
+      answers: [...HEALTHY_ANSWERS, [`git -C ${ROOT} symbolic-ref -q HEAD`, { code: 1 }]],
+    });
+    expect((await findings(h)).byCheck.get("install")?.detail).toContain("Hangar-managed checkout");
+  });
+
+  test("install: an install it cannot name warns and points at the docs", async () => {
+    const h = harness(null, [], {
+      answers: [...HEALTHY_ANSWERS, [`git -C ${ROOT} rev-parse --show-prefix`, { code: 128 }]],
+    });
+    const { byCheck, code } = await findings(h);
+    expect(byCheck.get("install")?.status).toBe("warn");
+    expect(byCheck.get("install")?.detail).toContain("cannot tell how this issance was installed");
+    expect(byCheck.get("install")?.remedy).toContain("docs/install.md");
+    // A warning, never an error: an install doctor cannot name still runs.
+    expect(code).toBe(EXIT.OK);
+  });
+
+  // ── versions (M15/02) ──────────────────────────────────────────────────────
+  // The outside view of the stage-then-swap layout both install kinds now use: which version is
+  // live, what is retained, whether `current` resolves — and, on a checkout, whether git agrees
+  // with the directories on disk.
+
+  const STAGED = `${ROOT}/versions/v1.1.0`;
+  const stagedFiles = (over: SeededFiles = {}): SeededFiles => ({
+    ...healthyFiles(),
+    [`${ROOT}/versions/v1.1.0/.issance-build`]: JSON.stringify({ version: "1.1.0", commit: "abc1234" }),
+    [`${ROOT}/versions/v1.0.0/.issance-build`]: JSON.stringify({ version: "1.0.0", commit: "0000000" }),
+    [`${ROOT}/versions/v0.9.0/.issance-build`]: JSON.stringify({ version: "0.9.0", commit: "1111111" }),
+    ...over,
+  });
+  const worktrees = (...paths: string[]): NonNullable<Scripted["answers"]> => [
+    [
+      `git -C ${STAGED} worktree list`,
+      { stdout: [`worktree ${ROOT}`, ...paths.map((p) => `worktree ${p}`)].join("\n\n") },
+    ],
+  ];
+  const stagedLink = { [`${ROOT}/current`]: { kind: "symlink" as const, target: "versions/v1.1.0" } };
+
+  test("versions: a staged checkout names the live version and what is retained", async () => {
+    const h = harness(null, [], {
+      root: STAGED,
+      files: stagedFiles(),
+      link: stagedLink,
+      answers: [
+        ...worktrees(`${ROOT}/versions/v1.1.0`, `${ROOT}/versions/v1.0.0`, `${ROOT}/versions/v0.9.0`),
+        ...HEALTHY_ANSWERS,
+      ],
+    });
+    const { byCheck } = await findings(h);
+    expect(byCheck.get("install")?.detail).toContain("staged checkout, version v1.1.0");
+    const f = byCheck.get("versions");
+    expect(f?.status).toBe("ok");
+    expect(f?.detail).toContain("current v1.1.0");
+    expect(f?.detail).toContain("2 retained (v1.0.0, v0.9.0)");
+  });
+
+  test("versions: a `current` that resolves to nothing is an error naming rollback", async () => {
+    const h = harness(null, [], {
+      root: STAGED,
+      files: stagedFiles(),
+      answers: [...worktrees(`${ROOT}/versions/v1.1.0`), ...HEALTHY_ANSWERS],
+    });
+    const f = (await findings(h)).byCheck.get("versions");
+    expect(f?.status).toBe("error");
+    expect(f?.detail).toContain("resolves to no version");
+  });
+
+  test("versions: a worktree git records with no directory on disk is reconciled and warned about", async () => {
+    const h = harness(null, [], {
+      root: STAGED,
+      files: stagedFiles(),
+      link: stagedLink,
+      answers: [
+        ...worktrees(`${ROOT}/versions/v1.1.0`, `${ROOT}/versions/v0.8.0`),
+        ...HEALTHY_ANSWERS,
+      ],
+    });
+    const f = (await findings(h)).byCheck.get("versions");
+    expect(f?.status).toBe("warn");
+    expect(f?.detail).toContain("git still records v0.8.0");
+    expect(f?.detail).toContain("v1.0.0, v0.9.0 is on disk but git tracks no worktree there");
+    expect(f?.remedy).toContain("git worktree prune");
+  });
+
+  test("versions: an in-place checkout says the layout is not there yet, and is not an error", async () => {
+    const { byCheck, code } = await findings(harness(null));
+    expect(byCheck.get("versions")?.status).toBe("ok");
+    expect(byCheck.get("versions")?.detail).toContain("no versions/ layout yet");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("versions: a Hangar-managed checkout is in place by design (ADR 0006)", async () => {
+    const h = harness(null, [], {
+      answers: [[`git -C ${ROOT} symbolic-ref -q HEAD`, { code: 1 }], ...HEALTHY_ANSWERS],
+    });
+    expect((await findings(h)).byCheck.get("versions")?.detail).toContain("ADR 0006");
+  });
+
+  test("update-source: an origin that is not the update source is an ERROR naming the fork docs", async () => {
+    const h = harness(null, [], {
+      answers: [
+        ...HEALTHY_ANSWERS.filter(([prefix]) => !prefix.includes("remote get-url")),
+        [`git -C ${ROOT} remote get-url origin`, { stdout: "git@github.com:youngsecurity/issance.git\n" }],
+      ],
+    });
+    const { byCheck, code } = await findings(h);
+    const f = byCheck.get("update-source");
+    expect(f?.status).toBe("error");
+    expect(f?.detail).toContain("youngsecurity/issance");
+    expect(f?.remedy).toContain("docs/upgrading.md");
+    expect(code).toBe(EXIT.FAIL);
+  });
+
+  test("update-source: a fork the operator chose is a warning, not a failure", async () => {
+    const h = harness(null, [], {
+      env: { ISSANCE_UPDATE_REPO: "youngsecurity/issance" },
+      answers: [
+        ...HEALTHY_ANSWERS.filter(([prefix]) => !prefix.includes("remote get-url")),
+        [`git -C ${ROOT} remote get-url origin`, { stdout: "git@github.com:youngsecurity/issance.git\n" }],
+      ],
+    });
+    const { byCheck, code } = await findings(h);
+    expect(byCheck.get("update-source")?.status).toBe("warn");
+    expect(byCheck.get("update-source")?.detail).toContain("ISSANCE_UPDATE_REPO");
+    expect(code).toBe(EXIT.OK);
+  });
+});
+
+// ── The clock ────────────────────────────────────────────────────────────────
+
+describe("issance doctor — the clock (§8.6's ±5m window)", () => {
+  const withDate = (delta: number) =>
+    harness(LEAD, [hello({ date: T0 + delta })], { files: { ...healthyFiles(), ...markerFile(LEAD) } });
+
+  test("solo is skipped rather than compared against an invented reference", async () => {
+    const { byCheck, code } = await findings(harness(null));
+    expect(byCheck.get("clock")?.status).toBe("skipped");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("inside ±2m passes", async () => {
+    const { byCheck, code } = await findings(withDate(60_000));
+    expect(byCheck.get("clock")?.status).toBe("ok");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("past ±2m warns — in BOTH directions", async () => {
+    for (const delta of [3 * 60_000, -3 * 60_000]) {
+      const { byCheck, code } = await findings(withDate(delta));
+      expect(byCheck.get("clock")?.status).toBe("warn");
+      expect(byCheck.get("clock")?.remedy).toContain("NTP");
+      expect(code).toBe(EXIT.OK);
+    }
+  });
+
+  test("past ±5m is an error — in BOTH directions — and says why a 401 was the symptom", async () => {
+    for (const delta of [6 * 60_000, -6 * 60_000]) {
+      const { byCheck, code } = await findings(withDate(delta));
+      expect(byCheck.get("clock")?.status).toBe("error");
+      expect(byCheck.get("clock")?.detail).toContain("401");
+      expect(code).toBe(EXIT.FAIL);
+      // And it is stamped `crew` (ADR 0050), because the machine at fault may be the far one: this
+      // check's own remedy says "whichever machine is off". A laptop waking six minutes out before
+      // NTP resyncs must not turn this machine's update button off.
+      expect(byCheck.get("clock")?.scope).toBe("crew");
+    }
+  });
+
+  test("a member that sent no readable Date is skipped, never guessed at", async () => {
+    const h = harness(LEAD, [hello({ date: null })], { files: { ...healthyFiles(), ...markerFile(LEAD) } });
+    const { byCheck } = await findings(h);
+    expect(byCheck.get("clock")?.status).toBe("skipped");
+  });
+
+  test("solo, it is skipped and about nobody, so it carries no crew stamp", async () => {
+    const { byCheck } = await findings(harness(null));
+    expect(byCheck.get("clock")?.status).toBe("skipped");
+    expect(byCheck.get("clock")?.scope).toBeUndefined();
+  });
+});
+
+// ── The crew checks ──────────────────────────────────────────────────────────
+
+describe("issance doctor — the crew checks", () => {
+  test("store-drift: a roster the running bridge never wired is an error naming `issance restart`", async () => {
+    // The marker was written when this lead had NO peers; the store now has one.
+    const stale = markerFor(leadStore(), T0, 42);
+    const { code, byCheck } = await findings(
+      harness(LEAD, [hello()], {
+        files: { ...healthyFiles(), [`${STATE}/crew-runtime.json`]: JSON.stringify(stale) },
+      }),
+    );
+    expect(byCheck.get("store-drift")?.status).toBe("error");
+    expect(byCheck.get("store-drift")?.detail).toContain("laptop");
+    expect(byCheck.get("store-drift")?.remedy).toContain("issance restart");
+    expect(code).toBe(EXIT.FAIL);
+  });
+
+  test("store-drift: no marker at all is skipped — no process exists for the store to be ahead of", async () => {
+    const { byCheck } = await findings(harness(LEAD, [hello()]));
+    expect(byCheck.get("store-drift")?.status).toBe("skipped");
+  });
+
+  test("secret-generation: a member behind the crew's generation warns, and does not fail the run", async () => {
+    const behind = leadStore({ peers: [member({ memberId: "laptop", secretGeneration: 0 })] });
+    const { code, byCheck } = await findings(
+      harness(behind, [hello()], { files: { ...healthyFiles(), ...markerFile(behind) } }),
+    );
+    expect(byCheck.get("secret-generation")?.status).toBe("warn");
+    expect(byCheck.get("secret-generation")?.remedy).toContain("issance crew rotate");
+    expect(code).toBe(EXIT.OK);
+    expect(CREW.secretGeneration).toBe(1);
+  });
+
+  test("member-reach: an unreachable member is an error naming `issance crew set-address`", async () => {
+    const { code, byCheck } = await findings(
+      harness(LEAD, [new Error("connection refused")], { files: { ...healthyFiles(), ...markerFile(LEAD) } }),
+    );
+    const f = byCheck.get("member-reach");
+    expect(f?.status).toBe("error");
+    expect(f?.detail).toContain("laptop");
+    // The lead's verb: it refuses an address the crew cannot dial, where `reconnect` takes anything.
+    expect(f?.remedy).toContain("issance crew set-address <member> <host:port>");
+    expect(f?.remedy).not.toContain("issance reconnect");
+    expect(code).toBe(EXIT.FAIL);
+  });
+
+  test("member-reach: a silent peer with a portless address gets the exact set-address command", async () => {
+    const portless = leadStore({ peers: [member({ memberId: "laptop", address: "100.64.0.9" })] });
+    const { byCheck } = await findings(
+      harness(portless, [new Error("connection refused")], { files: { ...healthyFiles(), ...markerFile(portless) } }),
+    );
+    const f = byCheck.get("member-reach");
+    expect(f?.detail).toContain(
+      "laptop at 100.64.0.9 — ",
+    );
+    expect(f?.detail).toContain("→ `issance crew set-address laptop 100.64.0.9:8787` (8787 unless that machine set ISSANCE_PORT)");
+    // The generic remedy is still there for the rest.
+    expect(f?.remedy).toContain("issance crew set-address <member> <host:port>");
+  });
+
+  test("member-reach: a silent peer at host:port, with a scheme or an IPv6 literal gets no suggestion", async () => {
+    for (const address of ["laptop.example:8787", "https://laptop.example", "fd7a:115c::9"]) {
+      const store = leadStore({ peers: [member({ memberId: "laptop", address })] });
+      const { byCheck } = await findings(
+        harness(store, [new Error("connection refused")], { files: { ...healthyFiles(), ...markerFile(store) } }),
+      );
+      expect(byCheck.get("member-reach")?.detail).not.toContain("→");
+    }
+  });
+
+  test("lead-reach: an unreachable lead keeps `issance reconnect`, the verb that runs on a peer", async () => {
+    const peer = peerStore();
+    const { byCheck } = await findings(
+      harness(peer, [new Error("connection refused")], {
+        env: { ISSANCE_HOST: "laptop.tail.ts.net" },
+        files: without({ ...healthyFiles(), ...markerFile(peer) }, HANDLER),
+      }),
+    );
+    const f = byCheck.get("lead-reach");
+    expect(f?.status).toBe("error");
+    expect(f?.remedy).toContain("issance reconnect <address>");
+    expect(f?.remedy).not.toContain("set-address");
+  });
+
+  test("member-reach: a member that answers `hello` and then starves is an error about the BUDGET", async () => {
+    // `hello` runs on the patient budget, every real read on the strict clamped one — so a link whose
+    // handshake outprices the poll used to answer the probe while the phone got 503s, and this check
+    // printed ✓ over it. Both questions are asked now, and the remedy names the knobs, not `reconnect`.
+    const { code, byCheck } = await findings(
+      harness(LEAD, [hello(), new Error("timed out after 1200ms")], {
+        files: { ...healthyFiles(), ...markerFile(LEAD) },
+      }),
+    );
+    const f = byCheck.get("member-reach");
+    expect(f?.status).toBe("error");
+    expect(f?.detail).toContain("served no data");
+    expect(f?.remedy).toContain("ISSANCE_CREW_TIMEOUT_MS");
+    expect(f?.remedy).toContain("ISSANCE_POLL_MS");
+    expect(f?.remedy).not.toContain("issance reconnect");
+    expect(code).toBe(EXIT.FAIL);
+  });
+
+  // F21: the peer's side of the same check. `/crew/v1/snapshot` is not on the closed peer → lead
+  // route set (§8.6), so the only answer the second question can get is §8.1's bare 401 — which this
+  // check reported as "answered but served no data", with the budget remedy, on a healthy crew.
+  test("lead-reach: a peer asks its lead `hello` and nothing else", async () => {
+    const peer = peerStore();
+    const h = harness(peer, [hello({ memberId: "desk" })], {
+      env: { ISSANCE_HOST: "laptop.tail.ts.net" },
+      files: without({ ...healthyFiles(), ...markerFile(peer) }, HANDLER),
+    });
+    const { byCheck } = await findings(h);
+    expect(h.requests).not.toContain("https://desk.example:8787/crew/v1/snapshot");
+    const f = byCheck.get("lead-reach");
+    expect(f?.status).toBe("ok");
+    expect(f?.detail).toContain("answered `hello`");
+    expect(f?.detail).not.toContain("served a snapshot");
+  });
+
+  test("member-reach: a healthy member reports both answers, and the data half is a REAL request", async () => {
+    const h = harness(LEAD, [hello(), hello()], { files: { ...healthyFiles(), ...markerFile(LEAD) } });
+    const { byCheck } = await findings(h);
+    expect(byCheck.get("member-reach")?.status).toBe("ok");
+    expect(byCheck.get("member-reach")?.detail).toContain("served a snapshot");
+    expect(h.requests).toEqual([
+      "https://laptop.example:8787/crew/v1/hello",
+      "https://laptop.example:8787/crew/v1/snapshot",
+      // The history section's one GET of THIS bridge's own snapshot (issue #137), on the same seam.
+      "http://127.0.0.1:8787/api/snapshot",
+    ]);
+  });
+
+  // Issue #238: with `tailscale serve` in front, `checkAccess` fails closed on a read that carries no
+  // `Tailscale-User-Login`, so this verb could not read its OWN snapshot and called a healthy bridge
+  // one that had not answered. It shows the login it is configured with; the header is an identity
+  // rather than a secret, and the bridge already takes it from any caller that reaches the port.
+  test("the bridge's own snapshot is read with the configured tailnet login", async () => {
+    const h = harness(LEAD, [hello(), hello()], {
+      env: { ISSANCE_TRUSTED_USER: "pat@example.com" },
+      files: { ...healthyFiles(), ...markerFile(LEAD) },
+    });
+    await findings(h);
+    const own = h.sent.filter((r) => r.url === "http://127.0.0.1:8787/api/snapshot");
+    expect(own).toHaveLength(1);
+    // `Headers` lower-cases what it is given; the wire name is case-insensitive either way.
+    expect(own[0]?.headers["tailscale-user-login"]).toBe("pat@example.com");
+    // And never on a crew leg: those go to another machine, where this login is not ours to claim.
+    for (const r of h.sent.filter((x) => x.url.startsWith("https://"))) {
+      expect(r.headers["tailscale-user-login"]).toBeUndefined();
+    }
+  });
+
+  test("no configured login means no invented header, and the refusal reads as a refusal", async () => {
+    const h = harness(LEAD, [hello(), hello()], { files: { ...healthyFiles(), ...markerFile(LEAD) } });
+    await findings(h);
+    const own = h.sent.find((r) => r.url === "http://127.0.0.1:8787/api/snapshot");
+    expect(own?.headers["tailscale-user-login"]).toBeUndefined();
+  });
+
+  // Reads need a pairing token since ADR 0086, and this process holds none: the bridge writes a local
+  // read credential to `<stateDir>/local-secret` at start, and this verb sends it on its own read.
+  test("the bridge's own snapshot carries the local read credential when the file is there", async () => {
+    const secret = "A".repeat(43);
+    const h = harness(LEAD, [hello(), hello()], {
+      files: { ...healthyFiles(), ...markerFile(LEAD), [`${STATE}/local-secret`]: `${secret}\n` },
+    });
+    await findings(h);
+    const own = h.sent.find((r) => r.url === "http://127.0.0.1:8787/api/snapshot");
+    expect(own?.headers.authorization).toBe(`Bearer ${secret}`);
+    // Never on a crew leg (those carry the crew secret): the credential is this host's own bridge's.
+    for (const r of h.sent.filter((x) => x.url.startsWith("https://"))) expect(r.headers.authorization).not.toContain(secret);
+  });
+
+  test("no local-secret file, or one that is not secret-shaped, means no Authorization header", async () => {
+    const extras: Record<string, string>[] = [{}, { [`${STATE}/local-secret`]: "not-a-secret\n" }];
+    for (const extra of extras) {
+      const h = harness(LEAD, [hello(), hello()], { files: { ...healthyFiles(), ...markerFile(LEAD), ...extra } });
+      await findings(h);
+      const own = h.sent.find((r) => r.url === "http://127.0.0.1:8787/api/snapshot");
+      expect(own?.headers.authorization).toBeUndefined();
+    }
+  });
+
+  test("member-versions: skew WARNS naming both versions — §7.1 refuses nothing, so nor does this", async () => {
+    const { code, byCheck } = await findings(
+      harness(LEAD, [hello({ version: "1.0.0-alpha.9" })], {
+        files: { ...healthyFiles(), ...markerFile(LEAD) },
+      }),
+    );
+    const f = byCheck.get("member-versions");
+    expect(f?.status).toBe("warn");
+    expect(f?.detail).toContain("1.0.0-alpha.9");
+    expect(f?.detail).toContain("1.0.0-alpha.12");
+    expect(f?.remedy).toContain("issance crew update");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("member-versions: a member that reported none renders as pre-amendment, not as an error", async () => {
+    const { code, byCheck } = await findings(
+      harness(LEAD, [hello({ version: null })], { files: { ...healthyFiles(), ...markerFile(LEAD) } }),
+    );
+    const f = byCheck.get("member-versions");
+    expect(f?.status).toBe("ok");
+    expect(f?.detail).toContain("pre-1.0.0-alpha.12 (not reported)");
+    expect(f?.detail).toContain("laptop");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("member-surface: names each member's reader version, or none for an older build", async () => {
+    const withReader = await findings(
+      harness(LEAD, [hello({ surfaceVersion: 2 })], { files: { ...healthyFiles(), ...markerFile(LEAD) } }),
+    );
+    const named = withReader.byCheck.get("member-surface");
+    expect(named?.status).toBe("ok");
+    expect(named?.scope).toBe("crew");
+    expect(named?.detail).toContain("laptop reader 2");
+    const silent = await findings(
+      harness(LEAD, [hello()], { files: { ...healthyFiles(), ...markerFile(LEAD) } }),
+    );
+    expect(silent.byCheck.get("member-surface")?.status).toBe("ok");
+    expect(silent.byCheck.get("member-surface")?.detail).toContain("laptop none (older build)");
+    expect(silent.code).toBe(EXIT.OK);
+  });
+
+  test("member-versions: same version everywhere is one quiet ✓", async () => {
+    const { byCheck } = await findings(
+      harness(LEAD, [hello()], { files: { ...healthyFiles(), ...markerFile(LEAD) } }),
+    );
+    expect(byCheck.get("member-versions")?.status).toBe("ok");
+    expect(byCheck.get("member-versions")?.detail).toContain("1.0.0-alpha.12");
+  });
+});
+
+// ── The agent's own hooks, and the beacons they write (M11/05) ───────────────
+//
+// Every case here is READ-ONLY by construction: the fake filesystem records writes, and the suite's
+// existing "doctor wrote nothing" assertion covers these paths with the rest. What is asserted here
+// is the tier — a missing install is a `warn` and the run still exits 0, because a Hangar operator
+// will never install one.
+
+/** The Claude settings file `hooks install claude` writes on a default host. */
+const SETTINGS = `${HOME}/.claude/settings.json`;
+
+/** A settings document carrying our entry on every registered event, at `version`. */
+function settingsWith(command: string): string {
+  const hooks: JsonObject = {};
+  for (const registration of BEACON_HOOKS) {
+    hooks[registration.event] = [{ matcher: registration.matcher, hooks: [{ type: "command", command }] }];
+  }
+  return JSON.stringify({ hooks }, null, 2);
+}
+
+/** The command an install at `version` would have written, pinned to `binary`. */
+const hookCommand = (binary: string, version = HOOK_MARKER): string => `${binary} beacon emit ${version}`;
+
+/** One beacon on disk, alive or not. Markers are opaque here — this suite only counts. */
+function beacon(pid: number, alive: boolean): FakeBeacon {
+  return {
+    alive,
+    record: {
+      schemaVersion: BEACON_SCHEMA_VERSION,
+      harness: "claude",
+      session: { kind: "id", value: `session-${String(pid)}` },
+      status: "idle",
+      pid,
+      pidStartTime: pid * 10,
+      markers: [{ namespace: "fixture", scope: "/socket", pane: `%${String(pid)}` }],
+      heartbeatMs: FAKE_BEACON_NOW - 1000,
+    },
+  };
+}
+
+// ── What a missing install costs depends on the MULTIPLEXER ──────────────────
+// Hangar names the agent from its own wire (`agentDetection`), so nobody will ever install the
+// emitter there and a red line would be noise. tmux and zellij declare that capability absent, so
+// the emitter is the only thing that can give them sight: without it every pane is a shell. The
+// tier is read from the adapter's declaration, never from the name — these tests pin both halves.
+
+/** Where the tmux adapter's own candidate list looks first, and what a healthy host has there. */
+const TMUX_BIN = "/usr/bin/tmux";
+/** Where zellij's own installer puts it — the first candidate `zellijBinaryCandidates` probes. */
+const ZELLIJ_BIN = `${HOME}/.local/bin/zellij`;
+const TMUX_SOCKET = "/run/issance-tmux.sock";
+/** The env of a issance driving tmux on a named socket path (`-S`, per `tmuxServerArgs`). */
+const ON_TMUX = { ISSANCE_MUX: "tmux", ISSANCE_MUX_ENDPOINT_TMUX: TMUX_SOCKET };
+/** The env of a issance driving one named zellij session. */
+const ON_ZELLIJ = { ISSANCE_MUX: "zellij", ISSANCE_MUX_ENDPOINT_ZELLIJ: "work" };
+
+/** tmux's single joined invocation: the version on the first line, one session per line after it. */
+const tmuxAnswers = (stdout: string, code = 0): Scripted["answers"] => [
+  [`${TMUX_BIN} -S ${TMUX_SOCKET} display-message`, { stdout, code, stderr: code === 0 ? "" : stdout }],
+  ...HEALTHY_ANSWERS!,
+];
+const zellijAnswers = (stdout: string, code = 0): Scripted["answers"] => [
+  [`${ZELLIJ_BIN} list-sessions`, { stdout, code }],
+  ...HEALTHY_ANSWERS!,
+];
+
+// ── mux ──────────────────────────────────────────────────────────────────────
+// READ-ONLY like everything else here: the probe is the cheapest listing each multiplexer answers,
+// and there is no argv in this check that could start a server, attach a client or create a session.
+
+describe("mux", () => {
+  test("herdr states the name and defers — the socket is `hangar-socket`'s question, asked once", async () => {
+    const { byCheck, code } = await findings(harness(null, [], { env: { ISSANCE_MUX: "herdr" } }));
+    const finding = byCheck.get("mux")!;
+    expect(finding.status).toBe("ok");
+    expect(finding.detail).toBe("herdr — see herdr-socket · set by ISSANCE_MUX");
+    expect(finding.remedy).toBeNull();
+    expect(code).toBe(EXIT.OK);
+  });
+
+  // Since M14/03 an unset ISSANCE_MUX is not silently "herdr" — `issance start` probes and decides, so
+  // `doctor` names the multiplexer that decision would land on, and the evidence for it.
+  test("with nothing configured it names what `start` would pick, and why", async () => {
+    const { byCheck, code } = await findings(harness(null));
+    const finding = byCheck.get("mux")!;
+    expect(finding.status).toBe("ok");
+    expect(finding.detail).toContain("no ISSANCE_MUX");
+    expect(finding.detail).toContain(`a Hangar socket at ${SOCKET}`);
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("nothing configured and nothing running is an error — that `start` refuses is the finding", async () => {
+    const h = harness(null, [], { files: without(healthyFiles(), SOCKET) });
+    const { byCheck } = await findings(h);
+    const finding = byCheck.get("mux")!;
+    expect(finding.status).toBe("error");
+    expect(finding.detail).toContain("no multiplexers are running");
+    expect(finding.remedy).toContain("ISSANCE_MUX=<durable|herdr|tern|tmux|tuios|zellij> issance start");
+  });
+
+  test("nothing configured and two multiplexers running is an error naming both", async () => {
+    const h = harness(null, [], {
+      files: { ...healthyFiles(), [TMUX_BIN]: "" },
+      answers: [[`${TMUX_BIN} list-sessions`, { stdout: "work\n" }], ...HEALTHY_ANSWERS!],
+    });
+    const { byCheck } = await findings(h);
+    const finding = byCheck.get("mux")!;
+    expect(finding.status).toBe("error");
+    expect(finding.detail).toContain("2 multiplexers are running");
+    expect(finding.detail).toContain("herdr");
+    expect(finding.detail).toContain("tmux");
+  });
+
+  test("tmux: a server that answers reports its version, its socket and its session count", async () => {
+    const h = harness(null, [], {
+      env: ON_TMUX,
+      files: { ...healthyFiles(), [TMUX_BIN]: "" },
+      answers: tmuxAnswers("3.6b\nwork\nscratch\n"),
+    });
+    const { byCheck, code } = await findings(h);
+    const finding = byCheck.get("mux")!;
+    expect(finding.status).toBe("ok");
+    expect(finding.detail).toBe(`tmux 3.6b · socket ${TMUX_SOCKET} · 2 sessions · set by ISSANCE_MUX`);
+    // One invocation, not two: the version and the listing are `;`-joined as the adapter joins its own.
+    expect(h.calls.filter((c) => c.startsWith(TMUX_BIN))).toEqual([
+      `${TMUX_BIN} -S ${TMUX_SOCKET} display-message -p -F #{version} ; list-sessions -F #{session_name}`,
+    ]);
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("tmux: no binary is an error naming ISSANCE_TMUX_BIN, and PATH is never the answer", async () => {
+    const h = harness(null, [], { env: ON_TMUX, answers: HEALTHY_ANSWERS });
+    const { byCheck, code } = await findings(h);
+    const finding = byCheck.get("mux")!;
+    expect(finding.status).toBe("error");
+    expect(finding.detail).toContain("no tmux binary to run");
+    expect(finding.remedy).toContain("ISSANCE_TMUX_BIN");
+    expect(code).toBe(EXIT.FAIL);
+  });
+
+  test("tmux: a binary but no server is an error, and the remedy never starts one for you", async () => {
+    const h = harness(null, [], {
+      env: ON_TMUX,
+      files: { ...healthyFiles(), [TMUX_BIN]: "" },
+      answers: tmuxAnswers("no server running on /run/issance-tmux.sock", 1),
+    });
+    const { byCheck, code } = await findings(h);
+    const finding = byCheck.get("mux")!;
+    expect(finding.status).toBe("error");
+    expect(finding.detail).toContain("no server answered");
+    expect(finding.remedy).toContain("tmux -S /run/issance-tmux.sock new -d");
+    expect(finding.remedy).toContain("ISSANCE_MUX_ENDPOINT_TMUX");
+    expect(code).toBe(EXIT.FAIL);
+  });
+
+  test("zellij: the named session running is ok; an absent one is an error naming it", async () => {
+    const files = { ...healthyFiles(), [ZELLIJ_BIN]: "" };
+    const live = await findings(
+      harness(null, [], { env: ON_ZELLIJ, files, answers: zellijAnswers("work\nscratch (EXITED - attach to resurrect)\n") }),
+    );
+    expect(live.byCheck.get("mux")?.status).toBe("ok");
+    expect(live.byCheck.get("mux")?.detail).toBe(
+      "zellij · session work · 1 running of 2 listed · set by ISSANCE_MUX",
+    );
+    expect(live.code).toBe(EXIT.OK);
+
+    const gone = await findings(harness(null, [], { env: ON_ZELLIJ, files, answers: zellijAnswers("scratch\n") }));
+    const finding = gone.byCheck.get("mux")!;
+    expect(finding.status).toBe("error");
+    expect(finding.detail).toContain('no running zellij session called "work"');
+    expect(finding.remedy).toContain("zellij -s work");
+    expect(gone.code).toBe(EXIT.FAIL);
+  });
+
+  test("an unknown mux name is an error naming the ones this build drives", async () => {
+    const h = harness(null, [], { env: { ISSANCE_MUX: "screen" } });
+    const { byCheck, code } = await findings(h);
+    const finding = byCheck.get("mux")!;
+    expect(finding.status).toBe("error");
+    expect(finding.detail).toContain('ISSANCE_MUX="screen"');
+    for (const name of ["herdr", "tmux", "zellij"]) expect(finding.remedy).toContain(name);
+    expect(code).toBe(EXIT.FAIL);
+    // And it does NOT stack a second red line on the same typo: the hooks check reads the unknown
+    // adapter optimistically, because `mux` above is already the finding about it.
+    expect(byCheck.get("beacon-hooks-claude")?.status).toBe("ok");
+  });
+});
+
+// ── The finding set is scoped by the CHOSEN multiplexer ──────────────────────
+// issance mirrors ONE multiplexer per install. On tmux or zellij, Hangar's socket, its build and its
+// per-agent `integration` hooks drive nothing here — the bridge never dials that socket, and the
+// hook that names an agent is issance's own. Those checks are ABSENT rather than a hollow `ok`, and
+// a healthy host exits 0: `issance doctor` failing on a working tmux install is the bug these pin.
+
+/** The checks that only mean something under Hangar — none of them may appear on another mux. */
+const isHerdrCheck = (check: string): boolean =>
+  check.startsWith("herdr-") || check.startsWith("integration-") || check === "hook-python3";
+
+/** A healthy tmux host with NO Hangar anywhere: a socket-less filesystem and no `hangar` binary. */
+const tmuxOnly = () => ({
+  env: ON_TMUX,
+  files: { ...without(healthyFiles(), SOCKET), [TMUX_BIN]: "" },
+  answers: tmuxAnswers("3.4\nwork\n"),
+  absent: ["herdr"],
+});
+
+// ── Pairing is always on (M46 spec 03, ADR 0086) ────────────────────────────
+// A bridge with no paired device answers only `/api/health` and `/api/pair`. `doctor` says so, and
+// names the one command that fixes it.
+describe("pairing — doctor points to issance pair", () => {
+  test("no device paired: a warning that names issance pair", async () => {
+    const { code, byCheck } = await findings(harness(null, [], { files: without(healthyFiles(), PAIRED_DEVICES) }));
+    const pairing = byCheck.get("pairing");
+    expect(pairing?.status).toBe("warn");
+    expect(pairing?.detail).toContain("no device paired yet");
+    expect(pairing?.detail).toContain("device not paired");
+    expect(pairing?.remedy).toContain("`issance pair`");
+    // A warning, so a fresh install still exits clean: it is the state every install starts in.
+    expect(code).toBe(EXIT.OK);
+  });
+
+  // The bridge answers 503 `pairing unavailable` over such a file, never `device not paired`
+  // (bridge/pairing.ts, RegistryUnreadableError), so doctor must not call it "no device paired".
+  test("an unreadable registry is its own warning, not \"no device paired\"", async () => {
+    for (const body of ["{ not json", "", "[]", "null"]) {
+      const files = { ...healthyFiles(), [PAIRED_DEVICES]: body };
+      const pairing = (await findings(harness(null, [], { files }))).byCheck.get("pairing");
+      expect(pairing?.status).toBe("warn");
+      expect(pairing?.detail).toContain("cannot be read");
+      expect(pairing?.detail).toContain("pairing unavailable");
+      expect(pairing?.detail).not.toContain("no device paired");
+      expect(pairing?.remedy).toContain("`issance pair`");
+    }
+  });
+
+  test("every pairing expired: a warning that names issance pair", async () => {
+    const files = { ...healthyFiles(), [PAIRED_DEVICES]: pairedRegistry([{ label: "old", expiresAt: 1 }]) };
+    const pairing = (await findings(harness(null, [], { files }))).byCheck.get("pairing");
+    expect(pairing?.status).toBe("warn");
+    expect(pairing?.detail).toContain("expired");
+    expect(pairing?.remedy).toContain("`issance pair`");
+  });
+
+  test("one live device: ok, counted", async () => {
+    const pairing = (await findings(harness(null))).byCheck.get("pairing");
+    expect(pairing?.status).toBe("ok");
+    expect(pairing?.detail).toBe("1 device(s) paired");
+  });
+
+  test("a peer is skipped and pointed at the lead's issance pair", async () => {
+    const h = harness(peerStore(), [], { files: without(healthyFiles(), PAIRED_DEVICES) });
+    const pairing = (await findings(h)).byCheck.get("pairing");
+    expect(pairing?.status).toBe("skipped");
+    expect(pairing?.remedy).toContain("`issance pair` on the lead");
+  });
+});
+
+describe("the finding set is scoped by the chosen multiplexer", () => {
+  test("a healthy tmux host exits 0, and carries no Hangar check at all", async () => {
+    const { code, byCheck, raw } = await findings(harness(null, [], tmuxOnly()));
+    expect(code).toBe(EXIT.OK);
+    expect(raw.filter((f) => isHerdrCheck(f.check))).toEqual([]);
+    // The whole set, so a Hangar-flavoured check added later cannot slip in unnoticed.
+    expect([...byCheck.keys()]).toEqual([
+      "issance",
+      "config-file",
+      "web-dist",
+      "path-link",
+      "install",
+      "versions",
+      "update-source",
+      "bind",
+      "bind-wildcard",
+      "acl",
+      "front-door",
+      "pairing",
+      "mux",
+      ...(HOST.platform === "win32" ? ["windows-task", "windows-long-paths", "secrets-private"] : []),
+      "beacon-hooks-claude",
+      "beacons",
+      "skill-walky-talky",
+      "agent-sessions",
+      "journal-roots",
+      "cache-claims",
+      "cache-rules",
+      "cache-env",
+      "restart-pending",
+      "clock",
+    ]);
+    expect(raw.filter((f) => f.status === "error")).toEqual([]);
+  });
+
+  test("a healthy zellij host reads the same way", async () => {
+    const h = harness(null, [], {
+      env: ON_ZELLIJ,
+      files: { ...without(healthyFiles(), SOCKET), [ZELLIJ_BIN]: "" },
+      answers: zellijAnswers("work\n"),
+      absent: ["herdr"],
+    });
+    const { code, raw } = await findings(h);
+    expect(code).toBe(EXIT.OK);
+    expect(raw.filter((f) => isHerdrCheck(f.check))).toEqual([]);
+  });
+
+  // Presence is not relevance: a Hangar on PATH, with its socket right there, still drives nothing on
+  // a tmux install — so it buys back no check and no red line (the reading `issance`'s config-dir
+  // resolution already takes).
+  test("a Hangar installed alongside tmux buys back nothing", async () => {
+    const h = harness(null, [], {
+      env: ON_TMUX,
+      files: { ...healthyFiles(), [TMUX_BIN]: "" },
+      answers: tmuxAnswers("3.4\nwork\n"),
+    });
+    const { code, raw } = await findings(h);
+    expect(code).toBe(EXIT.OK);
+    expect(raw.filter((f) => isHerdrCheck(f.check))).toEqual([]);
+  });
+
+  // The `--json` array is what a script reads, and the plain rendering is what an operator reads.
+  test("neither `--json` nor the printed lines mention a Hangar check on tmux", async () => {
+    const h = harness(null, [], tmuxOnly());
+    expect(await cmdDoctor(h.deps, ["--json"])).toBe(EXIT.OK);
+    // SAFETY: `--json` prints the serialised `Finding[]` and nothing else, as in `findings` above.
+    const parsed = JSON.parse(h.io.stdout.join("\n")) as Finding[];
+    expect(parsed.some((f) => isHerdrCheck(f.check))).toBe(false);
+
+    const plain = harness(null, [], tmuxOnly());
+    expect(await cmdDoctor(plain.deps, [])).toBe(EXIT.OK);
+    for (const l of plain.io.stdout) {
+      expect(/\bherdr-(socket|version)\b|\bintegration-|\bhook-python3\b/.test(l)).toBe(false);
+    }
+  });
+
+  // Zero regression on the mux issance defaults to: every Hangar check still runs, and still fails.
+  test("under Hangar nothing is scoped away — a missing socket is still the error it was", async () => {
+    const h = harness(null, [], {
+      env: { ISSANCE_MUX: "herdr" },
+      files: without(healthyFiles(), SOCKET),
+    });
+    const { code, byCheck } = await findings(h);
+    expect(byCheck.get("herdr-socket")?.status).toBe("error");
+    expect(byCheck.get("herdr-version")).toBeDefined();
+    expect(byCheck.get("integration-claude")).toBeDefined();
+    // Not on Windows: Hangar's hooks there are PowerShell (M43 spec 08), and this suite runs on the real host.
+    if (HOST.platform !== "win32") expect(byCheck.get("hook-python3")).toBeDefined();
+    expect(code).toBe(EXIT.FAIL);
+  });
+});
+
+describe("beacon-hooks-claude", () => {
+  test("under a mux that reports agents itself, no install is OK — never a red line to learn to skip", async () => {
+    const h = harness(null, [], { files: without(healthyFiles(), SETTINGS) });
+    const { byCheck, code } = await findings(h);
+    const finding = byCheck.get("beacon-hooks-claude")!;
+    expect(finding.status).toBe("ok");
+    expect(finding.remedy).toBeNull();
+    expect(finding.detail).toContain("herdr reports agents itself");
+    expect(finding.detail).toContain("hooks installed: no");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("under a mux that does NOT, no install is an ERROR naming the install verb", async () => {
+    const h = harness(null, [], {
+      env: ON_TMUX,
+      files: { ...without(healthyFiles(), SETTINGS), [TMUX_BIN]: "" },
+      answers: tmuxAnswers("3.4\nwork\n"),
+    });
+    const { byCheck, code } = await findings(h);
+    const finding = byCheck.get("beacon-hooks-claude")!;
+    expect(finding.status).toBe("error");
+    expect(finding.remedy).toContain("issance hooks install claude");
+    // What it costs, in the operator's own symptoms — and what an install would pin to.
+    expect(finding.detail).toContain("reads as a shell");
+    expect(finding.detail).toContain("notification");
+    expect(finding.detail).toContain(OWN_BINARY);
+    expect(code).toBe(EXIT.FAIL);
+  });
+
+  test("an install under a blind mux is the ordinary ✓", async () => {
+    const h = harness(null, [], {
+      env: ON_ZELLIJ,
+      files: { ...healthyFiles(), [ZELLIJ_BIN]: "" },
+      answers: zellijAnswers("work\n"),
+    });
+    const { byCheck, code } = await findings(h);
+    const finding = byCheck.get("beacon-hooks-claude")!;
+    expect(finding.status).toBe("ok");
+    expect(finding.detail).not.toContain("does not need");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("a current install whose binary is there is ok, with no remedy", async () => {
+    const { byCheck } = await findings(harness(null));
+    const finding = byCheck.get("beacon-hooks-claude")!;
+    expect(finding.status).toBe("ok");
+    expect(finding.remedy).toBeNull();
+    expect(finding.detail).toContain(OWN_BINARY);
+    // Installed under Hangar is still ✓, and says that Hangar needs it for hook edges only.
+    expect(finding.detail).toContain("does not need");
+    expect(finding.detail).toContain("hook edges only");
+  });
+
+  test("a stale marker version is a warn whose remedy is the self-heal", async () => {
+    const stale = hookCommand(OWN_BINARY, `${HOOK_MARKER_PREFIX}0`);
+    const files = { ...healthyFiles(), [SETTINGS]: settingsWith(stale) };
+    const { byCheck, code } = await findings(harness(null, [], { files }));
+    const finding = byCheck.get("beacon-hooks-claude")!;
+    expect(finding.status).toBe("warn");
+    expect(finding.detail).toContain("v0");
+    expect(finding.remedy).toContain("issance hooks install claude");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("a hook pinned to a path that is gone is its own warn, and names `issance link`", async () => {
+    // The silent failure: valid JSON, our marker, and a command that can never run.
+    const moved = `${HOME}/old-checkout/bin/issance`;
+    const files = { ...healthyFiles(), [SETTINGS]: settingsWith(hookCommand(moved)) };
+    const { byCheck, code } = await findings(harness(null, [], { files }));
+    const finding = byCheck.get("beacon-hooks-claude")!;
+    expect(finding.status).toBe("warn");
+    expect(finding.detail).toContain(moved);
+    expect(finding.remedy).toContain("issance link");
+    expect(finding.remedy).toContain("issance hooks install claude");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  // The two "that is not an install" readings, asserted under a BLIND mux so the verdict is the
+  // loud one — under Hangar they are `ok` for the reason above, which would prove nothing here.
+  const blind = (settings: string) => ({
+    env: ON_TMUX,
+    files: { ...healthyFiles(), [SETTINGS]: settings, [TMUX_BIN]: "" },
+    answers: tmuxAnswers("3.4\nwork\n"),
+  });
+
+  test("a settings file that is not JSON is left alone and reads as no install", async () => {
+    const { byCheck } = await findings(harness(null, [], blind("{ this is not json")));
+    expect(byCheck.get("beacon-hooks-claude")?.status).toBe("error");
+  });
+
+  test("somebody else's hooks are not ours — an unmarked entry installs nothing", async () => {
+    const foreign = JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "notify-send hi" }] }] } });
+    const { byCheck } = await findings(harness(null, [], blind(foreign)));
+    expect(byCheck.get("beacon-hooks-claude")?.status).toBe("error");
+    expect(byCheck.get("beacon-hooks-claude")?.detail).toContain("no settings file");
+  });
+});
+
+describe("skill-walky-talky", () => {
+  const SKILL = join(HOME, ".claude", "skills", "issance-walky-talky", "SKILL.md");
+  const STAMP = "<!-- issance-skill walky-talky v1 issance 0.0.1 -->";
+
+  test("no install anywhere is OK, because nothing writes the skill unless the operator asks", async () => {
+    const finding = (await findings(harness(null))).byCheck.get("skill-walky-talky")!;
+    expect(finding.status).toBe("ok");
+    expect(finding.remedy).toBeNull();
+    expect(finding.detail).toContain("not installed");
+  });
+
+  test("a copy that differs from this build's text warns and names the install verb", async () => {
+    const h = harness(null, [], { files: { ...healthyFiles(), [SKILL]: `# older advice\n${STAMP}\n` } });
+    const { byCheck, code } = await findings(h);
+    const finding = byCheck.get("skill-walky-talky")!;
+    expect(finding.status).toBe("warn");
+    expect(finding.detail).toContain("claude");
+    expect(finding.remedy).toContain("issance skill install all");
+    expect(code).toBe(EXIT.OK);
+  });
+});
+
+describe("walky-refusals", () => {
+  const FILE = `${STATE}/walky/refusals.json`;
+
+  test("no counter file writes no row: a machine that never refused a message reads as before", async () => {
+    expect((await findings(harness(null))).byCheck.has("walky-refusals")).toBe(false);
+  });
+
+  test("a counter file is one ok row with the total, the first day and each reason, the most first", async () => {
+    const counts = { v: 1, since: Date.UTC(2026, 9, 18), counts: { "pair limit": 1, "rate limit": 3 } };
+    const h = harness(null, [], { files: { ...healthyFiles(), [FILE]: JSON.stringify(counts) } });
+    const finding = (await findings(h)).byCheck.get("walky-refusals")!;
+    expect(finding.status).toBe("ok");
+    expect(finding.detail).toBe("4 refused since 2026-10-18: rate limit 3, pair limit 1");
+  });
+});
+
+describe("beacons", () => {
+  test("an empty directory with no install says so, and names the install verb", async () => {
+    const { byCheck } = await findings(harness(null, [], { files: without(healthyFiles(), SETTINGS) }));
+    const finding = byCheck.get("beacons")!;
+    expect(finding.status).toBe("skipped");
+    expect(finding.remedy).toContain("issance hooks install claude");
+  });
+
+  test("an empty directory WITH an install points at the agent, not at the installer", async () => {
+    const finding = (await findings(harness(null))).byCheck.get("beacons")!;
+    expect(finding.status).toBe("skipped");
+    expect(finding.remedy).not.toContain("hooks install");
+    expect(finding.detail).toContain("installed");
+  });
+
+  test("an agent that has ended leaves an expired beacon, and that is still `ok`", async () => {
+    const finding = (await findings(harness(null, [], { beacons: [beacon(11, false)] }))).byCheck.get("beacons")!;
+    // The pane it belonged to is a shell again (M11/03) — which is the ORDINARY end of an agent, so
+    // the only honest verdict is `ok`. Doctor writes nothing either way: the sweep is a read.
+    expect(finding.status).toBe("ok");
+    expect(finding.detail).toContain("0 live");
+    expect(finding.detail).toContain("1 expired");
+    expect(finding.detail).toContain("reads as a shell");
+  });
+
+  test("counts live against expired, and an expired one is never a warning", async () => {
+    const beacons = [beacon(11, true), beacon(12, false), beacon(13, false)];
+    const finding = (await findings(harness(null, [], { beacons }))).byCheck.get("beacons")!;
+    expect(finding.status).toBe("ok");
+    expect(finding.detail).toContain("1 live");
+    expect(finding.detail).toContain("2 expired");
+  });
+});
+
+// ── The terminal seam ────────────────────────────────────────────────────────
+// Everything above this line runs with no `ui`, which is the point: absent is the default, and the
+// plain lines every assertion in this file pins are what a pipe, a test and `--plain` all get.
+describe("the terminal renderer", () => {
+  test("with a `ui`, the findings go to it and nothing is printed", async () => {
+    const { ui, views } = fakeUi();
+    const h = harness(null);
+    expect(await cmdDoctor({ ...h.deps, ui }, [])).toBe(EXIT.OK);
+    expect(h.io.stdout).toEqual([]);
+    expect(views).toHaveLength(1);
+    // The same findings, not a re-derived summary of them.
+    expect(views[0]!.local.map((f) => f.check)).toEqual((await plainFindings()).map((f) => f.check));
+    expect(views[0]!.crew).toEqual([]);
+    expect(views[0]!.crewNote[0]).toContain("not in a crew");
+  });
+
+  test("`--json` outranks the renderer — a script's stdout is never a drawing", async () => {
+    const { ui, views } = fakeUi();
+    const h = harness(null);
+    expect(await cmdDoctor({ ...h.deps, ui }, ["--json"])).toBe(EXIT.OK);
+    expect(views).toEqual([]);
+    expect(JSON.parse(h.io.stdout.join("\n"))).toBeArray();
+  });
+});
+
+/** The findings an equivalent plain run reports, read back out of `--json`. */
+async function plainFindings(): Promise<Finding[]> {
+  const fresh = harness(null);
+  await cmdDoctor(fresh.deps, ["--json"]);
+  // SAFETY: as in `findings` above — `--json` prints the serialised `Finding[]` and nothing else.
+  return JSON.parse(fresh.io.stdout.join("\n")) as Finding[];
+}
+
+// ── A packaged install (ADR 0035) ──────────────────────────────────────────
+// doctor gained a `packaged` case, and the code review caught that its NEIGHBOURS did not: three
+// other findings key on install kind, and each fell through to a line that is false on this one.
+// Every case here is one of those, so the omission cannot come back quietly.
+
+describe("issance doctor — a packaged install", () => {
+  /** A issance with a manifest, no `.git`, in a folder a package manager owns. */
+  function systemOwned(
+    link: Record<string, LinkProbe> = {},
+    answers: Scripted["answers"] = [],
+    replies: (Response | Error)[] = [],
+  ) {
+    const h = harness(null, replies, {
+      link,
+      answers: [...answers, [`git -C ${ROOT} rev-parse --show-prefix`, { code: 128 }], ...(HEALTHY_ANSWERS ?? [])],
+      // The manifest is what makes this a issance at all — `hasMarker` is asked before ownership, so
+      // without it the tree classifies `no-marker` and none of these findings would be exercised.
+      files: { ...healthyFiles(), [`${ROOT}/herdr-plugin.toml`]: 'id = "herdr.issance"\nversion = "1.5.2"\n' },
+    });
+    h.files.rootOwned.add(ROOT);
+    return h;
+  }
+
+  test("the install line reports the kind, the prefix and the PATH name pointing at it", async () => {
+    // The three facts an operator checks the install by hand with. Healthy, never a warning:
+    // nothing is wrong with this install.
+    const f = (await findings(systemOwned())).byCheck.get("install");
+    expect(f?.status).toBe("ok");
+    expect(f?.detail ?? "").toContain("packaged install");
+    expect(f?.detail ?? "").toContain(ROOT);
+    expect(f?.detail ?? "").toContain("updates come from your package manager");
+  });
+
+  test("the symlink is named when one points into this root, and its absence is stated", async () => {
+    const h = systemOwned();
+    // `/opt/issance` is the fake's root; a PATH name pointing into it is what a package installs.
+    expect((await findings(h)).byCheck.get("install")?.detail ?? "").toContain("no PATH name points at it");
+    const linked = systemOwned({ "/usr/bin/issance": { kind: "symlink", target: OWN_BINARY } });
+    expect((await findings(linked)).byCheck.get("install")?.detail ?? "").toContain("via /usr/bin/issance");
+  });
+
+  test("`versions` no longer promises a staging that will never happen", async () => {
+    // The regression the review found: the generic branch says "the next `issance update` stages
+    // one", three lines under an install line saying this install does not update itself.
+    const f = (await findings(systemOwned())).byCheck.get("versions");
+    expect(f?.status).toBe("skipped");
+    expect(f?.detail ?? "").not.toContain("stages one");
+  });
+
+  test("`update-source` does not name a GitHub repo this install never fetches from", async () => {
+    const f = (await findings(systemOwned())).byCheck.get("update-source");
+    expect(f?.detail ?? "").not.toContain("github.com");
+    expect(f?.detail ?? "").toContain("updates come from your package manager");
+  });
+
+  // ── restart-pending, the check this kind is the whole reason for ───────────
+  // `pacman -U` replaces `bin/issance` under a live service and restarts nothing. Everything below
+  // is that machine: a pid from the unit, and an executable that either is or is not the installed
+  // one. The old skip reason claimed "whatever installs the new version restarts it", which is
+  // exactly what a package manager does not do.
+
+  const MAIN_PID = "systemctl --user show issance --property=MainPID --value";
+  const PID = 4242;
+  const EXE = `/proc/${String(PID)}/exe`;
+  const BINARY = OWN_BINARY;
+  const supervised = (link: Record<string, LinkProbe> = {}) =>
+    systemOwned(link, [[MAIN_PID, { stdout: `${String(PID)}\n` }]]);
+
+  test("`restart-pending` fires when the running issance was unlinked under the service", async () => {
+    const h = supervised();
+    h.files.links.set(EXE, `${BINARY} (deleted)`);
+    const f = (await findings(h)).byCheck.get("restart-pending");
+    expect(f?.status).toBe("warn");
+    expect(f?.detail ?? "").toContain(BINARY);
+    expect(f?.remedy).toContain("issance restart");
+  });
+
+  test("`restart-pending` fires on a same-version rebuild, where no version string moved", async () => {
+    // The inode is the only witness here: `pacman -U` of a new pkgrel writes a NEW file at the same
+    // path, so the link resolves, every version file agrees, and the process is still stale.
+    const h = supervised();
+    h.files.links.set(EXE, BINARY);
+    h.files.stats.set(EXE, { inode: 111, mtimeMs: 0 });
+    h.files.stats.set(BINARY, { inode: 222, mtimeMs: 0 });
+    const f = (await findings(h)).byCheck.get("restart-pending");
+    expect(f?.status).toBe("warn");
+    expect(f?.remedy).toContain("issance restart");
+  });
+
+  test("`restart-pending` passes when the process and the file are one inode", async () => {
+    const h = supervised();
+    h.files.links.set(EXE, BINARY);
+    h.files.stats.set(EXE, { inode: 111, mtimeMs: 0 });
+    h.files.stats.set(BINARY, { inode: 111, mtimeMs: 0 });
+    const f = (await findings(h)).byCheck.get("restart-pending");
+    expect(f?.status).toBe("ok");
+    expect(f?.detail ?? "").toContain(BINARY);
+    expect(f?.remedy).toBeNull();
+  });
+
+  test("`restart-pending` is skipped with no pid, and no longer claims anything restarts the process", async () => {
+    const f = (await findings(systemOwned())).byCheck.get("restart-pending");
+    expect(f?.status).toBe("skipped");
+    expect(f?.detail ?? "").toContain("no pid");
+    expect(f?.detail ?? "").not.toContain("restarts it");
+    expect(f?.remedy).toContain("issance restart");
+  });
+
+  // ── The bridge's own verdict comes first (issue #238, second half) ─────────
+  // On a Mac under launchd there is no systemd `MainPID`, no pidfile (that tier never writes one),
+  // no crew marker on a solo install, and no `/proc` even with a pid. Every tier above declines,
+  // and the check said "no pid" against a bridge that was up and already knew the answer: it
+  // reports `update.restartNeeded` on every snapshot. So that is read first, off the one snapshot
+  // request `doctor` already makes, and the process is read from outside only when it is silent.
+
+  /** A solo bridge's own `/api/snapshot`, carrying its verdict and nothing else this section reads. */
+  const ownSnapshot = (update: { restartNeeded: boolean; restartCommand?: string }) =>
+    new Response(JSON.stringify({ agents: [], update }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+
+  test("`restart-pending` takes the bridge's own word that it was replaced, with the command it spells", async () => {
+    const h = systemOwned({}, [], [ownSnapshot({ restartNeeded: true, restartCommand: "systemctl --user restart issance" })]);
+    const f = (await findings(h)).byCheck.get("restart-pending");
+    expect(f?.status).toBe("warn");
+    expect(f?.detail ?? "").toContain(BINARY);
+    expect(f?.detail ?? "").toContain("nothing restarted it");
+    expect(f?.remedy).toBe("`systemctl --user restart issance`");
+    // No pid was ever asked for: the bridge answered, so the process was not read from outside.
+    expect(h.calls.some((c) => c.includes("MainPID"))).toBe(false);
+  });
+
+  test("`restart-pending` passes on the bridge's own word, and says how much of it was checked", async () => {
+    const h = systemOwned({}, [], [ownSnapshot({ restartNeeded: false })]);
+    const f = (await findings(h)).byCheck.get("restart-pending");
+    expect(f?.status).toBe("ok");
+    expect(f?.detail ?? "").toContain("the running bridge reports it is executing");
+    if (process.platform === "linux") expect(f?.detail ?? "").not.toContain("version alone");
+    else expect(f?.detail ?? "").toContain("version alone");
+    expect(f?.remedy).toBeNull();
+  });
+
+  test("a refused snapshot falls back to the process, and the skip says the bridge refused", async () => {
+    // The reporter's machine before the first half of #238 shipped: identity required, no pid.
+    const h = systemOwned({}, [], [new Response("identity required", { status: 403 })]);
+    const f = (await findings(h)).byCheck.get("restart-pending");
+    expect(f?.status).toBe("skipped");
+    expect(f?.detail ?? "").toContain("refused");
+    expect(f?.detail ?? "").toContain("403");
+    expect(f?.detail ?? "").toContain("no pid");
+  });
+
+  test("the bridge's verdict does not outrank the process when the process can be read", async () => {
+    // Belt and braces are not the design: the bridge answers first when it answers at all, so a
+    // supervised Linux install with a healthy inode and a bridge saying `restartNeeded: true` reports
+    // the bridge's warning. On Linux the bridge's two witnesses are a superset of this one; elsewhere
+    // this one cannot run at all, so there is no second opinion to weigh.
+    const h = systemOwned({}, [[MAIN_PID, { stdout: `${String(PID)}\n` }]], [ownSnapshot({ restartNeeded: true })]);
+    h.files.links.set(EXE, BINARY);
+    h.files.stats.set(EXE, { inode: 111, mtimeMs: 0 });
+    h.files.stats.set(BINARY, { inode: 111, mtimeMs: 0 });
+    const f = (await findings(h)).byCheck.get("restart-pending");
+    expect(f?.status).toBe("warn");
+    expect(f?.remedy).toBe("`issance restart`");
+  });
+
+  test("a checkout ignores the bridge's verdict: there `bridgeStale` is the answer, and this stays skipped", async () => {
+    const f = (await findings(harness(null, [ownSnapshot({ restartNeeded: true })]))).byCheck.get("restart-pending");
+    expect(f?.status).toBe("skipped");
+    expect(f?.detail).toContain("records no version");
+  });
+
+  test("a linked clone still gets every one of those answers the old way", async () => {
+    // The control. All four assertions above must fail on a checkout, or they are pinning nothing.
+    const run = await findings(harness(null));
+    expect(run.byCheck.get("update-source")?.detail ?? "").toContain("github.com");
+    expect(run.byCheck.get("versions")?.status).not.toBe("skipped");
+  });
+});
+
+// ── The config file (ADR 0040) ───────────────────────────────────────────────
+
+describe("the config-file finding", () => {
+  const HOME_FILE = join(HOME, ".issance", "config.toml");
+  const INSTANCE_FILE = join(CONFIG, "config.toml");
+
+  /** A layer over seeded text, optionally with a file the process cannot make owner-only. */
+  function layer(seed: Record<string, string>, tightenable = true): ConfigFileLayer {
+    const entries = new Map(Object.entries(seed));
+    const reader: ConfigFileReader = {
+      read: (p) => ({ text: entries.get(p) ?? null, error: null }),
+    };
+    return readConfigFilesSync(reader, configFilePaths({}, HOME, CONFIG), () => {}, {
+      home: HOME,
+      perms: { mode: () => 0o644, tighten: () => tightenable },
+    });
+  }
+
+  test("config-file names BOTH paths and their presence, even with no file at all", async () => {
+    const { byCheck } = await findings(harness(null));
+    const f = byCheck.get("config-file")!;
+    expect(f.status).toBe("skipped");
+    expect(f.detail).toContain(HOME_FILE);
+    expect(f.detail).toContain(INSTANCE_FILE);
+    expect(f.detail).toContain("absent");
+    expect(f.remedy).toBe("`issance config init`");
+  });
+
+  test("config-file is ok when a file parsed clean", async () => {
+    const { byCheck } = await findings(
+      harness(null, [], { configLayer: layer({ [HOME_FILE]: "[network]\nport = 8800\n" }) }),
+    );
+    const f = byCheck.get("config-file")!;
+    expect(f.status).toBe("ok");
+    expect(f.detail).toContain("parsed clean");
+  });
+
+  test("config-file warns with the count and the remedy when a file had problems", async () => {
+    const { byCheck } = await findings(
+      harness(null, [], { configLayer: layer({ [HOME_FILE]: "[bridge]\npoll_mss = 1\n" }) }),
+    );
+    const f = byCheck.get("config-file")!;
+    expect(f.status).toBe("warn");
+    expect(f.detail).toContain("1 problem");
+    expect(f.remedy).toBe("`issance config check`");
+  });
+
+  test("config-file is bad when a secret was dropped for permissions", async () => {
+    const h = harness(null, [], {
+      configLayer: layer({ [HOME_FILE]: '[push]\nvapid_private = "x"\n' }, false),
+    });
+    // The POSIX remedy, pinned: on a Windows test host the line below would name icacls instead.
+    h.deps = { ...h.deps, host: hostFor("linux") };
+    const { code, byCheck } = await findings(h);
+    const f = byCheck.get("config-file")!;
+    expect(f.status).toBe("error");
+    expect(f.detail).toContain("ISSANCE_VAPID_PRIVATE");
+    expect(f.detail).not.toContain('"x"');
+    expect(f.remedy).toContain("chmod 600");
+    // A dropped secret is a real failure, so the verb's exit code says so.
+    expect(code).not.toBe(EXIT.OK);
+  });
+
+  test("on Windows the dropped-secret remedy names icacls, never chmod (M43 spec 04)", async () => {
+    const h = harness(null, [], {
+      configLayer: layer({ [HOME_FILE]: '[push]\nvapid_private = "x"\n' }, false),
+    });
+    h.deps = { ...h.deps, host: hostFor("win32") };
+    const f = (await findings(h)).byCheck.get("config-file")!;
+    expect(f.status).toBe("error");
+    expect(f.remedy).toBe("run the `icacls` line the warning above names for that file, then `issance restart`");
+  });
+
+  test("solo on a Windows host says it cannot join or lead, and suggests no verb that refuses", async () => {
+    const h = harness(null);
+    h.deps = { ...h.deps, host: hostFor("win32") };
+    await cmdDoctor(h.deps, []);
+    const lines = h.io.stdout;
+    const at = lines.indexOf("crew: none — this issance is not in a crew.");
+    expect(at).toBeGreaterThan(-1);
+    expect(lines[at + 1]).toBe("  A Windows machine cannot join or lead a crew in this release.");
+    expect(lines.join("\n")).not.toContain("crew invite");
+  });
+
+  test("solo on a POSIX host still names both ways into a crew", async () => {
+    const h = harness(null);
+    h.deps = { ...h.deps, host: hostFor("linux") };
+    await cmdDoctor(h.deps, []);
+    const lines = h.io.stdout;
+    const at = lines.indexOf("crew: none — this issance is not in a crew.");
+    expect(lines[at + 1]).toBe("  `issance crew invite` here makes it a lead; `issance join …` makes it a peer.");
+  });
+
+  test("a typo'd ISSANCE_CONFIG shows as an absent path rather than as silence", async () => {
+    const reader: ConfigFileReader = { read: () => ({ text: null, error: null }) };
+    const typo = readConfigFilesSync(
+      reader,
+      configFilePaths({ ISSANCE_CONFIG: "/etc/issance-tpyo.toml" }, HOME, CONFIG),
+      () => {},
+      { home: HOME },
+    );
+    const { byCheck } = await findings(
+      harness(null, [], { configLayer: typo, env: { ISSANCE_CONFIG: "/etc/issance-tpyo.toml" } }),
+    );
+    expect(byCheck.get("config-file")!.detail).toContain("/etc/issance-tpyo.toml (absent)");
+  });
+});
+
+// ── Windows: who the Task Scheduler task belongs to (M43 spec 05) ─────────────
+
+describe("hook-python3 on Windows (M43 spec 08)", () => {
+  // The rehearsal found `issance doctor` exiting 1 on every fresh Windows install without Python, and
+  // `issance update --check` red with it, which turned the phone's Update button off.
+  test("is no finding at all on Windows, where Hangar's hooks are PowerShell; elsewhere still an error", async () => {
+    const win = harness(null, [], { absent: ["python3"] });
+    win.deps = { ...win.deps, host: hostFor("win32") };
+    const { byCheck } = await findings(win);
+    expect(byCheck.has("hook-python3")).toBe(false);
+    expect(byCheck.has("windows-long-paths")).toBe(true);
+
+    const linux = harness(null, [], { absent: ["python3"] });
+    linux.deps = { ...linux.deps, host: hostFor("linux") };
+    const { byCheck: onLinux, code } = await findings(linux);
+    expect(onLinux.get("hook-python3")?.status).toBe("error");
+    expect(onLinux.has("windows-long-paths")).toBe(false);
+    expect(code).toBe(EXIT.FAIL);
+  });
+});
+
+describe("windows-long-paths", () => {
+  const reg = (value: string | null): Scripted["answers"] => [
+    [
+      `reg query ${LONG_PATHS_KEY} /v LongPathsEnabled`,
+      value === null
+        ? { code: 1, stderr: "ERROR: The system was unable to find the specified registry key or value." }
+        : { stdout: `\r\n${LONG_PATHS_KEY}\r\n    LongPathsEnabled    REG_DWORD    ${value}\r\n\r\n` },
+    ],
+  ];
+  const SHORT = "C:\\Users\\pat\\AppData\\Local\\issance\\versions\\1.16.0";
+  const run = (value: string | null, root = SHORT) =>
+    windowsLongPaths({ ctx: context({}, { root }), exec: fakeExec({ answers: reg(value) }) });
+
+  test("ok when long paths are on and the install folder is short", () => {
+    const f = run("0x1");
+    expect(f.status).toBe("ok");
+    expect(f.detail).toBe(`LongPathsEnabled is 1, and the install folder is ${SHORT.length} characters long`);
+  });
+
+  test("warns, never errors, when long paths are off, with the one line that turns them on", () => {
+    const f = run("0x0");
+    expect(f.status).toBe("warn");
+    expect(f.detail).toBe(
+      "Hangar cannot start a pane in a folder whose path is longer than 260 characters (os error 267). Keep your work folders short. LongPathsEnabled is 0 on this machine.",
+    );
+    expect(f.remedy).toContain("Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem' -Name LongPathsEnabled -Value 1");
+  });
+
+  test("warns when the install folder itself is long, whatever the switch says", () => {
+    const deep = `C:\\${"a".repeat(210)}\\versions\\1.16.0`;
+    const f = run("0x1", deep);
+    expect(f.status).toBe("warn");
+    expect(f.detail).toContain(`is ${deep.length} characters long`);
+    expect(f.remedy).toContain("ISSANCE_DIR");
+  });
+
+  test("a value it cannot read is skipped, never a failure", () => {
+    expect(run(null).status).toBe("skipped");
+  });
+});
+
+describe("secrets-private (M43 spec 04)", () => {
+  const WIN = hostFor("win32");
+  const WIN_STATE = `${WIN_HOME}\\.local\\state\\issance`;
+  const WIN_CONFIG = `${WIN_HOME}\\AppData\\Roaming\\\hangar\\\plugins\\config\\herdr.issance`;
+  const ENV = `${WIN_CONFIG}\\.env`;
+  // A folder made under C:\ (VM): Users read it, Authenticated Users change it.
+  const DRIVE = (name: string) =>
+    `${name}\r\nD:AI(A;OICIID;FA;;;BA)(A;OICIID;FA;;;SY)(A;OICIID;0x1200a9;;;BU)(A;ID;0x1301bf;;;AU)(A;OICIIOID;SDGXGWGR;;;AU)\r\n`;
+  const PRIVATE = (name: string) => `${name}\r\nD:PAI(A;OICI;FA;;;${WIN_SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)\r\n`;
+  const run = (trees: Record<string, string>, over: Parameters<typeof fakeOwnerOnly>[1] = {}, stateDir = WIN_STATE) =>
+    secretsPrivate({ ctx: context({}, { stateDir, configDir: WIN_CONFIG }), host: WIN, ownerOnly: fakeOwnerOnly(trees, over) });
+
+  test("ok: both folders private, in the words a person reads", () => {
+    const f = run({});
+    expect(f.status).toBe("ok");
+    expect(f.detail).toBe("the issance state folder and the issance config folder are private to your account, SYSTEM and Administrators");
+  });
+
+  test("a loose state folder is an error: who, the path on its own line, and the fix", () => {
+    const f = run({ [WIN_STATE]: DRIVE("issance") });
+    expect(f.status).toBe("error");
+    expect(f.detail).toBe(
+      `the issance state folder can be read by other accounts (Users [S-1-5-32-545], Authenticated Users [S-1-5-11]).\n${WIN_STATE}`,
+    );
+    expect(f.remedy).toBe(
+      `Fix: restart issance, or run: icacls "${WIN_STATE}" /grant:r "*${WIN_SID}:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" ` +
+        `"*S-1-5-32-544:(OI)(CI)F" /inheritance:r /remove:g *S-1-5-32-545 *S-1-5-11`,
+    );
+  });
+
+  test("an Everyone grant on .env names the file inside the folder, and the one reset that fixes it", () => {
+    const tree = `${PRIVATE("herdr.issance")}herdr.issance\\.env\r\nD:AI(A;;FR;;;WD)(A;ID;FA;;;BA)(A;ID;FA;;;SY)(A;ID;FA;;;${WIN_SID})\r\n`;
+    const f = run({ [WIN_CONFIG]: tree });
+    expect(f.status).toBe("error");
+    expect(f.detail).toBe(`the issance config folder holds files other accounts can read (Everyone [S-1-1-0]): .env.\n${WIN_CONFIG}`);
+    expect(f.remedy).toBe(`Fix: restart issance, or run: icacls "${ENV}" /reset`);
+  });
+
+  test("a custom folder issance does not own: the fix is the icacls line alone, never 'restart'", () => {
+    const custom = "D:\\Projects";
+    const f = run({ [custom]: DRIVE("Projects") }, { lists: { [custom]: ["src", "crew-trust.json"] } }, custom);
+    expect(f.status).toBe("error");
+    expect(f.remedy).toStartWith(`Fix: run: icacls "${custom}" /grant:r`);
+  });
+
+  test("a folder that cannot be checked is a warning, 'cannot confirm', never ok and never an error", () => {
+    const f = run({ [WIN_STATE]: ACL_TIMED_OUT });
+    expect(f.status).toBe("warn");
+    expect(f.detail).toBe(
+      `cannot confirm who can read the issance state folder: icacls did not answer within 10 seconds\n${WIN_STATE}`,
+    );
+    // FAT, exFAT or a share (simulated: icacls writes no list there).
+    expect(run({ [WIN_STATE]: ACL_NO_LIST }).detail).toContain("FAT, exFAT and network drives have none");
+  });
+
+  test("a foreign owner is an error even when the list is private: an owner can always change it", () => {
+    const f = run({}, { owners: { [`${WIN_STATE}\\crew-trust.json`]: "O:S-1-5-21-1-2-3-1002G:S-1-5-21-1-2-3-513D:(A;;FA;;;SY)" } });
+    expect(f.status).toBe("error");
+    expect(f.detail).toBe(
+      `crew-trust.json is owned by another account [S-1-5-21-1-2-3-1002], who can always change its permissions.\n${WIN_STATE}\\crew-trust.json`,
+    );
+    expect(f.remedy).toBe(`Fix: in an Administrator PowerShell, icacls "${WIN_STATE}\\crew-trust.json" /setowner "*${WIN_SID}"`);
+  });
+
+  test("nothing there yet is skipped", () => {
+    expect(run({}, { absent: [WIN_STATE, WIN_CONFIG] }).status).toBe("skipped");
+  });
+
+  test("is a line on Windows only, with the path printed on its own line", async () => {
+    const win = harness(null);
+    win.deps = { ...win.deps, host: WIN };
+    expect((await findings(win)).byCheck.get("secrets-private")?.status).toBe("ok");
+    const linux = harness(null);
+    linux.deps = { ...linux.deps, host: hostFor("linux") };
+    expect((await findings(linux)).byCheck.has("secrets-private")).toBe(false);
+    const loose = harness(null);
+    loose.deps = {
+      ...loose.deps,
+      host: WIN,
+      ctx: { ...loose.deps.ctx, stateDir: WIN_STATE, configDir: WIN_CONFIG },
+      ownerOnly: fakeOwnerOnly({ [WIN_STATE]: DRIVE("issance") }),
+    };
+    await cmdDoctor(loose.deps, []);
+    const out = loose.io.stdout.join("\n");
+    expect(out).toContain(`secrets-private       the issance state folder can be read by other accounts`);
+    expect(out).toContain(`\n${" ".repeat(33)}${WIN_STATE} → Fix: restart issance, or run: icacls`);
+  });
+});
+
+describe("windows-task", () => {
+  const WIN = hostFor("win32");
+  // The query opens with the UTF-8 line (`POWERSHELL_UTF8`), so a non-ASCII path comes back whole.
+  const QUERY = `powershell -NoProfile -NonInteractive -Command ${POWERSHELL_UTF8}$t = Get-ScheduledTask`;
+  const BIN = collieBinary(ROOT, WIN);
+  const answer = (args: string): Scripted["answers"] => [
+    [QUERY, { stdout: `Running\r\nC:\\WINDOWS\\system32\\conhost.exe\r\n${args}\r\n` }],
+  ];
+  const run = (answers: Scripted["answers"], absent: string[] = []) =>
+    windowsTask({ ctx: context(), exec: fakeExec({ answers, absent }), host: WIN, link: fakeLinkFs() });
+
+  test("names the program the task runs when it is this install's launcher", () => {
+    const f = run(answer(`--headless ${BIN} _supervise ISSANCE_PORT=8787`));
+    expect(f.status).toBe("ok");
+    expect(f.detail).toBe(`Task herdr.issance runs ${BIN} (Running)`);
+  });
+
+  test("a task that still runs the old script says so in one line, with the one command that fixes it", () => {
+    const f = run(answer(`--headless "C:\\ps\\powershell.exe" -File "${ROOT}\\contrib\\windows\\issance-ctl.ps1" _exec-bridge`));
+    expect(f.status).toBe("warn");
+    expect(f.detail).toContain("Task herdr.issance still runs the old script");
+    expect(f.remedy).toBe("Run: issance restart");
+  });
+
+  // The gate for M43 spec 06/08: a binary install's task registered on a version folder keeps
+  // relaunching that version after an update moves `current`.
+  test("a binary install whose task runs a version folder, not `current`, is a warning", () => {
+    const install = "C:\\Users\\pat\\.issance";
+    const root = `${install}\\versions\\1.16.0`;
+    const link = fakeLinkFs({ [`${install}\\current`]: { kind: "symlink", target: `${install}\\versions\\1.16.0` } });
+    const exec = fakeExec({
+      answers: [[QUERY, { stdout: `Running\r\nC:\\conhost.exe\r\n--headless ${collieBinary(root, WIN)} _supervise\r\n` }]],
+    });
+    const f = windowsTask({ ctx: context({}, { root }), exec, host: WIN, link });
+    expect(f.status).toBe("warn");
+    expect(f.detail).toContain(`runs ${collieBinary(root, WIN)}, not ${install}\\current\\bin\\issance.exe`);
+    expect(f.remedy).toBe("run `issance start` once: it registers the task on `current`");
+  });
+
+  test("a binary install whose task runs `current\\bin\\issance.exe` reads ok, whichever version runs", () => {
+    const install = "C:\\Users\\pat\\.issance";
+    const root = `${install}\\versions\\1.16.0`;
+    const link = fakeLinkFs({ [`${install}\\current`]: { kind: "symlink", target: `${install}\\versions\\1.16.0` } });
+    const program = `${install}\\current\\bin\\issance.exe`;
+    const exec = fakeExec({
+      answers: [[QUERY, { stdout: `Running\r\nC:\\conhost.exe\r\n--headless ${program} _supervise "ISSANCE_PLUGIN_ROOT=${install}\\current"\r\n` }]],
+    });
+    const f = windowsTask({ ctx: context({}, { root }), exec, host: WIN, link });
+    expect(f.status).toBe("ok");
+    expect(f.detail).toBe(`Task herdr.issance runs ${program} (Running)`);
+  });
+
+  test("another install's task is named, and no task or no PowerShell is a skip", () => {
+    const other = run(answer('--headless "D:\\other\\bin\\issance.exe" _supervise'));
+    expect(other.status).toBe("warn");
+    expect(other.detail).toContain("D:\\other\\bin\\issance.exe, another issance install");
+    expect(run([[QUERY, { code: 1 }]]).status).toBe("skipped");
+    expect(run([], ["powershell"]).status).toBe("skipped");
+  });
+});
+
+// ── POSIX parity (M43 spec 04) ──────────────────────────────────────────────
+describe("POSIX parity (M43 spec 04)", () => {
+  const GOLDEN = join(import.meta.dir, "testdata", "doctor-posix.golden.txt");
+  // The identity line names the machine the suite runs on, so it is the one line normalised.
+  const render = async (over: Parameters<typeof harness>[2] = {}): Promise<string> => {
+    const h = harness(null, [], over);
+    h.deps = { ...h.deps, host: hostFor("linux") };
+    await cmdDoctor(h.deps, []);
+    // Two lines are normalised: the machine's identity, and the age of the oldest cache claim, which
+    // grows by one every day and must not fail this test on the day after it was written.
+    const text = h.io.stdout.join("\n").replace(/ · [a-z0-9]+-[a-z0-9]+$/m, " · <platform>");
+    return `${text.replace(/the oldest was checked \d+ days? ago/g, "the oldest was checked <N> days ago")}\n`;
+  };
+  // A config.toml secret that could not be made private: the POSIX `config-file` remedy is pinned too.
+  const blocked = (): Parameters<typeof harness>[2] => ({
+    configLayer: readConfigFilesSync(
+      { read: (p) => ({ text: p === join(HOME, ".issance", "config.toml") ? '[push]\nvapid_private = "x"\n' : null, error: null }) },
+      configFilePaths({}, HOME, CONFIG),
+      () => {},
+      { home: HOME, perms: { mode: () => 0o644, tighten: () => false } },
+    ),
+  });
+
+  // The golden was written by this same block run before spec 04, then gained the integration-omp row from main (the
+  // healthy solo fixture, then a config.toml secret the mode rule could not tighten). The
+  // `secrets-private` line is Windows-only: on a POSIX host it does not exist at all.
+  test("the plain doctor output on a POSIX host is byte-identical to the one before spec 04", async () => {
+    const out = `${await render()}---\n${await render(blocked())}`;
+    const golden = readFileSync(GOLDEN, "utf8");
+    // Paths in the output are joined with the machine's own separator, so the byte comparison runs
+    // where the golden was made (POSIX). Windows compares the check ids and statuses line by line.
+    if (process.platform !== "win32") expect(out).toBe(golden);
+    const ids = (text: string) => text.split("\n").map((l) => /^\s+(\S+)\s+(\S+)/.exec(l)?.slice(1, 3).join(" ")).filter(Boolean);
+    expect(ids(out)).toEqual(ids(golden));
+    expect(out).not.toContain("secrets-private");
+  });
+});
+
+// ── stt.whistle-model (ADR 0096) ─────────────────────────────────────────────
+// One finding, and only when Whistle plays a part on this host. The model is read from a REAL temp
+// state dir (the store hashes a real file); everything else is the usual fakes.
+
+describe("stt.whistle-model", () => {
+  const MODEL = new TextEncoder().encode("a tiny stand-in for whistle.cact");
+  const SHA = createHash("sha256").update(MODEL).digest("hex");
+  const PIN = { url: "https://models.invalid/whistle.cact", revision: "ca5287601bef25af", sha256: SHA, bytes: MODEL.byteLength };
+
+  async function run(setup: (stateDir: string) => void, files: (stateDir: string) => Record<string, string> = () => ({})) {
+    const stateDir = mkdtempSync(join(tmpdir(), "issance-doctor-whistle-"));
+    try {
+      setup(stateDir);
+      const h = harness(null, [], { files: { ...healthyFiles(), ...files(stateDir) } });
+      return await findings({ ...h, deps: { ...h.deps, ctx: { ...h.deps.ctx, stateDir }, whistle: { pin: PIN, accepted: [SHA] } } });
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  }
+  const put = (stateDir: string, name: string, bytes: string | Uint8Array): void => {
+    mkdirSync(join(stateDir, "whistle"), { recursive: true });
+    writeFileSync(join(stateDir, "whistle", name), bytes);
+  };
+
+  test("no model and no host engine: no finding at all", async () => {
+    const { byCheck } = await run(() => undefined);
+    expect(byCheck.has("stt.whistle-model")).toBe(false);
+  });
+
+  test("a model that matches the pin is ok, and says its size, hash and revision", async () => {
+    const { byCheck, code } = await run((dir) => {
+      put(dir, "whistle.cact", MODEL);
+      put(dir, "whistle.json", JSON.stringify({ version: 1, model: { sha256: SHA, bytes: MODEL.byteLength, revision: "ca5287601bef25af", source: "x", fetchedAt: "2026-10-11T00:00:00.000Z" } }));
+    });
+    const f = byCheck.get("stt.whistle-model");
+    expect(f?.status).toBe("ok");
+    expect(f?.detail).toContain(`sha256 ${SHA.slice(0, 8)}`);
+    expect(f?.detail).toContain("revision ca528760");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("a file that is not this release's model is a warning with the verb that fixes it, not an error", async () => {
+    const { byCheck, code } = await run((dir) => put(dir, "whistle.cact", "some other bytes"));
+    const f = byCheck.get("stt.whistle-model");
+    expect(f?.status).toBe("warn");
+    expect(f?.detail).toContain("does not match this release");
+    expect(f?.remedy).toContain("issance stt whistle");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("a symlink where the model should be is a warning: it is not followed", async () => {
+    if (process.platform === "win32") return;
+    const { byCheck } = await run((dir) => {
+      mkdirSync(join(dir, "whistle"), { recursive: true });
+      symlinkSync(join(dir, "elsewhere"), join(dir, "whistle", "whistle.cact"));
+    });
+    const f = byCheck.get("stt.whistle-model");
+    expect(f?.status).toBe("warn");
+    expect(f?.detail).toContain("cannot be read");
+  });
+
+  test("a stt.json holding only a change stamp names no provider: no finding, no warning", async () => {
+    const stamp = JSON.stringify({ changedBy: "Pixel 8", changedAt: "2026-10-11T08:00:00.000Z" });
+    const { byCheck, code } = await run(() => undefined, (dir) => ({ [join(dir, "stt.json")]: stamp }));
+    expect(byCheck.has("stt.whistle-model")).toBe(false);
+    expect([...byCheck.keys()].filter((c) => c.startsWith("stt."))).toEqual([]);
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("the host engine is Whistle and the model is missing: a warning naming the verb", async () => {
+    const { byCheck } = await run(() => undefined, (dir) => ({ [join(dir, "stt.json")]: JSON.stringify({ provider: "whistle" }) }));
+    expect(byCheck.get("stt.whistle-model")).toMatchObject({ status: "warn", remedy: "run `issance stt whistle`" });
+  });
+});
+
+// ── doctor durable ───────────────────────────────────────────────────────────
+// The rows read a REAL socket: the fixture program of `bridge/mux/durable/fixture.ts` listens on one,
+// and the privacy check and the client are the adapter's own. Only the owner case needs a stand-in
+// user id, which the section takes through its `probe` seam.
+
+// Socket only: every row here reads a Unix socket. Windows has no socket transport (WIRE.md section 1A),
+// and `cli/durable-findings.test.ts` covers its rows with a fake platform.
+describe.skipIf(SOCKET_ONLY_SKIP)("doctor durable", () => {
+  const started: FakeDurableProgram[] = [];
+  const scratch: string[] = [];
+  afterEach(async () => {
+    for (const program of started.splice(0)) await program.close();
+    for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function startFake(): Promise<FakeDurableProgram> {
+    const made = await FakeDurableProgram.start();
+    started.push(made);
+    return made;
+  }
+  const onDurable = (socket: string | undefined) => ({ ISSANCE_MUX: "durable", ISSANCE_DURABLE_SOCKET: socket });
+  const durableRows = (run: JsonRun): [string, string][] =>
+    run.raw.filter((f) => f.check.startsWith("durable-")).map((f) => [f.check, f.status]);
+
+  test("a ready program in range gives four ok rows, skips the two https rows, and the mux line defers to them", async () => {
+    const fake = await startFake();
+    const run = await findings(harness(null, [], { env: onDurable(fake.socketPath) }));
+    expect(durableRows(run)).toEqual([
+      ["durable-env", "ok"],
+      ["durable-socket", "ok"],
+      ["durable-url", "skipped"],
+      ["durable-token", "skipped"],
+      ["durable-hello", "ok"],
+      ["durable-ready", "ok"],
+      ["durable-lead", "skipped"],
+    ]);
+    expect(run.byCheck.get("durable-env")!.detail).toContain("transport: private socket");
+    expect(run.byCheck.get("durable-url")!.detail).toContain("this peer uses the socket");
+    expect(run.byCheck.get("durable-hello")!.detail).toContain("speaks 1..1");
+    expect(run.byCheck.get("mux")).toMatchObject({ status: "ok", detail: "durable, see the durable-* lines · set by ISSANCE_MUX" });
+    expect(run.byCheck.get("beacon-hooks-claude")!.status).toBe("ok");
+    expect(fake.requests.every((r) => r.path === "/session/v1/hello")).toBe(true);
+  });
+
+  test("a mux other than durable gets no durable rows", async () => {
+    const run = await findings(harness(null, [], { env: { ISSANCE_MUX: "herdr", ISSANCE_DURABLE_SOCKET: "/tmp/x.sock" } }));
+    expect(durableRows(run)).toEqual([]);
+  });
+
+  test("an unset or relative variable fails the env row, names the variable and skips the rest", async () => {
+    for (const value of [undefined, "", "relative.sock"]) {
+      const run = await findings(harness(null, [], { env: onDurable(value) }));
+      expect(durableRows(run)).toEqual([
+        ["durable-env", "error"],
+        ["durable-socket", "skipped"],
+        ["durable-url", "skipped"],
+        ["durable-token", "skipped"],
+        ["durable-hello", "skipped"],
+        ["durable-ready", "skipped"],
+        ["durable-lead", "skipped"],
+      ]);
+      const row = run.byCheck.get("durable-env")!;
+      expect(row.detail).toContain("ISSANCE_DURABLE_SOCKET");
+      expect(row.remedy).toContain("ISSANCE_DURABLE_SOCKET");
+      expect(run.code).toBe(EXIT.FAIL);
+    }
+  });
+
+  test("a path with nothing at it fails the socket row and says the program is not running", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "doctor-durable-"));
+    scratch.push(dir);
+    const run = await findings(harness(null, [], { env: onDurable(join(dir, "none.sock")) }));
+    const row = run.byCheck.get("durable-socket")!;
+    expect(row.status).toBe("error");
+    expect(row.detail).toContain("nothing is at");
+    expect(row.remedy).toContain("start the durable agent");
+    expect(run.byCheck.get("durable-hello")!.status).toBe("skipped");
+  });
+
+  test("a regular file is refused as not a socket", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "doctor-durable-"));
+    scratch.push(dir);
+    const file = join(dir, "plain.sock");
+    writeFileSync(file, "", { mode: 0o600 });
+    const run = await findings(harness(null, [], { env: onDurable(file) }));
+    expect(run.byCheck.get("durable-socket")!.detail).toContain("is not a socket");
+  });
+
+  test("a socket open to the group is refused with its mode and the fix", async () => {
+    const fake = await startFake();
+    chmodSync(fake.socketPath, 0o660);
+    const run = await findings(harness(null, [], { env: onDurable(fake.socketPath) }));
+    const row = run.byCheck.get("durable-socket")!;
+    expect(row.status).toBe("error");
+    expect(row.detail).toContain("mode 0660");
+    expect(row.detail).toContain("must be 0600");
+    expect(row.remedy).toContain("chmod 600");
+    expect(run.byCheck.get("durable-hello")!.status).toBe("skipped");
+    expect(fake.requests).toEqual([]);
+  });
+
+  test("a socket owned by another user is refused and never dialled", async () => {
+    const fake = await startFake();
+    const probe: SocketProbe = { lstat: SYSTEM_PROBE.lstat, uid: () => (SYSTEM_PROBE.uid() ?? 0) + 1 };
+    const rows = await durableFindings({ ctx: context(onDurable(fake.socketPath)), probe });
+    const row = rows.find((f) => f.check === "durable-socket")!;
+    expect(row.status).toBe("error");
+    // The walk meets the socket's own folder first, and that folder is not the other user's either.
+    expect(row.detail).toContain("belongs to user");
+    expect(rows.find((f) => f.check === "durable-hello")!.status).toBe("skipped");
+    expect(fake.requests).toEqual([]);
+  });
+
+  test("a program that is down behind a stale socket fails the hello row with the reason", async () => {
+    const fake = await startFake();
+    fake.override = () => new Response("nope", { status: 500 });
+    const run = await findings(harness(null, [], { env: onDurable(fake.socketPath) }));
+    const row = run.byCheck.get("durable-hello")!;
+    expect(row.status).toBe("error");
+    expect(row.detail).toContain("status 500");
+    expect(run.byCheck.get("durable-ready")!.status).toBe("skipped");
+  });
+
+  test("a socket that answers without the durable service name fails the hello row as the wrong program", async () => {
+    const fake = await startFake();
+    fake.hello.service = undefined;
+    const run = await findings(harness(null, [], { env: onDurable(fake.socketPath) }));
+    const row = run.byCheck.get("durable-hello")!;
+    expect(row.status).toBe("error");
+    expect(row.detail).toContain("not a durable agent");
+    expect(row.remedy).toContain("ISSANCE_DURABLE_SOCKET");
+    expect(run.byCheck.get("durable-ready")!.status).toBe("skipped");
+  });
+
+  test("a program whose range does not overlap fails the hello row with both ranges", async () => {
+    const fake = await startFake();
+    fake.range = { min: 2, max: 3 };
+    fake.override = (path) =>
+      path === "/session/v1/hello" ? Response.json({ ...fake.hello, protocol: { min: 2, max: 3 }, epoch: fake.epoch, ready: true }) : undefined;
+    const run = await findings(harness(null, [], { env: onDurable(fake.socketPath) }));
+    const row = run.byCheck.get("durable-hello")!;
+    expect(row.status).toBe("error");
+    expect(row.detail).toContain("the durable agent speaks 2..3, this issance speaks 1..1");
+    expect(run.byCheck.get("durable-socket")!.status).toBe("ok");
+    expect(run.byCheck.get("durable-ready")!.status).toBe("skipped");
+  });
+
+  test("a program that asks for a token, or sends an unreadable hello, fails the hello row", async () => {
+    const fake = await startFake();
+    fake.asksForToken = true;
+    let run = await findings(harness(null, [], { env: onDurable(fake.socketPath) }));
+    expect(run.byCheck.get("durable-hello")!.detail).toContain("asks for a token");
+    fake.asksForToken = false;
+    fake.override = (path) => (path === "/session/v1/hello" ? new Response("not json", { status: 200 }) : undefined);
+    run = await findings(harness(null, [], { env: onDurable(fake.socketPath) }));
+    expect(run.byCheck.get("durable-hello")!.detail).toContain("unreadable");
+  });
+
+  test("a program that is not ready yet is a warning on the ready row, not a failure", async () => {
+    const fake = await startFake();
+    fake.ready = false;
+    const run = await findings(harness(null, [], { env: onDurable(fake.socketPath) }));
+    expect(durableRows(run)).toEqual([
+      ["durable-env", "ok"],
+      ["durable-socket", "ok"],
+      ["durable-url", "skipped"],
+      ["durable-token", "skipped"],
+      ["durable-hello", "ok"],
+      ["durable-ready", "warn"],
+      ["durable-lead", "skipped"],
+    ]);
+    expect(run.byCheck.get("durable-ready")!.remedy).toContain("issance doctor");
+    expect(run.code).toBe(EXIT.OK);
+  });
+});
+
+// ── the surface table (M56 spec 09) ──────────────────────────────────────────
+// A summary line and one line per harness and version, read from the bridge's day files over the last
+// seven days. A read: doctor writes nothing. With no counters there is no line at all, so a fresh
+// install reads exactly as it did.
+
+describe("doctor: the surface table (M56 spec 09)", () => {
+  const dayFile = (daysAgo: number): string => `${STATE}/surface/counters-${new Date(T0 - daysAgo * 86_400_000).toISOString().slice(0, 10)}.json`;
+  const day = (daysAgo: number, rows: Row[]): [string, string] => [
+    dayFile(daysAgo),
+    JSON.stringify({ date: new Date(T0 - daysAgo * 86_400_000).toISOString().slice(0, 10), rows: Object.fromEntries(rows.map((r, i) => [`k${String(i)}`, r])), unknownFrames: {}, manualAt: {} }),
+  ];
+  interface Row {
+    harness: string;
+    version: string;
+    profileId: string;
+    status: string;
+    free: number;
+    unknown: Record<string, number>;
+    modal: Record<string, number>;
+    refused: Record<string, number>;
+    probed: number;
+    manual: number;
+    sent: number;
+    effective: number;
+    unknown_outcome: number;
+    discarded: number;
+    held?: number;
+    held_sent?: number;
+    held_expired?: number;
+    held_cancelled?: number;
+  }
+  const row = (over: Partial<Row> = {}): Row => ({
+    harness: "agent",
+    version: "2.1.301",
+    profileId: "agent",
+    status: "provisional",
+    free: 100,
+    unknown: { "no-match": 6, "weak-cue": 2 },
+    modal: { permission: 3 },
+    refused: { not_free: 4 },
+    probed: 5,
+    manual: 1,
+    sent: 9,
+    effective: 0,
+    unknown_outcome: 1,
+    discarded: 1,
+    ...over,
+  });
+  const run = async (entries: [string, string][]) => findings(harness(null, [], { files: { ...healthyFiles(), ...Object.fromEntries(entries) } }));
+
+  test("surface: a host with no counters has no surface line at all", async () => {
+    const { raw } = await findings(harness(null));
+    expect(raw.filter((f) => f.check.startsWith("surface"))).toEqual([]);
+  });
+
+  test("surface: prints a summary and one line per harness and version, adding the last seven days", async () => {
+    const { byCheck, code } = await run([day(0, [row()]), day(3, [row({ free: 50, manual: 2 })]), day(10, [row({ free: 9999 })])]);
+    expect(code).toBe(0);
+    const summary = byCheck.get("surface")!;
+    expect(summary.status).toBe("ok");
+    expect(summary.detail).toContain("free 150 · unknown 16 · manual 3");
+    expect(summary.detail).toContain(join(STATE, "surface", "examples"));
+    expect(summary.detail).toContain(join(STATE, "surface", "inbox.jsonl"));
+    expect(summary.detail).toContain("3 day files");
+    const line = byCheck.get("surface-agent-2.1.301")!;
+    // 8 refusals against 18 sends is above the refusal rate, so the line warns (2026-10-17).
+    expect(line.status).toBe("warn");
+    expect(line.remedy).toContain("8 sends refused by the reader against 18 that went out on agent 2.1.301, most of them not_free (8)");
+    expect(line.detail).toBe(
+      "2.1.301 provisional · free 150 · unknown 16 (no-match 12, weak-cue 4) · modal 6 (permission 6) · refused 8 (not_free 8) · probed 10 · manual 3 · sent 18 · effective 0 · unknown-outcome 2 · typed-not-submitted 0 · discarded 2",
+    );
+  });
+
+  test("surface: a row that held sends (M56 spec 15) names the four held counts after discarded; one that held none reads as before", async () => {
+    const { byCheck } = await run([day(0, [row({ held: 3, held_sent: 1, held_expired: 1, held_cancelled: 1 }), row({ version: "2.1.302" })])]);
+    expect(byCheck.get("surface-agent-2.1.301")!.detail).toEndWith("discarded 1 · held 3 · held-sent 1 · held-expired 1 · held-cancelled 1");
+    expect(byCheck.get("surface-agent-2.1.302")!.detail).toEndWith("discarded 1");
+  });
+
+  test("surface: another version of the same harness is its own line", async () => {
+    const { raw } = await run([day(0, [row(), row({ version: "2.1.302" })])]);
+    expect(raw.filter((f) => f.check.startsWith("surface-")).map((f) => f.check)).toEqual(["surface-agent-2.1.301", "surface-agent-2.1.302"]);
+  });
+
+  test("surface: a person typing past an unreadable screen as often as the cap is a warning that names the inbox, and never an error", async () => {
+    const { byCheck, code } = await run([day(0, [row({ manual: 5 })])]);
+    const line = byCheck.get("surface-agent-2.1.301")!;
+    expect(line.status).toBe("warn");
+    expect(line.remedy).toContain(join(STATE, "surface", "inbox.jsonl"));
+    expect(code).toBe(0);
+  });
+
+  test("surface: refusals above 0.3 per send that went out, over at least 10 sends, warn and name the top reason", async () => {
+    // 2026-10-17: the field case, seven not_free refusals against a handful of sends.
+    const { byCheck, code } = await run([day(0, [row({ manual: 0, sent: 8, effective: 2, refused: { not_free: 3, probe_failed: 1, draft_present: 5 } })])]);
+    const line = byCheck.get("surface-agent-2.1.301")!;
+    expect(line.status).toBe("warn");
+    expect(line.remedy).toContain("4 sends refused by the reader against 10 that went out on agent 2.1.301, most of them not_free (3)");
+    expect(line.remedy).toContain(join(STATE, "surface", "examples"));
+    expect(code).toBe(0);
+  });
+
+  test("surface: the refusal warning needs both the rate and the ten sends", async () => {
+    const atRate = await run([day(0, [row({ manual: 0, sent: 10, effective: 0, refused: { not_free: 3 } })])]);
+    expect(atRate.byCheck.get("surface-agent-2.1.301")!.status).toBe("ok");
+    const fewSends = await run([day(0, [row({ manual: 0, sent: 5, effective: 4, refused: { not_free: 9 } })])]);
+    expect(fewSends.byCheck.get("surface-agent-2.1.301")!.status).toBe("ok");
+    // Seven days add up: two days of 5 sends and 2 refusals each pass both limits together.
+    const twoDays = await run([day(0, [row({ manual: 0, sent: 5, refused: { bound: 2 } })]), day(2, [row({ manual: 0, sent: 5, refused: { bound: 2 } })])]);
+    expect(twoDays.byCheck.get("surface-agent-2.1.301")!.remedy).toContain("most of them bound (4)");
+  });
+
+  test("surface: only the reader's refusals count toward the warning, never the person's or the pane's", async () => {
+    const theirs = { draft_present: 4, unconfirmed: 3, stale_surface: 2, busy: 2, id_reused: 1, pane_gone: 1, turn_running: 5 };
+    const quiet = await run([day(0, [row({ manual: 0, sent: 10, refused: { ...theirs, not_free: 3 } })])]);
+    expect(quiet.byCheck.get("surface-agent-2.1.301")!.status).toBe("ok");
+    const loud = await run([day(0, [row({ manual: 0, sent: 10, refused: { ...theirs, bound: 2, probe_failed: 2 } })])]);
+    expect(loud.byCheck.get("surface-agent-2.1.301")!.remedy).toContain("4 sends refused by the reader against 10");
+    expect(loud.byCheck.get("surface-agent-2.1.301")!.remedy).not.toContain("turn_running");
+  });
+
+  test("surface: a row with both warnings carries both remedies", async () => {
+    const { byCheck } = await run([day(0, [row({ manual: 5, sent: 10, refused: { not_free: 6 } })])]);
+    const line = byCheck.get("surface-agent-2.1.301")!;
+    expect(line.status).toBe("warn");
+    expect(line.remedy).toContain(join(STATE, "surface", "inbox.jsonl"));
+    expect(line.remedy).toContain("most of them not_free (6)");
+  });
+
+  test("surface: the plain output carries the table and a torn file is skipped", async () => {
+    const h = harness(null, [], { files: { ...healthyFiles(), ...Object.fromEntries([day(0, [row()])]), [dayFile(1)]: "{ torn" } });
+    await cmdDoctor(h.deps, []);
+    const out = h.io.stdout.join("\n");
+    expect(out).toMatch(/✓\s+surface\s+last 7 days: free 100 · unknown 8 · manual 1/u);
+    expect(out).toMatch(/surface-agent-2\.1\.301\s+2\.1\.301 provisional · free 100/u);
+  });
+
+  test("surface: doctor writes nothing while it reads the counters", async () => {
+    const h = harness(null, [], { files: { ...healthyFiles(), ...Object.fromEntries([day(0, [row()])]) } });
+    const before = JSON.stringify([...h.files.entries.entries()]);
+    await cmdDoctor(h.deps, ["--json"]);
+    expect(JSON.stringify([...h.files.entries.entries()])).toBe(before);
+  });
+});

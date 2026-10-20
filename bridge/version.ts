@@ -1,0 +1,155 @@
+import type { JsonValue } from "./json.ts";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+// This issance's own version string, resolved from the same two files for every consumer.
+//
+// It lives in `bridge/` rather than in `cli/` because the dependency direction is one-way — `cli/`
+// imports from `bridge/` (context.ts already does, for `config.ts` and `root.ts`) and nothing in
+// `bridge/` may import from `cli/`. `hello` has to answer with a version (CREW_PROTOCOL.md §7.1,
+// "Where the responder gets the string"), and the spec's requirement is that the bridge and the CLI
+// "never print different strings for one machine" — which is only guaranteed by one implementation,
+// not by two that agree today. `cli/context.ts` re-exports {@link collieVersion} from here.
+//
+// TWO SPELLINGS, deliberately:
+//   • {@link collieVersion} — what `issance version` PRINTS. May carry a parenthetical
+//     ("0.24.2 (manifest; web not built)"): it is a sentence for an operator.
+//   • {@link collieVersionBare} — what goes ON THE WIRE. A version and nothing else, because the
+//     other side compares it against its own and renders the difference (§7.1); a parenthetical
+//     would make one machine skewed against itself the moment its web bundle was missing.
+// Both read the same files through the same judgement, so they can differ in decoration and never
+// in the version they name.
+
+/** Which file answered, and with what. `version === null` ⇒ neither file named one. */
+interface ResolvedVersion {
+  readonly version: string | null;
+  /** True when the manifest answered because no built bundle stamp existed. */
+  readonly manifestOnly: boolean;
+}
+
+function resolve(buildInfo: string | null, manifest: string | null): ResolvedVersion {
+  if (buildInfo !== null) {
+    const stamp = readBuildInfo(buildInfo);
+    if (stamp !== null) return { version: stamp, manifestOnly: false };
+  }
+  return { version: manifestVersionFrom(manifest), manifestOnly: true };
+}
+
+/**
+ * The `version = "…"` line of `herdr-plugin.toml`, or null. The CANONICAL version — the one Hangar
+ * reads and `scripts/check-version.sh` gates on — so it is also the one `update` reads the installed
+ * MAJOR out of (ADR 0020). Exported so there is one parser, never a second that agrees today.
+ */
+export function manifestVersionFrom(manifest: string | null): string | null {
+  const v = manifest === null ? null : /^version[ \t]*=[ \t]*"([^"]*)"/m.exec(manifest)?.[1];
+  return v === undefined || v === "" ? null : v;
+}
+
+/**
+ * What issance is actually serving: the built bundle's stamp (`web/dist/build-info.json`, the same id
+ * the PWA footer and `/api/config` report), else the manifest version tagged as unbuilt, else
+ * `unknown`. Ported from `collie_version()` (the pre-shim `issance-ctl.sh`) output for output —
+ * this is authoritative in a way Hangar's link-time registry value is not.
+ */
+export function collieVersionFrom(buildInfo: string | null, manifest: string | null): string {
+  const { version, manifestOnly } = resolve(buildInfo, manifest);
+  if (version === null) return "unknown";
+  return manifestOnly ? `${version} (manifest; web not built)` : version;
+}
+
+/**
+ * The same judgement with no sentence around it — `1.0.0-alpha.12`, or `1.0.0-alpha.12+ab12cd3` when
+ * a build stamp is present (§5's wire example). Never a parenthetical, never a note.
+ */
+export function bareVersionFrom(buildInfo: string | null, manifest: string | null): string {
+  return resolve(buildInfo, manifest).version ?? "unknown";
+}
+
+/**
+ * The built bundle's stamp — `1.0.0-beta.46`, or `1.0.0-beta.46+ab12cd3` when the file names a sha.
+ * Null when there is no bundle, or none this can read a version out of.
+ *
+ * Exported for the same reason {@link manifestVersionFrom} is: `cli/update.ts` compares what is BUILT
+ * against what the manifest names, and a second reader of this file would agree today and drift.
+ */
+export function readBuildInfo(text: string | null): string | null {
+  if (text === null) return null;
+  let version: string | undefined;
+  let sha: string | undefined;
+  try {
+    // SAFETY: `JSON.parse` output IS a JsonValue by construction; both fields are checked below.
+    const data = JSON.parse(text) as JsonValue;
+    const fields = data !== null && typeof data === "object" && !Array.isArray(data) ? data : {};
+    if (typeof fields.version === "string") version = fields.version;
+    if (typeof fields.sha === "string") sha = fields.sha;
+  } catch {
+    // The shell read this file with `sed`, so a truncated write still yielded a version. Keep that
+    // tolerance rather than falling all the way back to the manifest on a half-written stamp.
+    version = /"version"[ \t]*:[ \t]*"([^"]*)"/.exec(text)?.[1];
+    sha = /"sha"[ \t]*:[ \t]*"([^"]*)"/.exec(text)?.[1];
+  }
+  if (!version) return null;
+  return sha ? `${version}+${sha}` : version;
+}
+
+/** Read the two files {@link collieVersionFrom} judges. Missing/unreadable reads as absent. */
+export function collieVersion(root: string, read: (p: string) => string | null = readIfPresent): string {
+  return collieVersionFrom(...versionFiles(root, read));
+}
+
+/** {@link bareVersionFrom} over the same two files — the spelling the crew wire takes. */
+export function collieVersionBare(root: string, read: (p: string) => string | null = readIfPresent): string {
+  return bareVersionFrom(...versionFiles(root, read));
+}
+
+function versionFiles(root: string, read: (p: string) => string | null): [string | null, string | null] {
+  return [read(join(root, "web", "dist", "build-info.json")), read(join(root, "herdr-plugin.toml"))];
+}
+
+function readIfPresent(p: string): string | null {
+  try {
+    return readFileSync(p, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does `reported` name the build at `(version, commit)`?
+ *
+ * TWO CALLERS, ONE QUESTION. `cli/crew-update.ts` asks it of a peer that was just levelled to this
+ * lead's commit; `cli/update-run.ts`'s health gate asks it of the local service that just restarted
+ * onto a staged version. Both are comparing a string a running issance ANSWERS with against a version
+ * and a commit, and both learned the same lesson: a built issance reports `<semver>+<short sha>`, so
+ * comparing against the bare semver reports a mismatch about a machine running exactly the right
+ * code.
+ *
+ * The build metadata is compared as an ABBREVIATION of the commit rather than byte for byte: git
+ * chooses that length per repository, so the other build may spell the same commit with more digits
+ * than this one does — and it stays a mismatch the moment the digits disagree, or a `-dirty`/`-dev`
+ * marker says the build is not that commit. A issance with no build stamp at all can only report its
+ * manifest version; that is the version it was given, and it is not evidence against the build.
+ */
+export function answersThisBuild(reported: string, version: string, commit: string): boolean {
+  const plus = reported.indexOf("+");
+  if (plus < 0) return reported === version;
+  if (reported.slice(0, plus) !== version) return false;
+  const build = reported.slice(plus + 1);
+  return build.length >= 4 && commit.toLowerCase().startsWith(build.toLowerCase());
+}
+
+/**
+ * The version a DEVELOPMENT build is built on, or null when `reported` is not one.
+ *
+ * `web/vite.config.ts` stamps a build off any commit that is not its version's tag as
+ * `<version>-dev`, and the `+<sha>` follows: `1.22.6-dev+c7ac1e91` → `1.22.6`. That build is the
+ * tag's code plus the commits after it, so the version it names is a floor, not a release. Split at
+ * the `+` exactly as {@link answersThisBuild} does, so the two never read one stamp differently.
+ */
+export function developmentBase(reported: string): string | null {
+  const plus = reported.indexOf("+");
+  const core = plus < 0 ? reported : reported.slice(0, plus);
+  return core.endsWith(DEV_MARKER) && core.length > DEV_MARKER.length ? core.slice(0, -DEV_MARKER.length) : null;
+}
+
+const DEV_MARKER = "-dev";

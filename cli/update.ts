@@ -1,0 +1,3443 @@
+import { basename, dirname, join } from "node:path";
+
+import { binaryName, collieBinary, HOST, type Host } from "../bridge/host.ts";
+import { envGet } from "../bridge/tools.ts";
+import type { JsonValue } from "../bridge/json.ts";
+import {
+  type ApiTag,
+  compareSemver,
+  githubCredential,
+  githubTagsUrl,
+  isGithubApiUrl,
+  majorOf,
+  MANIFEST_SCHEMA_VERSION,
+  MIRROR_FETCH,
+  mirrorRefusal,
+  mirrorWarning,
+  updateMirror,
+  parsePrereleaseTag,
+  parseReleaseManifest,
+  readAllTags,
+} from "../bridge/update.ts";
+import {
+  STALE_AFTER_MS,
+  inFlight,
+  type RunAction,
+  updateLockPath,
+  type UpdateLock,
+  type UpdateRun,
+} from "../bridge/update-run.ts";
+import {
+  afterFailedBuild,
+  afterRollback,
+  isEdgeBuild,
+  isStrictRelease,
+  lineOffer,
+  readUpdateLine,
+  type ReleaseLine,
+  writeUpdateLine,
+} from "../bridge/update-line.ts";
+import { readReleaseTag, stampPackageJson, stampToml } from "../scripts/release-tag.ts";
+import { STAGING_LOG_LINES, STAGING_LOG_PREFIX, stagingLogPath } from "../bridge/staging-log.ts";
+import { manifestVersionFrom, readBuildInfo } from "../bridge/version.ts";
+import { type BuildDeps, cmdBuild } from "./build.ts";
+import { logFilePath, systemdUserReachable } from "./lifecycle.ts";
+import {
+  binaryLayout,
+  type BinaryLayout,
+  detectInstall,
+  type InstallKind,
+  gitArgs,
+  isGitCheckout,
+  isManagedCheckout,
+  originOf,
+  originMatches,
+  updateRepoOf,
+  DEFAULT_UPDATE_REPO,
+  PACKAGED_SENTENCE,
+  WINDOWS_CHECKOUT_SENTENCE,
+} from "./install-kind.ts";
+import { packageCommand } from "./package-command.ts";
+import { herdrActionCommand, type Environment, type EnvVars } from "./context.ts";
+import { EXIT } from "./io.ts";
+import { parseSyncResult, skillSyncEnabled, syncLines } from "./skill-sync-result.ts";
+import { cmdLink, isCollieBinaryPath, type LinkReader, linkPath, type LinkWriter } from "./link.ts";
+import {
+  type BunReadiness,
+  type Exec,
+  type ExecResult,
+  type Files,
+  type Net,
+  type NetFailure,
+  type RunnableBun,
+  resolveRunnableBun,
+} from "./sys.ts";
+import { tagRemote } from "./update-remote.ts";
+import { unitName } from "./unit.ts";
+import {
+  driveApply,
+  HEALTH_POLL_MS,
+  HEALTH_TIMEOUT_ENV,
+  bootEvidenceOf,
+  updateHealthProbe,
+  probeConfigOf,
+  updateHealthTarget,
+  healthTimeoutMs,
+  HANDOFF_CONFIRM_MS,
+  idleRun,
+  launchPlan,
+  lockVerdict,
+  readLock,
+  readRun,
+  reduce,
+  releaseLock,
+  type RunEvent,
+  serviceLogTail,
+  takeLock,
+  writeRun,
+} from "./update-run.ts";
+
+// `update`, `_apply-update` and the checkout logic behind them, ported from
+// the pre-shim `issance-ctl.sh`. ADR 0006 is this module's specification: issance is a link-mode
+// Hangar plugin, so the checkout on disk IS the plugin, and it arrives in one of TWO shapes —
+//
+//   `git clone` + `hangar plugin link`   → a normal clone, ON A BRANCH, full history
+//   `hangar plugin install issance/issance-app` → `git init` + `fetch --depth 1` + `checkout --detach`,
+//                                          i.e. DETACHED and SHALLOW, no remote-tracking refs
+//
+// — and a bare `git pull --ff-only` has nothing to pull into in the second, which is why every
+// turnkey install from 0.1.0 to 0.23.1 could never self-update while the in-app banner kept
+// advertising the release (#63).
+//
+// SINCE M15/02 the first of those two shapes no longer advances in place: a linked clone STAGES its
+// update into a `versions/vX.Y.Z` git worktree and goes live by flipping a `current` symlink, the
+// same layout and the same single rename a binary install uses. ADR 0006's 2026-09-03 amendment
+// records the change and scopes it: a Hangar-managed checkout keeps advancing in place. See "The
+// staged checkout path" at the foot of this file.
+
+export interface UpdateDeps extends BuildDeps {
+  /** `restart` over the same context — injected because `update`'s own tests must never start a service. */
+  restart: () => Promise<number>;
+  /**
+   * The symlink seam (`cli/link.ts`), which the binary path flips `current` with. The same writer
+   * `link` publishes the PATH name through — one implementation of "make a symlink", never two.
+   */
+  link: LinkWriter;
+  /** The two anonymous HTTPS GETs the binary path makes (`cli/sys.ts`). No test may reach a network. */
+  net: Net;
+  /** The host (`bridge/host.ts`) and `process.arch`, injected so a test pins a platform rather than
+   *  inheriting the machine's — the artifact this install may take is decided from them. */
+  host: Host;
+  arch: string;
+  /** The clock and the wait the detached runner's health gate is driven by (M15/04). Injected for
+   *  the same reason everything else here is: a test drives a 30 s budget in no time at all. */
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  /** This process's pid — what the update lock records and the staleness rule asks about. */
+  pid: number;
+  /** `process.execPath` — the binary THIS process is executing, and the one the detached runner is
+   *  launched as. See {@link runnerBinary} for why it is not simply `<root>/bin/issance`. */
+  execPath: string;
+  /**
+   * Told when the verb ends on a NOTHING-TO-TAKE verdict: no run was started, nothing on disk changed,
+   * and no record will follow. Absent ⇒ nobody is listening, which is every terminal run.
+   *
+   * The exit code cannot say this, because `EXIT.OK` also means "the detached runner is away". A lead's
+   * `crew update` needs the difference: it waits on the run record after a hand-off, and a record
+   * that is never written is minutes of silence before a timeout (`cli/crew-update.ts`, `lazyLead`).
+   */
+  nothingToTake?: () => void;
+}
+
+/** End the verb on a nothing-to-take verdict, and tell whoever asked ({@link UpdateDeps.nothingToTake}). */
+function nothingTaken(deps: UpdateDeps): number {
+  deps.nothingToTake?.();
+  return EXIT.OK;
+}
+
+// One predicate for the checkout shape, one for "is this a git checkout at all", both in
+// `cli/install-kind.ts` now that `doctor` asks them too. Re-exported because every caller and test
+// already spells them `from "./update.ts"`.
+export { isManagedCheckout };
+
+/**
+ * The Bun this update will RUN, or null when there is none — the same lookup `update --check`'s
+ * preflight reports (`cli/update-check.ts`) and the same one the shim bootstraps with.
+ *
+ * Not `exec.which("bun")`. Hangar invokes a plugin action with no login shell, so the directory the
+ * operator's profile exports is simply absent from PATH, and a bare name would refuse an update the
+ * shim would have built without complaint (#169). The preflight already told the operator it found
+ * a Bun at an absolute path; the verb has to run THAT one, or the two disagree on the same host.
+ *
+ * Callers spawn `path` and pass its `dirname` as the child's PATH prefix: `bun cli/main.ts build`
+ * spawns `bun` again by name for the two installs and the Vite build.
+ */
+function bunReadiness(deps: UpdateDeps): BunReadiness {
+  return resolveRunnableBun(deps.exec, deps.files, deps.ctx.env, deps.ctx.home);
+}
+
+/**
+ * Resolve and prove Bun before the path that needs it. `--version` is bounded in `cli/sys.ts`, so
+ * a malformed executable cannot advance a managed checkout and then leave it unable to rebuild.
+ */
+function requireRunnableBun(deps: UpdateDeps, need: string): RunnableBun | null {
+  const readiness = bunReadiness(deps);
+  if (readiness.kind === "ready") return readiness.bun;
+  const reason =
+    readiness.kind === "missing"
+      ? "bun is not installed"
+      : `bun at ${readiness.tool.path} is not runnable — \`bun --version\` did not return a readable version`;
+  deps.io.err(`error: ${reason} — ${need}.`);
+  deps.io.err("       Install or repair Bun from https://bun.sh, then re-run update.");
+  return null;
+}
+
+/**
+ * The command that consents to a major crossing — printed wherever one is refused.
+ *
+ * A function of the instance, not a constant: on a named instance the bare `hangar.issance` names the
+ * host's FIRST issance, so an operator following it would cross a major on the wrong service.
+ */
+export const majorAction = (instance: string | null): string => herdrActionCommand("update-major", instance);
+
+// ── Target selection (pure — ADR 0020) ───────────────────────────────────────
+// A routine `update` no longer means "the tip of the default branch": it means "the newest RELEASE
+// of the major this install is already on". Crossing a major is a separate act, consented to by
+// `--major`. One amendment since (ADR 0020, 2026-08-30): an install whose OWN version carries a
+// prerelease tail may also follow its major's prerelease train — but only as a FALLBACK, when no
+// strict release of that major is newer than it. Beta to beta while the release is unpublished, then
+// straight onto the release the moment it exists. That is a property of the installed version, not a
+// flag, so there is no switch to get wrong and a stable install cannot be pulled onto a beta.
+//
+// Everything that decides WHICH commit to land on is a pure function over the remote's tag list, so
+// `bun test` covers the whole decision without a git remote.
+
+/** One `vX.Y.Z` or `vX.Y.Z-<tail>` tag, as the remote reports it. */
+export interface ReleaseTag {
+  /** The ref name (`v1.2.3`, `v1.0.0-beta.44`) — what we fetch by, because a bare sha may not be a
+   *  valid want. A prerelease name needs no special handling downstream: `refs/tags/<tag>` is a ref
+   *  like any other. */
+  tag: string;
+  /** Dotted version, no leading `v`. */
+  version: string;
+  major: number;
+  /** The `-` tail (`beta.44`), or null for a strict release. A prerelease tag is a candidate ONLY for
+   *  an install that itself carries a tail — see {@link planUpdate}. */
+  prerelease: string | null;
+  /** The commit the tag resolves to — the PEELED one for an annotated tag. */
+  commit: string;
+}
+
+/** Just the strict releases. The candidate set for a stable install, for `--major`, and for pinning an
+ *  unversioned checkout — none of those three ever touches a prerelease. */
+const strictOnly = (tags: readonly ReleaseTag[]): ReleaseTag[] => tags.filter((t) => t.prerelease === null);
+
+/**
+ * Release AND prerelease tags out of `git ls-remote --tags origin`. Every non-version ref is dropped
+ * by the same anchor the banner uses (`bridge/update.ts`'s `PRERELEASE_SEMVER_TAG`), so the verb can
+ * never land on something the banner would not have announced. Which of these tags an install may
+ * actually take is decided later, by {@link planUpdate}, from the INSTALLED version alone.
+ *
+ * An ANNOTATED tag is listed twice — once at the tag object, once peeled (`^{}`) at the commit. The
+ * peeled line is the one that names a commit, so it wins wherever both appear.
+ */
+export function parseRemoteTags(stdout: string): ReleaseTag[] {
+  const byTag = new Map<string, { commit: string; peeled: boolean }>();
+  for (const line of stdout.split("\n")) {
+    const [commit, ref] = line.trim().split(/\s+/);
+    if (commit === undefined || ref === undefined) continue;
+    if (!ref.startsWith("refs/tags/")) continue;
+    const raw = ref.slice("refs/tags/".length);
+    const peeled = raw.endsWith("^{}");
+    const name = peeled ? raw.slice(0, -3) : raw;
+    if (parsePrereleaseTag(name) === null) continue;
+    const seen = byTag.get(name);
+    if (seen !== undefined && seen.peeled && !peeled) continue;
+    byTag.set(name, { commit, peeled });
+  }
+  return [...byTag].flatMap(([tag, { commit }]) => {
+    const parsed = parsePrereleaseTag(tag);
+    if (parsed === null) return [];
+    return [
+      { tag, version: tag.slice(1), major: parsed.triple[0], prerelease: parsed.prerelease, commit },
+    ];
+  });
+}
+
+/** The highest tag among `tags` by full semver, or null when there is none. Filter FIRST — this does
+ *  not know which of them the caller is allowed to take. */
+export function highestRelease(tags: readonly ReleaseTag[]): ReleaseTag | null {
+  let best: ReleaseTag | null = null;
+  for (const t of tags) if (best === null || compareSemver(t.version, best.version) > 0) best = t;
+  return best;
+}
+
+/** The highest STRICT release inside `major` — the target of a routine update on a stable install. */
+export function releaseInMajor(tags: readonly ReleaseTag[], major: number): ReleaseTag | null {
+  return highestRelease(strictOnly(tags).filter((t) => t.major === major));
+}
+
+/**
+ * The highest tag inside `major` counting PRERELEASES — the FALLBACK target for an install that is
+ * itself on a prerelease and has no newer strict release of its major to take.
+ *
+ * The caller asks `followsTrain` first, so this is never what a stable install sees, and never what a
+ * beta install sees once its release is out: the release supersedes the betas that led to it. This is
+ * only how a tester walks beta.44 → beta.45 while `v1.0.0` does not exist yet.
+ */
+export function trainInMajor(tags: readonly ReleaseTag[], major: number): ReleaseTag | null {
+  return highestRelease(tags.filter((t) => t.major === major));
+}
+
+/**
+ * The highest release of the NEXT major that has one — the target of `update --major`.
+ *
+ * The next major, not the highest: an install two majors behind crosses one at a time, so each
+ * crossing is the one the operator consented to and its release notes are the ones that apply.
+ */
+export function nextMajorRelease(tags: readonly ReleaseTag[], major: number): ReleaseTag | null {
+  // Strict only: crossing a major lands on a RELEASE. A prerelease of the next major is not something
+  // `--major` may hand an operator who has not opted into that train by installing one.
+  const above = strictOnly(tags).filter((t) => t.major > major);
+  if (above.length === 0) return null;
+  const next = Math.min(...above.map((t) => t.major));
+  return releaseInMajor(above, next);
+}
+
+/**
+ * What `update` should do with this checkout, given the remote's tags and the version the checkout's
+ * manifest names. `higher` rides along on every routine outcome so the caller can always say a major
+ * is out — announcing it is not the same as taking it.
+ */
+export type UpdatePlan =
+  | { kind: "advance"; target: ReleaseTag; crossesMajor: boolean; higher: ReleaseTag | null }
+  | { kind: "current"; at: ReleaseTag; higher: ReleaseTag | null }
+  | { kind: "no-release"; major: number; higher: ReleaseTag | null }
+  | { kind: "no-higher-major"; major: number }
+  /**
+   * The manifest named no version we can read a major out of — so there is no major to gate on.
+   *
+   * `newest` is the highest release tag on the remote, and the caller pins to it. It used to follow
+   * `origin HEAD`, which is not a release: a moved default branch would land an operator on
+   * unreleased work they never asked for. `null` means the remote publishes no releases at all,
+   * which is the one case where there is nothing safe to take.
+   */
+  | { kind: "unknown-version"; newest: ReleaseTag | null };
+
+export function planUpdate(a: {
+  tags: readonly ReleaseTag[];
+  /** The version in the checkout's `herdr-plugin.toml` — the canonical one Hangar reads. */
+  installed: string | null;
+  /** The commit the checkout is on, or "" when git could not say. */
+  head: string;
+  /** `--major` was passed: the operator consents to one crossing. */
+  crossMajor: boolean;
+  /** This machine's release line (`update-line.json`, or `--line`). Absent reads as Stable. */
+  line?: ReleaseLine;
+  /** Builds this machine rolled back from. Never a target. */
+  rejected?: readonly string[];
+}): UpdatePlan {
+  const major = a.installed === null ? null : majorOf(a.installed);
+  if (major === null || a.installed === null) {
+    return { kind: "unknown-version", newest: highestRelease(strictOnly(a.tags)) };
+  }
+  const higher = nextMajorRelease(a.tags, major);
+  if (a.crossMajor) {
+    return higher === null
+      ? { kind: "no-higher-major", major }
+      : { kind: "advance", target: higher, crossesMajor: true, higher };
+  }
+  // WHAT THE LINE OFFERS (M60 spec 01, ADR 0110), decided in ONE place, `lineOffer`, which the
+  // banner reads too. Stable is ADR 0020 unchanged: strict releases, plus the legacy prerelease train
+  // for an install that is itself on an old beta (`followsTrain`). Edge adds the `-edge.N` builds of
+  // the same major. A build this machine rolled back from is never a target on either line.
+  const offer = lineOffer({
+    tags: a.tags.map((t) => t.tag),
+    installed: a.installed,
+    line: a.line ?? "stable",
+    rejected: a.rejected ?? [],
+  });
+  const best = offer.latest === null ? null : (a.tags.find((t) => t.version === offer.latest) ?? null);
+  if (best === null) return { kind: "no-release", major, higher };
+  // Already there — by commit (the usual case) or by version (a rebuilt tag, a rolled-forward
+  // manifest). Either answer means there is nothing in this major left to take.
+  if (best.commit === a.head || compareSemver(best.version, a.installed) <= 0) {
+    return { kind: "current", at: best, higher };
+  }
+  return { kind: "advance", target: best, crossesMajor: false, higher };
+}
+
+/**
+ * The gate on the LINKED-CLONE path, where the target is the branch tip rather than a tag: compare
+ * the major of the manifest we just fetched against the installed one. `unknown` when either side
+ * names no readable version — we proceed there, for the same reason `planUpdate` falls back.
+ */
+export function majorVerdict(installed: string | null, fetched: string | null): "same" | "crosses" | "unknown" {
+  const a = installed === null ? null : majorOf(installed);
+  const b = fetched === null ? null : majorOf(fetched);
+  if (a === null || b === null) return "unknown";
+  return b > a ? "crosses" : "same";
+}
+
+/** `--major` anywhere in the verb's argv. The flag IS the consent — there is no prompt (ADR 0020). */
+export function wantsMajor(args: readonly string[]): boolean {
+  return args.includes("--major");
+}
+
+/**
+ * `--to-tag v<x.y.z>` — the PLUMBING flag that pins the plan to one exact release (M16/04).
+ *
+ * The operator's verb is `issance update`, which takes the highest release of its own major and needs
+ * no target. This exists so a peer following its lead can take **the release the lead is running**
+ * rather than the newest one, and for nothing else. It is deliberately not `--to`: that spelling is
+ * already the detached runner's own internal argv ({@link parseApplyArgs}), and two flags one letter
+ * apart on the same binary is a bug waiting for a tired evening.
+ *
+ * Both spellings are read, `--to-tag v1.2.3` and `--to-tag=v1.2.3`, because a caller composing argv
+ * by hand will write one of them and the other would read as "no target" — which is an update to
+ * something else entirely rather than a refusal.
+ */
+export function wantsToTag(args: readonly string[]): string | null {
+  return namedValue(args, "--to-tag");
+}
+
+/**
+ * `--run-id <opaque>` — the other plumbing flag: the id of the run this update belongs to (M16/04).
+ *
+ * It is written into `<state dir>/update.json` and read back by the crew and by nobody else: a peer's
+ * memory of "I already rolled back from this tag" is keyed by (tag, run id), so a fresh confirm on
+ * the phone mints a new id and permits exactly one further attempt. It never becomes a path, a URL
+ * or a comparison against a clock — it is compared for equality with itself and printed nowhere.
+ */
+export function wantsRunId(args: readonly string[]): string | null {
+  return namedValue(args, "--run-id");
+}
+
+/** `--name value` or `--name=value`, trimmed. `null` for absent and for a blank value alike. */
+function namedValue(args: readonly string[], name: string): string | null {
+  const at = args.indexOf(name);
+  if (at >= 0) {
+    const next = args[at + 1]?.trim() ?? "";
+    return next === "" || next.startsWith("--") ? null : next;
+  }
+  const joined = args.find((a) => a.startsWith(`${name}=`));
+  if (joined === undefined) return null;
+  const value = joined.slice(name.length + 1).trim();
+  return value === "" ? null : value;
+}
+
+/** What `--to-tag` resolved to: the one tag to take, or the sentence saying why it will not be. */
+export type ToTagPlan =
+  | { readonly kind: "pinned"; readonly target: ReleaseTag }
+  | { readonly kind: "refused"; readonly reason: string };
+
+/**
+ * Resolve `--to-tag` against the remote's tags and the installed version — the refusals, in one pure
+ * function so every install kind refuses identically.
+ *
+ * TWO LINES, ONE WAY DOWN (M60 spec 01, ADR 0110). An `-edge.N` tag is a target only on a machine
+ * whose line is Edge. A LOWER tag is a target only with `downgrade`, the explicit flag
+ * (`--downgrade`) the bridge passes for the two runs that go down: the person-started switch back to
+ * Stable, and a crew member following its lead's rollback or switch. It is never the default: the
+ * terminal's `issance update` and `--to-tag` without it refuse every downgrade, as they always did.
+ * With it, the lower target must be a Stable release or an Edge build, never an old beta, and never
+ * across a major.
+ */
+export function planToTag(a: {
+  tags: readonly ReleaseTag[];
+  installed: string | null;
+  wanted: string;
+  /** This machine's release line. Absent reads as Stable. */
+  line?: ReleaseLine;
+  /** Builds this machine rolled back from. Refused, except as the target of a step down. */
+  rejected?: readonly string[];
+  /** `--downgrade`: a lower target is allowed. */
+  downgrade?: boolean;
+}): ToTagPlan {
+  const wanted = a.wanted.trim();
+  const bare = wanted.startsWith("v") ? wanted.slice(1) : wanted;
+  const target = a.tags.find((t) => t.tag === wanted || t.version === bare);
+  if (target === undefined) {
+    return { kind: "refused", reason: `no release tag \`${wanted}\` upstream — there is nothing to take` };
+  }
+  const edge = isEdgeBuild(target.version);
+  if (target.prerelease !== null && !edge) {
+    return {
+      kind: "refused",
+      reason: `\`${target.tag}\` is a prerelease — \`--to-tag\` takes strict releases and Edge builds only`,
+    };
+  }
+  if (a.installed === null) {
+    return {
+      kind: "refused",
+      reason: "this install names no version, so there is nothing to compare `--to-tag` against",
+    };
+  }
+  const order = compareSemver(target.version, a.installed);
+  const down = a.downgrade === true && order < 0;
+  if (order <= 0 && !down) {
+    return {
+      kind: "refused",
+      reason:
+        order === 0
+          ? `\`${target.tag}\` is the installed ${a.installed} — there is nothing to take`
+          : `\`${target.tag}\` is lower than the installed ${a.installed} — \`--to-tag\` never downgrades without \`--downgrade\``,
+    };
+  }
+  if (edge && !down && a.line !== "edge") {
+    return {
+      kind: "refused",
+      reason: `\`${target.tag}\` is an Edge build, and this machine is on the Stable line`,
+    };
+  }
+  if (!down && (a.rejected ?? []).includes(target.version)) {
+    return {
+      kind: "refused",
+      reason: `\`${target.tag}\` is a build this machine rolled back from, and it is not offered again`,
+    };
+  }
+  const major = majorOf(a.installed);
+  if (major !== null && target.major !== major) {
+    return {
+      kind: "refused",
+      reason: `\`${target.tag}\` crosses a major from ${a.installed} — a crossing is a named operator choice (ADR 0020), never a flag`,
+    };
+  }
+  return { kind: "pinned", target };
+}
+
+/** The pinned plan as an {@link UpdatePlan}, so every call site below keeps exactly one shape. */
+const advanceTo = (target: ReleaseTag): UpdatePlan => ({
+  kind: "advance",
+  target,
+  crossesMajor: false,
+  higher: null,
+});
+
+/**
+ * Apply `--to-tag` to a plan, or say why it will not apply. `null` in ⇒ the plan is handed straight
+ * back, which is every `issance update` an operator has ever run.
+ */
+export function pinPlan(
+  plan: UpdatePlan,
+  a: {
+    tags: readonly ReleaseTag[];
+    installed: string | null;
+    wanted: string | null;
+    line?: ReleaseLine;
+    rejected?: readonly string[];
+    downgrade?: boolean;
+  },
+): { readonly ok: true; readonly plan: UpdatePlan } | { readonly ok: false; readonly reason: string } {
+  if (a.wanted === null) return { ok: true, plan };
+  const pinned = planToTag({ ...a, wanted: a.wanted });
+  if (pinned.kind === "refused") return { ok: false, reason: pinned.reason };
+  return { ok: true, plan: advanceTo(pinned.target) };
+}
+
+function isShallow(exec: Exec, root: string): boolean {
+  const r = exec.capture("git", gitArgs(root, ["rev-parse", "--is-shallow-repository"]));
+  return r.found && r.code === 0 && r.stdout.trim() === "true";
+}
+
+/**
+ * The fork guard on the git paths: `origin` must be the repo updates are configured to come from.
+ *
+ * Both git strategies talk to a hardcoded `origin` and one of them force-checks-out onto its tags.
+ * On a fork that reads the FORK's tags and `checkout --detach --force` discards local work — which
+ * is exactly what happened to youngsecurity/issance at 0.35.0+ys.2. So the check runs BEFORE
+ * `git fetch origin` and before `git ls-remote origin`, and a mismatch fails there: no fetch, no
+ * checkout, nothing changed. An unresolvable origin is a mismatch too — a checkout that cannot say
+ * where it came from is not one to force-checkout.
+ *
+ * The remedy is one line of consent, not a flag to disable the guard: a fork operator sets
+ * `ISSANCE_UPDATE_REPO` to their own fork, which moves the banner and the updater TOGETHER.
+ */
+function assertOrigin(deps: UpdateDeps, root: string = deps.ctx.root): boolean {
+  const configured = updateRepoOf(deps.ctx.env);
+  const origin = originOf(deps.exec, root);
+  if (originMatches(origin, configured)) return true;
+  const named =
+    origin.kind === "repo"
+      ? `github.com/${origin.repo}`
+      : origin.kind === "other"
+        ? origin.url
+        : "unreadable (no `origin` remote, or no git)";
+  deps.io.err(`error: this checkout's origin is ${named}, but updates are configured to`);
+  deps.io.err(`       come from github.com/${configured}.`);
+  deps.io.err("       `issance update` would fetch that remote's tags and force-checkout onto them,");
+  deps.io.err("       discarding local work — it will not do that.");
+  if (origin.kind === "repo") {
+    deps.io.err(`       If you run a fork on purpose:      set ISSANCE_UPDATE_REPO=${origin.repo}`);
+  }
+  deps.io.err('       To take an upstream release by hand: docs/upgrading.md → "You run a fork"');
+  return false;
+}
+
+/** The version in the checkout's own `herdr-plugin.toml` — the installed major is read from here. */
+function installedVersion(deps: UpdateDeps): string | null {
+  return manifestVersionFrom(deps.files.read(join(deps.ctx.root, "herdr-plugin.toml")));
+}
+
+/**
+ * `--line edge|stable` — PLUMBING, like `--to-tag`: the line ONE run resolves on, over the one this
+ * machine keeps in `update-line.json`. A crew member following its lead passes the lead's line here
+ * (ADR 0110). Anything but the two words reads as absent.
+ */
+export function wantsLine(args: readonly string[]): ReleaseLine | null {
+  const v = namedValue(args, "--line");
+  return v === "edge" || v === "stable" ? v : null;
+}
+
+/**
+ * `--downgrade` — the one way down (M60 spec 01). With `--to-tag`, a LOWER release is a target. The
+ * bridge passes it for the person-started switch back to Stable ("Go back now") and for a crew member
+ * following its lead's rollback or switch. Nothing passes it by default, and without it every update
+ * path refuses a downgrade, as it always did.
+ */
+export function wantsDowngrade(args: readonly string[]): boolean {
+  return args.includes("--downgrade");
+}
+
+/** What one run resolves its target on: the line, the builds never offered again, the way down. */
+export interface LineChoice {
+  readonly line: ReleaseLine;
+  readonly rejected: readonly string[];
+  readonly downgrade: boolean;
+}
+
+/** This machine's {@link LineChoice}: `update-line.json` (absent reads Stable), then the flags. */
+export function lineChoice(deps: Pick<UpdateDeps, "files" | "ctx">, args: readonly string[]): LineChoice {
+  const record = readUpdateLine((p) => deps.files.read(p), deps.ctx.stateDir);
+  return { line: wantsLine(args) ?? record.line, rejected: record.rejected, downgrade: wantsDowngrade(args) };
+}
+
+/**
+ * A rollback off an Edge build puts this machine back on Stable and marks the build it left as
+ * rejected, so neither line offers it again (M60 spec 01). A rollback off a Stable build changes
+ * nothing. Best-effort and said out loud: the rollback itself must not fail because a note did.
+ */
+function noteRollback(deps: UpdateDeps, fromVersion: string): void {
+  if (!isEdgeBuild(fromVersion)) return;
+  try {
+    const record = readUpdateLine((p) => deps.files.read(p), deps.ctx.stateDir);
+    writeUpdateLine(deps.files, deps.ctx.stateDir, afterRollback(record, fromVersion, deps.now()));
+    deps.io.out(`  ${fromVersion} is marked as rolled back from; this machine is on the Stable line again.`);
+  } catch (err) {
+    deps.io.err(`warning: could not mark ${fromVersion} as rolled back from (${String(err)}).`);
+  }
+}
+
+/**
+ * An Edge build that failed its health check and was rolled back by this runner: rejected, so no
+ * line offers it again (ADR 0110). The line stays as the person set it. Best-effort and said out
+ * loud, like {@link noteRollback}: the run record already says what happened.
+ */
+function noteFailedBuild(deps: UpdateDeps, failed: string): void {
+  if (!isEdgeBuild(failed.replace(/^v/, ""))) return;
+  try {
+    const record = readUpdateLine((p) => deps.files.read(p), deps.ctx.stateDir);
+    const next = afterFailedBuild(record, failed);
+    if (next !== record) writeUpdateLine(deps.files, deps.ctx.stateDir, next);
+    deps.io.err(`       ${failed.replace(/^v/, "")} is marked as rolled back from and is not offered again.`);
+  } catch (err) {
+    deps.io.err(`warning: could not mark ${failed} as rolled back from (${String(err)}).`);
+  }
+}
+
+/**
+ * The three files a release stamps (`scripts/release-version.ts`), relative to a checkout root, in
+ * git's own spelling: `git update-index` takes `/` on every host, and a checkout is never Windows.
+ */
+const VERSION_FILES = ["herdr-plugin.toml", "package.json", "web/package.json"] as const;
+
+/**
+ * Give an Edge tag's checkout the version it is (M60 spec 01): the files in git say plain `X.Y.Z`,
+ * and the release job stamps `X.Y.Z-edge.N` into its own copy before it builds. A checkout install
+ * builds on this machine, so it stamps the same way, from the tag it just checked out, and the health
+ * gate then compares like with like. A Stable tag stamps nothing.
+ *
+ * The stamped files are marked `assume-unchanged` in that checkout's index, so `git status` stays
+ * clean: the build stamp carries no `-dirty`, and `scripts/check-version.sh` accepts the stamp there
+ * because HEAD is the tag. {@link unstampCheckout} lifts the mark before the next checkout.
+ */
+export function stampCheckout(
+  deps: Pick<UpdateDeps, "files" | "exec" | "io" | "host">,
+  dir: string,
+  tag: string,
+): boolean {
+  const reading = readReleaseTag(tag);
+  if (reading === null || reading.line !== "edge") return true;
+  const [toml, pkg, web] = [
+    deps.host.path.join(dir, "herdr-plugin.toml"),
+    deps.host.path.join(dir, "package.json"),
+    deps.host.path.join(dir, "web", "package.json"),
+  ];
+  if (toml === undefined || pkg === undefined || web === undefined) return false;
+  const text = { toml: deps.files.read(toml), pkg: deps.files.read(pkg), web: deps.files.read(web) };
+  if (text.toml === null || text.pkg === null || text.web === null) {
+    deps.io.err(`error: ${tag} is an Edge build, and its version files could not be read to stamp it.`);
+    return false;
+  }
+  deps.files.write(toml, stampToml(text.toml, reading.version));
+  deps.files.write(pkg, stampPackageJson(text.pkg, reading.version));
+  deps.files.write(web, stampPackageJson(text.web, reading.version));
+  deps.exec.capture("git", gitArgs(dir, ["update-index", "--assume-unchanged", "--", ...VERSION_FILES]));
+  deps.io.out(`  stamped ${reading.version} into this checkout's version files (an Edge build)`);
+  return true;
+}
+
+/** Lift {@link stampCheckout}'s mark, so a `checkout --force` may replace the stamped files. */
+function unstampCheckout(deps: Pick<UpdateDeps, "exec">, dir: string): void {
+  deps.exec.capture("git", gitArgs(dir, ["update-index", "--no-assume-unchanged", "--", ...VERSION_FILES]));
+}
+
+// The sentences a "nothing to take" verdict prints. They live here, once, because BOTH update paths
+// print them — a user must not be able to tell the git path from the binary one by its wording
+// (M14/01 §3.2 step 4).
+
+function printNoHigherMajor(deps: UpdateDeps, major: number): void {
+  deps.io.out(`no release above major ${major} exists yet — nothing to cross to.`);
+}
+
+function printNoRelease(deps: UpdateDeps, major: number, tail: string): void {
+  deps.io.out(`no release of major ${major} yet — ${tail}.`);
+}
+
+function printCurrent(deps: UpdateDeps, at: ReleaseTag): void {
+  deps.io.out(
+    at.prerelease === null
+      ? `already current — v${at.version} is the newest release of major ${at.major}.`
+      : `already current — v${at.version} is the newest on the major ${at.major} prerelease train.`,
+  );
+}
+
+/** Say a higher major is out, and name the one command that takes it. Never acts. */
+function announceMajor(deps: UpdateDeps, higher: ReleaseTag | null): void {
+  if (higher === null) return;
+  deps.io.out(`note: issance ${higher.version} is out — a NEW MAJOR, which a routine update never takes.`);
+  deps.io.out(`      Read its release notes, then consent to it with:  ${majorAction(deps.ctx.instance)}`);
+}
+
+/**
+ * What advancing the checkout came to. `code` is the verb's exit status; the other two are what
+ * `cmdUpdate` needs and cannot re-derive once the git calls are behind it.
+ */
+export interface CheckoutOutcome {
+  /** {@link EXIT.OK} or {@link EXIT.FAIL} — unchanged from what this function used to return. */
+  code: number;
+  /**
+   * True only when a commit actually landed. False for every "nothing to take" verdict, for a
+   * refused major crossing, and for a `git pull --ff-only` that found nothing to fast-forward.
+   * `cmdUpdate` skips the rebuild on false, so this must never be optimistic.
+   */
+  moved: boolean;
+  /**
+   * The version this advance was AIMED at, or null when it aimed at nothing (every failure, every
+   * "nothing to take"). Answered by the code that chose the target, never re-read off disk
+   * afterwards: the manifest is rewritten by the checkout, so reading it back would be trusting the
+   * very step whose success is in question — and on a linked clone, which fast-forwards a branch,
+   * there is no chosen tag to read at all. It is what an in-place run records as its `to`.
+   */
+  to: string | null;
+  /**
+   * The next major's release, when one exists and we did not just take it — re-printed at the very
+   * END of the transcript, which is the part the operator reads.
+   */
+  higher: ReleaseTag | null;
+  /**
+   * The exact Bun proven runnable before this managed checkout moved. It is optional because no-op
+   * and refusal paths deliberately never probe Bun, and linked checkouts do not hand off this way.
+   */
+  bun?: RunnableBun;
+}
+
+/**
+ * Advance the checkout, in whichever shape it was installed — and never across a major without
+ * `--major` (ADR 0020).
+ *
+ * The two shapes take the gate differently, because their targets are different things. A managed
+ * checkout is detached, so it can be pointed straight at a release TAG and the gate is target
+ * selection itself. A linked clone is on a branch and fast-forwards it, so its gate is a pre-flight:
+ * fetch, read the manifest at the branch's OWN upstream, and refuse before pulling.
+ *
+ * IN-PLACE ADVANCEMENT, which since M15/02 is what a MANAGED checkout gets. `cmdUpdate` routes a
+ * linked clone to {@link updateStagedCheckout} instead, so the linked arm below is reached only
+ * through this exported function — kept because it is the whole of the branch-following behaviour
+ * (including the manifest pre-flight that ADR 0020's major gate is spelled in), and spec 03's
+ * preflight is expected to reuse it rather than re-derive it.
+ */
+export function updateCheckout(
+  deps: UpdateDeps,
+  opts: { crossMajor: boolean; toTag?: string | null; args?: readonly string[] } = { crossMajor: false },
+): CheckoutOutcome {
+  const root = deps.ctx.root;
+  const git = (args: readonly string[]): number => {
+    const r = deps.exec.runIn("git", gitArgs(root, args), root);
+    if (!r.found) {
+      deps.io.err("error: git not found — cannot update the checkout");
+      return EXIT.FAIL;
+    }
+    return r.code === 0 ? EXIT.OK : EXIT.FAIL;
+  };
+
+  if (!isGitCheckout(deps.exec, root)) {
+    deps.io.err(`error: ${root} is not a git checkout — refresh it with:`);
+    deps.io.err("       herdr plugin install issance/issance-app --yes");
+    return { code: EXIT.FAIL, moved: false, to: null, higher: null };
+  }
+
+  // BEFORE any fetch, and therefore before any `checkout --detach --force`. See {@link assertOrigin}.
+  if (!assertOrigin(deps)) return { code: EXIT.FAIL, moved: false, to: null, higher: null };
+
+  const installed = installedVersion(deps);
+  const toTag = opts.toTag ?? null;
+  return isManagedCheckout(deps.exec, root)
+    ? updateManaged(deps, git, installed, opts.crossMajor, toTag, lineChoice(deps, opts.args ?? []))
+    : updateLinked(deps, git, installed, opts.crossMajor, toTag);
+}
+
+/** A linked clone keeps its branch and its `--ff-only` pull; the gate runs BEFORE the pull. */
+function updateLinked(
+  deps: UpdateDeps,
+  git: (args: readonly string[]) => number,
+  installed: string | null,
+  crossMajor: boolean,
+  toTag: string | null,
+): CheckoutOutcome {
+  const root = deps.ctx.root;
+  // `--to-tag` names a RELEASE, and this path takes a branch tip: there is no tag here to pin, so
+  // the flag is refused rather than quietly ignored. A caller that asked for one exact version and
+  // got whatever the branch points at today is the failure this refusal exists for.
+  if (toTag !== null) {
+    deps.io.err("error: `--to-tag` names a release tag, and this checkout follows a branch.");
+    deps.io.err("       Take that release by hand with `git checkout <tag>` and rebuild.");
+    return { code: EXIT.FAIL, moved: false, to: null, higher: null };
+  }
+  const headNow = (): string => deps.exec.capture("git", gitArgs(root, ["rev-parse", "HEAD"])).stdout.trim();
+  const before = headNow();
+  // Plain `git fetch origin` — the configured refspec, so every remote-tracking ref advances. NOT
+  // `fetch origin HEAD`: that resolves the remote's DEFAULT branch, and the pull below takes the
+  // current branch's own upstream. On a clone kept on a maintenance or integration branch those are
+  // different commits, and a gate that judged one while the pull took the other would refuse a
+  // fast-forward that never leaves the major (and, after 1.0 lands on `main`, would refuse EVERY
+  // pull on a 0.x branch). Judge exactly the commit the pull will land on.
+  if (git(["fetch", "origin"]) !== EXIT.OK) return { code: EXIT.FAIL, moved: false, to: null, higher: null };
+  const upstream = deps.exec.capture(
+    "git",
+    gitArgs(root, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]),
+  );
+  const ref = upstream.found && upstream.code === 0 ? upstream.stdout.trim() : "";
+  // No upstream at all: there is nothing for the gate to judge, and nothing for the pull to take
+  // either — `git pull --ff-only` fails with its own "no tracking information" message, which says
+  // more about the checkout than anything we could add. Let it speak; a pull that cannot happen
+  // cannot cross a major.
+  if (ref !== "") {
+    const fetched = manifestVersionFrom(
+      deps.exec.capture("git", gitArgs(root, ["show", `${ref}:herdr-plugin.toml`])).stdout,
+    );
+    if (!crossMajor && majorVerdict(installed, fetched) === "crosses") {
+      deps.io.out(`refusing to update: ${installed} → ${fetched} (${ref}) crosses a MAJOR version.`);
+      deps.io.out("A major means you have to change something — so it is never taken by a routine update.");
+      deps.io.out(`Read its release notes, then consent to it with:  ${majorAction(deps.ctx.instance)}`);
+      deps.io.out("(nothing was pulled — this checkout is unchanged)");
+      return { code: EXIT.OK, moved: false, to: null, higher: null };
+    }
+  }
+  deps.io.out("updating issance (git pull --ff-only)…");
+  const code = git(["pull", "--ff-only"]);
+  // A `--ff-only` pull that finds nothing to take succeeds and moves no commit — the linked-clone
+  // spelling of "already current". Compare HEAD across the pull rather than parsing git's wording:
+  // "Already up to date." is a translated, version-dependent sentence, and the sha is neither.
+  return { code, moved: code === EXIT.OK && headNow() !== before, to: null, higher: null };
+}
+
+/**
+ * A Hangar-managed checkout is detached, so `update` re-detaches it — onto the newest TAG of the major
+ * it is on (prereleases counting only as a fallback, for an install that is on one), never onto
+ * whatever the default branch says right now. A prerelease tag needs nothing special here: it is fetched as
+ * `refs/tags/<tag>` like every other.
+ */
+function updateManaged(
+  deps: UpdateDeps,
+  git: (args: readonly string[]) => number,
+  installed: string | null,
+  crossMajor: boolean,
+  toTag: string | null,
+  choice: LineChoice,
+): CheckoutOutcome {
+  const root = deps.ctx.root;
+  const ls = deps.exec.capture("git", gitArgs(root, ["ls-remote", "--tags", tagRemote(deps.exec, root)]));
+  if (!ls.found || ls.code !== 0) {
+    deps.io.err("error: could not list the upstream release tags — is the remote reachable?");
+    return { code: EXIT.FAIL, moved: false, to: null, higher: null };
+  }
+  const head = deps.exec.capture("git", gitArgs(root, ["rev-parse", "HEAD"])).stdout.trim();
+  const managedTags = parseRemoteTags(ls.stdout);
+  const asked = pinPlan(
+    planUpdate({ tags: managedTags, installed, head, crossMajor, line: choice.line, rejected: choice.rejected }),
+    { tags: managedTags, installed, wanted: toTag, ...choice },
+  );
+  if (!asked.ok) {
+    deps.io.err(`error: ${asked.reason}.`);
+    return { code: EXIT.FAIL, moved: false, to: null, higher: null };
+  }
+  const plan = asked.plan;
+
+  if (plan.kind === "unknown-version") {
+    // No readable version on disk: still take a RELEASE, never `origin HEAD`. A checkout that cannot
+    // name its major cannot be gated on one — but "ungated" must not mean "whatever the default
+    // branch points at today", which is unreleased work nobody consented to.
+    if (plan.newest === null) {
+      deps.io.err("error: no release tags on origin — cannot pin an unversioned checkout.");
+      return { code: EXIT.FAIL, moved: false, to: null, higher: null };
+    }
+    const bun = requireRunnableBun(deps, "this update cannot rebuild the selected release; the checkout is unchanged");
+    if (bun === null) return { code: EXIT.FAIL, moved: false, to: null, higher: null };
+    deps.io.out(
+      `updating issance (Hangar-managed checkout: no readable version — pinning to newest release tag ${plan.newest.tag})…`,
+    );
+    const pinned = detachOnto(deps, git, plan.newest.tag);
+    return { code: pinned, moved: pinned === EXIT.OK, to: plan.newest.version, higher: null, bun };
+  }
+  if (plan.kind === "no-higher-major") {
+    printNoHigherMajor(deps, plan.major);
+    return { code: EXIT.OK, moved: false, to: null, higher: null };
+  }
+  if (plan.kind === "no-release") {
+    printNoRelease(deps, plan.major, "leaving this checkout where it is");
+    announceMajor(deps, plan.higher);
+    return { code: EXIT.OK, moved: false, to: null, higher: plan.higher };
+  }
+  if (plan.kind === "current") {
+    printCurrent(deps, plan.at);
+    announceMajor(deps, plan.higher);
+    return { code: EXIT.OK, moved: false, to: null, higher: plan.higher };
+  }
+  // Target selection above is read-only. Prove the exact Bun that will run the fetched source
+  // before `detachOnto` reaches its first mutation (`git fetch`), so a bad compiler leaves this
+  // managed checkout exactly where it was.
+  const bun = requireRunnableBun(deps, "this update cannot rebuild the selected release; the checkout is unchanged");
+  if (bun === null) return { code: EXIT.FAIL, moved: false, to: null, higher: null };
+  deps.io.out(
+    plan.crossesMajor
+      ? `crossing to issance ${plan.target.version} (--major given: consented)…`
+      : `updating issance (Hangar-managed checkout: fetch + detach onto ${plan.target.tag})…`,
+  );
+  const code = detachOnto(deps, git, plan.target.tag);
+  if (code === EXIT.OK && !plan.crossesMajor) announceMajor(deps, plan.higher);
+  // A crossing just TOOK `higher`; naming it again at the end of the transcript would advertise the
+  // release the operator is now standing on.
+  return {
+    code,
+    moved: code === EXIT.OK,
+    to: plan.target.version,
+    higher: plan.crossesMajor ? null : plan.higher,
+    bun,
+  };
+}
+
+/** Fetch the release tag `tag` and re-detach onto it, the way Hangar got this checkout here. */
+function detachOnto(deps: UpdateDeps, git: (args: readonly string[]) => number, tag: string): number {
+  const root = deps.ctx.root;
+  const ref = `refs/tags/${tag}`;
+  // An EXPLICIT, STORING refspec — `+<ref>:<ref>` — so the tag exists LOCALLY afterwards.
+  //
+  // This used to fetch the bare ref (`git fetch origin refs/tags/v1.0.0`). Git accepts that and
+  // writes FETCH_HEAD, which is all the `checkout --detach FETCH_HEAD` below needs — and stores NO
+  // local tag at all. So the checkout landed on the right commit and the local tag set never learned
+  // it had, leaving `refs/tags/v<version>` in one of two states, neither of them the truth:
+  //
+  //   ABSENT — a checkout Hangar installed and only ever updated this way carries no tags at all.
+  //     `web/vite.config.ts`'s `isReleaseBuild` runs `git rev-parse -q --verify` on the tag, that
+  //     FAILS, and its catch path returns true — so the stamp comes out clean. The right answer,
+  //     reached by a failure rather than by evidence: git still cannot say which release this is.
+  //   STALE — a checkout that DOES carry a `v<version>` tag from some earlier fetch, pointing at an
+  //     older commit. Now `isReleaseBuild` compares it against HEAD, they differ, and a genuine
+  //     release is stamped `<version>-dev`. Measured in the VM lab on a guest whose clone carried an
+  //     older `v1.0.0`: `issance version` → `1.0.0-dev+8d57cc8`. The PWA footer and the
+  //     `X-issance-Build` header then call a release a development build, and `cli/crew-update.ts`'s
+  //     `answersThisBuild` reads the `-dev` tail as "not that commit" — so a crew member updated
+  //     this way looks like it never took the push it did take.
+  //
+  // Storing the ref replaces absent-or-stale with true, in both shapes.
+  // The leading `+` forces the update. It is the right sign HERE and only here: this function
+  // already discards local work wholesale (see `--force` below), because a reinstall replaces the
+  // managed checkout. A tag that was moved upstream must follow the same rule, or a re-cut release
+  // would fail the fetch and strand the update on the old tag object.
+  //
+  // `--depth 1` ONLY when we are already shallow, so an update never truncates the history of a full
+  // clone someone happens to have detached.
+  const spec = `+${ref}:${ref}`;
+  const remote = tagRemote(deps.exec, root);
+  const fetch = isShallow(deps.exec, root)
+    ? ["fetch", "--depth", "1", remote, spec]
+    : ["fetch", remote, spec];
+  if (git(fetch) !== EXIT.OK) return EXIT.FAIL;
+  // `--force` because `build` runs `bun install`, which can rewrite the TRACKED lockfiles: a plain
+  // checkout would then refuse on the dirty tree and re-break the very update path this fixes.
+  // Discarding local edits matches Hangar's own refresh semantics — a reinstall replaces the managed
+  // checkout wholesale. `-q` because otherwise checkout warns "you are leaving 1 commit behind" on
+  // every single update: true, alarming, and useless — the commit we leave is the release we just
+  // replaced.
+  //
+  // An Edge build's stamp is lifted first: `assume-unchanged` files refuse even a forced checkout.
+  unstampCheckout(deps, root);
+  if (git(["checkout", "-q", "--detach", "--force", "FETCH_HEAD"]) !== EXIT.OK) return EXIT.FAIL;
+  const head = deps.exec.capture("git", gitArgs(root, ["log", "-1", "--format=%h %s"]));
+  deps.io.out(`→ now at ${head.stdout.trim()}`);
+  return stampCheckout(deps, root, tag) ? EXIT.OK : EXIT.FAIL;
+}
+
+/**
+ * After an update, Hangar's plugin registry still holds the action set + version CACHED at the last
+ * `plugin link`, so a newly added action returns `plugin_action_not_found` until a re-link. Re-link
+ * here so `update` self-heals it. Best-effort: never fails the update — Hangar may be down, or this
+ * may not be a link install — it just prints how to do it by hand.
+ *
+ * NEVER on a Hangar-MANAGED checkout: `plugin link` re-registers with `source.kind = local`, after
+ * which Hangar REFUSES `plugin install` ("already linked from a local path"), taking away the
+ * reinstall that is the operator's only other way to refresh (ADR 0006).
+ */
+export function refreshRegistry(deps: UpdateDeps, at: string = deps.ctx.root): void {
+  // `at` is the path Hangar should register, which on a STAGED checkout is the `current` symlink —
+  // so a plugin action always runs the version that is live, not the one that happened to be live
+  // when the link was made. Whether we may re-link at all is still decided from the checkout we are
+  // running in: `git -C <current>` resolves into a detached worktree, which would read as managed
+  // and skip the very re-link the staged path needs.
+  if (deps.exec.which("herdr") === null) return;
+  if (isManagedCheckout(deps.exec, deps.ctx.root)) {
+    deps.io.out(
+      "note: Hangar-managed install — registry left alone (re-linking would block `hangar plugin install`)",
+    );
+    return;
+  }
+  const r = deps.exec.capture("herdr", ["plugin", "link", at]);
+  if (r.found && r.code === 0) {
+    deps.io.out("herdr registry refreshed (re-linked) — new actions are invokable now");
+    return;
+  }
+  deps.io.out("note: couldn't refresh the Hangar registry (is the Hangar server running?) —");
+  deps.io.out(`      run: herdr plugin link "${at}"`);
+}
+
+/**
+ * The version with its BUILD METADATA and its non-release marker taken off — `1.0.0-beta.46+ab12cd3`
+ * and `1.0.0-beta.46-dev` both read as `1.0.0-beta.46`.
+ *
+ * Both tails have to go before the built bundle can be compared against the manifest. `+<sha>` is the
+ * commit the bundle came from, which the manifest never carries. `-dev`/`-dirty` are `vite.config.ts`
+ * saying "this bundle is not a tagged release" — true on a linked clone mid-development, and true on
+ * any checkout whose local `v<version>` tag is STALE, and in NEITHER case evidence that the build is
+ * of a different version. A prerelease tail (`-beta.46`) is part of the version and stays.
+ */
+const releaseCore = (v: string): string => (v.split("+")[0] ?? v).replace(/-(?:dev|dirty)$/, "");
+
+/**
+ * Is there a working issance on disk built from the version the manifest names?
+ *
+ * This is the second half of the "nothing to take" decision. A no-op verdict alone must not skip the
+ * rebuild, because the half-crossed checkout — detached onto the new tag with a build that failed —
+ * reports exactly the same verdict on the re-run the operator was TOLD to make ("Fix the build and
+ * re-run"). That path has to keep repairing, so anything short of a complete, matching install
+ * builds anyway.
+ *
+ * Both facts are read through `bridge/version.ts`, the one place that parses either file.
+ */
+function installIsIntact(deps: UpdateDeps): boolean {
+  const root = deps.ctx.root;
+  if (!deps.files.exists(collieBinary(root, deps.host))) return false;
+  const manifest = manifestVersionFrom(deps.files.read(join(root, "herdr-plugin.toml")));
+  const built = readBuildInfo(deps.files.read(join(root, "web", "dist", "build-info.json")));
+  if (manifest === null || built === null) return false;
+  return releaseCore(built) === releaseCore(manifest);
+}
+
+/**
+ * The closing half of the major notice. The full two-line form prints where the decision is made,
+ * near the TOP of a transcript that then runs two installs, two typechecks, a Vite build and a
+ * restart — about seventy lines. What the operator reads is the tail, so the tail has to say it too:
+ * one line, after the final status block, where the eye lands. This is the notice the whole 1.0
+ * migration depends on.
+ *
+ * On the short path above the two may sit next to each other. That costs one line and is not worth a
+ * special case.
+ */
+function closeWithMajor(deps: UpdateDeps, higher: ReleaseTag | null): void {
+  if (higher === null) return;
+  deps.io.out(`note: issance ${higher.version} is out — a NEW MAJOR. Take it with:  ${majorAction(deps.ctx.instance)}`);
+}
+
+/** The check is `hooks status --check`, which answers in milliseconds; a longer wait is a hang. */
+const HOOKS_CHECK_TIMEOUT_MS = 5_000;
+
+/**
+ * The one line a successful update prints when the new build's beacon hooks are ahead of the
+ * operator's `settings.json` — a registration this build added that their file does not carry.
+ *
+ * IT IS ASKED OF THE NEW BINARY, and that is the whole design. This process is the OLD build, and
+ * its compiled-in `BEACON_HOOKS` is exactly the list that may have grown; an in-process check would
+ * therefore be the one check guaranteed to miss the case it exists for. So the freshly installed
+ * binary is spawned through the stable name that was just switched, and its EXIT CODE is the verdict
+ * (`EXIT.STATE` = behind — `cli/hooks.ts`).
+ *
+ * Silent unless the answer is "behind". A machine with no beacon hooks installed opted out, and an
+ * update is not the place to sell them; a complete install has nothing to say. Every other outcome —
+ * a binary too old to know the flag, a spawn that fails, a settings file nobody can read — is
+ * silence too. The update already succeeded, and no afterthought may take that back.
+ */
+function nudgeHooks(deps: UpdateDeps, binary: string): void {
+  let r;
+  try {
+    r = deps.exec.capture(binary, ["hooks", "status", "--check"], HOOKS_CHECK_TIMEOUT_MS, undefined, ITS_OWN_ROOT);
+  } catch {
+    // `capture` throws when the child cannot even start (ENOEXEC, EACCES) — spawn failure, silence.
+    return;
+  }
+  if (!r.found || r.code !== EXIT.STATE) return;
+  deps.io.out(
+    "note: this build registers beacon hooks your settings do not carry yet —" +
+      " run `issance hooks install claude` to add them.",
+  );
+}
+
+/**
+ * The same question for the walky talky skill: is an installed copy older than the text the NEW
+ * binary carries? Asked of the new binary for the reason `nudgeHooks` is — the old build's embedded
+ * text is the stale one. Silent unless the answer is `EXIT.STATE`; a skill nobody installed, a binary
+ * too old to know the verb and a failed spawn all say nothing.
+ *
+ * Only with `ISSANCE_SKILL_SYNC=off` since ADR 0111: by default {@link syncSkill} writes instead.
+ */
+function nudgeSkill(deps: UpdateDeps, binary: string): void {
+  let r;
+  try {
+    r = deps.exec.capture(binary, ["skill", "status", "--check"], HOOKS_CHECK_TIMEOUT_MS, undefined, ITS_OWN_ROOT);
+  } catch {
+    return;
+  }
+  if (!r.found || r.code !== EXIT.STATE) return;
+  deps.io.out(
+    "note: this build carries a newer walky talky skill than the one your agents have —" +
+      " run `issance skill sync` to update it.",
+  );
+}
+
+/** How long the skill sync may take. It writes a handful of small files; a hang must not hold the update. */
+const SKILL_SYNC_TIMEOUT_MS = 30_000;
+
+/**
+ * THE SKILL FOLLOWS THE UPDATE (ADR 0111). After every successful swap, the NEW binary runs `issance
+ * skill sync --json` through the stable name, for the reason {@link nudgeHooks} asks it: this process
+ * is the old build, and its embedded skill text is the one that may have moved on. The sync installs
+ * the skill into every harness present on this machine, rewrites a stale copy, and leaves out a target
+ * the operator uninstalled. Its lines go where the update's own notes go.
+ *
+ * NOTHING HERE FAILS THE UPDATE. A spawn that throws, a timeout and a non-zero exit each print one
+ * note naming the command to run by hand. A build that does not know the verb (a rollback to a version
+ * before 1.23.0 prints the general brief for `skill sync`) answers with no JSON, and that is silence.
+ *
+ * `ISSANCE_SKILL_SYNC=off` keeps the old behaviour: ask `skill status --check` and print the one note.
+ * `nudgeWhenOff` is false on the two terminal rollbacks, which never nudged.
+ */
+function syncSkill(deps: UpdateDeps, binary: string, nudgeWhenOff = true): void {
+  if (!skillSyncEnabled(deps.ctx.env.ISSANCE_SKILL_SYNC)) {
+    if (nudgeWhenOff) nudgeSkill(deps, binary);
+    return;
+  }
+  const didNotRun = (reason: string): void => {
+    deps.io.out(`note: skill sync did not run: ${reason}; run \`issance skill sync\`.`);
+  };
+  let r;
+  try {
+    r = deps.exec.capture(binary, ["skill", "sync", "--json"], SKILL_SYNC_TIMEOUT_MS, undefined, ITS_OWN_ROOT);
+  } catch (err) {
+    didNotRun(err instanceof Error ? err.message : String(err));
+    return;
+  }
+  if (!r.found) return didNotRun(`${binary} was not found`);
+  if (r.code === 124) return didNotRun(`it took longer than ${String(SKILL_SYNC_TIMEOUT_MS / 1000)} s`);
+  const result = parseSyncResult(r.stdout);
+  if (r.code !== EXIT.OK) {
+    const said = r.stderr.trim().split("\n").findLast((l) => l.trim() !== "");
+    if (result !== null) for (const line of syncLines(result)) deps.io.out(line);
+    return didNotRun(said ?? `it exited ${String(r.code)}`);
+  }
+  if (result === null) return;
+  for (const line of syncLines(result)) deps.io.out(line);
+}
+
+/**
+ * The second half of `update`, run FROM THE CODE THAT WAS JUST FETCHED. `build` re-runs the version
+ * gate (a half-bumped release can't go live) and recompiles both the binary and `web/dist`;
+ * `restart` picks up the new bridge AND the new binary (the swap gave `bin/issance` a fresh inode,
+ * so the still-running service keeps executing the old one until it is restarted); `refreshRegistry`
+ * re-links so Hangar learns any newly added actions.
+ */
+export async function cmdApplyUpdate(deps: UpdateDeps, args: readonly string[] = []): Promise<number> {
+  // TWO VERBS UNDER ONE NAME, told apart by `--to`. With it, this is the DETACHED RUNNER of M15/04:
+  // it flips a staged version live, restarts, polls the health gate and rolls back once. Without it,
+  // it is the original post-pull half below — the in-place second stage a Hangar-managed checkout
+  // still takes (ADR 0006), which builds in the tree it is standing in and has nothing to flip.
+  const apply = parseApplyArgs(args);
+  if (apply !== null) return await runApply(deps, apply);
+  const built = cmdBuild(deps);
+  if (built !== EXIT.OK) {
+    // The checkout has already advanced, so this is the skew shape ADR 0006 exists to prevent: new
+    // code on disk, the OLD artifacts still being served. `build` swaps nothing on failure, so the
+    // service is untouched and consistent — but the operator has to know the update did not land.
+    deps.io.err("error: update stopped — the checkout advanced but the build failed.");
+    deps.io.err("       The running bridge and the served UI are unchanged. Fix the build and re-run");
+    deps.io.err(`       \`${herdrActionCommand("update", deps.ctx.instance)}\`.`);
+    return built;
+  }
+  const restarted = await deps.restart();
+  if (restarted !== EXIT.OK) return restarted;
+  refreshRegistry(deps);
+  deps.io.out("✓ update complete");
+  // `build` just wrote this binary from the code we are running, so it is the new list, not ours.
+  nudgeHooks(deps, collieBinary(deps.ctx.root, deps.host));
+  syncSkill(deps, collieBinary(deps.ctx.root, deps.host));
+  return EXIT.OK;
+}
+
+/**
+ * Record an IN-PLACE update that has already succeeded, so a restarted lead can find its crew turns.
+ *
+ * The other two update paths reach the record through {@link handOff}, which writes it before it
+ * launches the detached runner and then leaves the runner to drive it. This path has no runner: the
+ * `_apply-update` child builds, restarts and verifies inside its own process, and until now it wrote
+ * nothing at all. `--run-id` was accepted, carried the whole way here and dropped, because
+ * `wantsRunId` was read at the two `handOff` calls and nowhere else.
+ *
+ * The cost was not the missing `--status` line. `settleUpdateGate` in `bridge/index.ts` re-derives
+ * the crew's turn queue from this file, because the update restarts the very bridge that held the
+ * queue in memory and the record is the only thing that survives it. No record, so the gate returned
+ * early on every tick forever, so no peer was ever handed its turn — the lead updated itself and the
+ * crew sat still until the operator tapped "Retry crew update" by hand. Every install from an
+ * ordinary git checkout had this, which is the documented default.
+ *
+ * ONE WRITE, AFTER THE FACT, and that is the honest shape here. The child has already returned 0,
+ * which means it built, restarted and verified; walking the record through those states one at a
+ * time would be narrating a machine that has finished running. `idleRun` rather than the record on
+ * disk for the same reason {@link handOff} uses it: the previous run's terminal state is a log, not
+ * a state this run must transition out of.
+ *
+ * `pass` here means WHAT THIS PATH CAN KNOW: the child returned 0, so it built, restarted the
+ * service and returned without an error. It is not the health-gate pass the detached runner writes,
+ * because an in-place checkout has no gate to poll — ADR 0006 gives it no previous version on disk
+ * to roll back to, so there is nothing a failed probe could do but say so. Reading `done` here as
+ * "the runner verified it" would be reading more than the word carries on this path.
+ *
+ * Best-effort. A failed write must not turn a successful update into a failed command — the new
+ * version is already built, restarted and serving. It IS said out loud, because a silent failure
+ * here is the very bug this function exists to fix, wearing a success message.
+ */
+function recordInPlaceRun(
+  deps: UpdateDeps,
+  runId: string | null,
+  from: string | null,
+  to: string | null,
+  startedAt: number,
+  action?: "switch",
+): void {
+  // TWO clocks, not one. `begin` carries the real start, taken before the advance; everything after
+  // it carries now. A single `now` for all five would have written `startedAt === updatedAt` on a run
+  // that visibly took half a minute, and `issance update --status` prints both of those numbers.
+  const now = deps.now();
+  const events: RunEvent[] = [{ kind: "stage" }, { kind: "restart" }, { kind: "verify" }, { kind: "pass" }];
+  try {
+    const begin: RunEvent = { kind: "begin", from, to, pid: deps.pid, runId };
+    const begun = reduce(idleRun(startedAt), action === undefined ? begin : { ...begin, action }, startedAt);
+    writeRun(deps.files, deps.ctx.stateDir, events.reduce((run, event) => reduce(run, event, now), begun));
+    // Only when a crew is actually waiting on it. A run with no id was started from a terminal by
+    // someone who never asked for one, and a line about peers there would be noise about nothing.
+    if (runId !== null) deps.io.out("  Crew turn recorded — peers level on this lead's next poll.");
+  } catch (err) {
+    // Said out loud, because the silence is the bug. The update itself stands — the new version is
+    // built, restarted and serving — but a crew will not level off a record that was not written,
+    // and an operator who does not know that is an operator watching a peer sit still for no
+    // visible reason. Name the manual way out in the same breath.
+    deps.io.err(`warning: the update landed, but its run record could not be written (${String(err)}).`);
+    deps.io.err("         A crew will not level its peers from this run. Level them from the phone's");
+    deps.io.err("         \"Retry crew update\", or run `issance update` on each peer.");
+  }
+}
+
+/**
+ * Update to the newest release of the major this install is on: advance the checkout, then hand the
+ * rest to the code we just fetched. `--major` — the whole consent, since a Hangar plugin action has no
+ * TTY to prompt on (ADR 0020) — targets the next major instead.
+ *
+ * The handoff is the whole subtlety. The shell re-exec'd itself because bash reads a script by byte
+ * offset and the pull rewrites that very file. A binary has the harder version of the problem: the
+ * post-pull half must run the NEW build logic, and the new binary does not exist yet — `build` is
+ * what produces it. So the re-exec target is the new checkout's SOURCE, run with Bun, which `build`
+ * already requires and which is therefore not a new dependency. That build compiles the new
+ * `bin/issance` and swaps it in; the restart that follows is what puts it into service.
+ */
+export async function cmdUpdate(deps: UpdateDeps, args: readonly string[] = []): Promise<number> {
+  // The fork on install kind, and the ONLY one. Every path below it is the path that kind's shape
+  // supports: a git checkout advances and rebuilds; a binary install fetches, verifies and flips a
+  // symlink; an install we cannot name does neither, and says so rather than guessing (M14/01 §3.1).
+  const install = detectInstall(deps);
+  const isCheckout = install.kind === "linked-clone" || install.kind === "detached-checkout";
+  // WHICH CHECKOUT STAGES. A checkout already living under a `versions/` layout stages, whatever its
+  // HEAD says — a staged version IS a detached worktree, so reading `git symbolic-ref` there would
+  // route every second update back into the in-place path it just left. A checkout that is not under
+  // the layout stages only when it is a LINKED CLONE: a Hangar-managed checkout keeps ADR 0006's
+  // in-place advancement for this milestone (see that ADR's 2026-09-03 amendment).
+  const staged = isCheckout && (underVersions(deps.ctx.root, deps.host) || install.kind === "linked-clone");
+  const layout = isCheckout ? layoutForCheckout(deps.ctx.root, deps.host) : null;
+  // The record, not the act — `--status` reads `<state dir>/update.json` and touches nothing, so it
+  // is answered before the lock, before the install kind matters and before any network call.
+  if (wantsStatus(args)) return cmdUpdateStatus(deps, args);
+  // Windows takes a release install only. Refused here, before the lock, the record or any fetch,
+  // so nothing on disk changes (WINDOWS_CHECKOUT_SENTENCE says why).
+  if (isCheckout && deps.host.platform === "win32") {
+    deps.io.err(`error: ${WINDOWS_CHECKOUT_SENTENCE}`);
+    return EXIT.FAIL;
+  }
+  if (args.includes("--rollback")) {
+    // FROM THE PHONE (M60 spec 01): `--run-id` is what `POST /api/update/rollback` adds, and it turns
+    // the rollback into a RUN, handed to the same detached runner an update takes, so the phone
+    // follows it on the record and the restart cannot kill the process driving it. The terminal's
+    // `issance update --rollback` (no run id) is unchanged below.
+    const rollbackRunId = wantsRunId(args);
+    if (rollbackRunId !== null && (install.kind === "binary" || (staged && layout !== null))) {
+      return rollbackDetached(deps, install.kind, rollbackRunId);
+    }
+    if (install.kind === "binary") return await rollbackBinary(deps);
+    if (install.kind === "packaged") {
+      // Above the checkout branch on purpose: the message below it is three sentences about
+      // `versions/` layouts and `git checkout`, none of which exist here, and the real answer is the
+      // package manager's own downgrade (`pacman -U` from the cache, `brew` an older formula).
+      // The main refusal below names the command that takes the NEXT version; a rollback wants the
+      // previous one, which no `pacman -Syu` spelling reaches, so this one names the boundary and
+      // sends the operator to the manager rather than to a command.
+      deps.io.err(`error: ${deps.ctx.root} is a packaged install — ${PACKAGED_SENTENCE}, and issance stages`);
+      deps.io.err("       no versions here to roll back to. Reinstall the previous version through");
+      deps.io.err("       your package manager.");
+      return EXIT.FAIL;
+    }
+    if (staged && layout !== null) return await rollbackCheckout(deps, layout);
+    deps.io.err("error: `--rollback` flips the `current` symlink back to the previous version, and this");
+    deps.io.err("       install has no `versions/` layout to flip inside — a Hangar-managed checkout");
+    deps.io.err("       advances in place (ADR 0006), so there is no previous version on disk.");
+    deps.io.err("       Take a specific release with `git checkout v<version>` and rebuild.");
+    return EXIT.FAIL;
+  }
+  if (install.kind === "packaged") {
+    // Not a failure to diagnose — a boundary to respect (ADR 0035). The sentence is the shared one
+    // the preflight's `package` check and `doctor`'s install line print, so a reword reaches every
+    // surface at once. The COMMAND is named only where the resolved root names a manager we know;
+    // where it does not, issance says the boundary and stops rather than guessing a manager and
+    // sending the operator after a package that may not exist.
+    const cmd = packageCommand(deps.ctx.root);
+    deps.io.err(`error: ${deps.ctx.root} is a packaged install — ${PACKAGED_SENTENCE}.`);
+    deps.io.err("       `issance update` will not replace its files.");
+    if (cmd !== null) deps.io.err(`       Take the new version with: ${cmd}`);
+    return EXIT.FAIL;
+  }
+  if (install.kind === "unknown") {
+    deps.io.err(`error: cannot tell how this issance was installed (${unknownEvidence(deps, install.why)}).`);
+    deps.io.err("       `issance update` will not guess. A git checkout refreshes with:");
+    deps.io.err("       herdr plugin install issance/issance-app --yes");
+    deps.io.err("       A downloaded install — and a staged checkout — lives under a `versions/` layout");
+    deps.io.err("       with a `current` symlink beside it; see docs/install.md.");
+    return EXIT.FAIL;
+  }
+  // ONE UPDATE AT A TIME ON THIS MACHINE, asked before any of the three paths below begins. On
+  // 2026-10-14 two detached updaters for the same run built into the same tree and broke each other's
+  // rename. The in-place path took no lock at all and wrote no record until its last line, and the
+  // staged and binary paths take the lock only at `handOff`, at the END of staging; this refusal is
+  // what makes the second runner exit at once instead of building beside the first.
+  const busy = refuseIfUpdateRunning(deps);
+  if (busy !== null) return busy;
+  // THE WAY DOWN THROUGH A KEPT BUILD (M60 spec 01): `--downgrade --to-tag` names a build this
+  // machine may still hold, and flipping to it beats downloading it again. No kept build falls
+  // through to the ordinary paths below, which take the same target the slow way.
+  const downTag = wantsDowngrade(args) ? wantsToTag(args) : null;
+  if (downTag !== null && (install.kind === "binary" || (staged && layout !== null))) {
+    const kept = keptStepDown(deps, install.kind === "binary" ? "binary" : "checkout", downTag, wantsRunId(args));
+    if (kept !== null) return kept;
+  }
+  if (install.kind === "binary") return await withStagingRecord(deps, () => updateBinary(deps, args));
+  if (staged && layout !== null) return await withStagingRecord(deps, () => updateStagedCheckout(deps, layout, args));
+  // The in-place path holds the lock for its whole run, because nothing else on this path writes
+  // a record until the end. The `_apply-update` child is a separate process and neither checks nor
+  // takes it.
+  takeLock(deps.files, deps.ctx.stateDir, deps.pid, deps.now());
+  // Read back: two runners can both pass the check above and both write, and the later write wins.
+  // The loser sees the other pid in the file and leaves, and does not release a lock that is not its own.
+  const taken = readLock(deps.files, deps.ctx.stateDir);
+  if (taken !== null && taken.pid !== deps.pid) {
+    const verdict = updateLockVerdict(deps);
+    return verdict.ok ? refuseOnLock(deps, taken, "another update is in flight") : refuseOnLock(deps, verdict.held, verdict.reason);
+  }
+  try {
+    return await updateInPlace(deps, args);
+  } finally {
+    if (readLock(deps.files, deps.ctx.stateDir)?.pid === deps.pid) releaseLock(deps.files, deps.ctx.stateDir);
+  }
+}
+
+/**
+ * Refuse when another update is already running on this machine, and say so. `null` means the way
+ * is clear.
+ *
+ * Two questions, the two `beginStaging` asks: the lock, and a live in-flight record another process
+ * wrote. The lock alone is not enough, because the staged and binary paths take it only at the end
+ * of staging, and the record alone is not enough, because the in-place path writes it only at the
+ * end of its run.
+ */
+function refuseIfUpdateRunning(deps: UpdateDeps): number | null {
+  const verdict = updateLockVerdict(deps);
+  if (!verdict.ok) return refuseOnLock(deps, verdict.held, verdict.reason);
+  const live = currentRun(deps);
+  if (live !== null && live.pid !== deps.pid && inFlight(live.state)) {
+    deps.io.err(
+      `error: another update is in flight (pid ${live.pid}, ${live.state}). This update does not start a second one. Wait for it to finish.`,
+    );
+    return EXIT.FAIL;
+  }
+  return null;
+}
+
+/** The refusal for a lock another process holds. A dead holder says when the lock clears. */
+function refuseOnLock(deps: UpdateDeps, held: UpdateLock, reason: string): number {
+  const alive = deps.exec.processCommand(held.pid) !== null;
+  const next = alive
+    ? "Wait for it to finish."
+    : `If that update is gone, the lock clears at ${clockTime(held.at + STALE_AFTER_MS)}, or remove ${updateLockPath(deps.ctx.stateDir)}.`;
+  deps.io.err(`error: ${reason}. This update does not start a second one. ${next}`);
+  return EXIT.FAIL;
+}
+
+/** HH:MM on this machine's clock. */
+function clockTime(ms: number): string {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** The in-place path: advance the checkout where it stands, then build and restart from it. */
+async function updateInPlace(deps: UpdateDeps, args: readonly string[]): Promise<number> {
+  // Read BEFORE the advance rewrites the manifest — this is the version being left behind, and it is
+  // the only moment it is still on disk. `handOff`'s callers get theirs from the `versions/` layout;
+  // an in-place checkout has no previous directory to name, so the manifest is the whole record of it.
+  const from = installedVersion(deps);
+  // The run's real start, for the record written at the end of it. Everything below this line is
+  // the run: the fetch, the advance, the build, the restart.
+  const startedAt = deps.now();
+  const advanced = updateCheckout(deps, { crossMajor: wantsMajor(args), toTag: wantsToTag(args), args });
+  if (advanced.code !== EXIT.OK) return advanced.code;
+  // Nothing was taken AND what is on disk is whole: stop here. This used to fall through, so
+  // "already current" and "nothing to cross to" were each followed by two installs, two typechecks,
+  // a full Vite build and a bridge restart — minutes of work and a service interruption for a no-op,
+  // ending on `✓ update complete`, which contradicted the verb's own first line.
+  //
+  // The rebuild is still unconditional when the install is NOT intact. An update whose build failed
+  // leaves the checkout advanced with no binary, and the recovery the operator is told to run is this
+  // very command — which by then reports "already current", because the checkout really did move. So
+  // the verdict alone may never be what skips the build.
+  if (!advanced.moved && installIsIntact(deps)) {
+    closeWithMajor(deps, advanced.higher);
+    return nothingTaken(deps);
+  }
+  // A managed advance already proved and carried this exact Bun before its fetch. A repair of an
+  // incomplete, already-current checkout still needs the same proof, but intact no-ops above remain
+  // Bun-free.
+  const bun =
+    advanced.bun ?? requireRunnableBun(deps, "this update cannot rebuild the current checkout");
+  if (bun === null) return EXIT.FAIL;
+  const r = deps.exec.runIn(
+    bun.path,
+    [join(deps.ctx.root, "cli", "main.ts"), "_apply-update"],
+    deps.ctx.root,
+    dirname(bun.path),
+  );
+  if (!r.found || r.code !== 0) return EXIT.FAIL;
+  // A step DOWN to a lower release is the switch back to Stable, or a member following its lead
+  // down; the record says so, so a lead's crew levels down after it (`crewTurnStart`).
+  const down = from !== null && advanced.to !== null && compareSemver(advanced.to, from) < 0;
+  recordInPlaceRun(deps, wantsRunId(args), from, advanced.to, startedAt, down ? "switch" : undefined);
+  // `_apply-update` ran as a child with our own stdio, so its `✓ update complete` is already on the
+  // screen. This lands after it — the last line of the transcript.
+  closeWithMajor(deps, advanced.higher);
+  return EXIT.OK;
+}
+
+// ── The binary install path (M14/01 §3) ──────────────────────────────────────
+// A binary install has no `.git` to pull and nothing to compile: it is a versioned directory and a
+// symlink. `<root>/versions/X.Y.Z/` holds a complete payload (the compiled binary, `web/dist`, the
+// manifest, `package.json`, `.env.example`, `docs/`), and `<root>/current` is a RELATIVE symlink at
+// exactly one of them. An update lays a new version down beside the old one and flips that symlink;
+// two atomic renames, and the previous version is still on disk afterwards, which is what makes
+// `--rollback` almost free. On Windows `current` is a directory junction with an absolute target
+// instead, flipped by `flipJunction`; Bun resolves `process.execPath` through it there too (Windows
+// 11 VM, 2026-10-02), so the paragraph below holds on every host.
+//
+// The running bridge is pinned to the version directory it was started from — `process.execPath` is
+// realpath-resolved, so `resolvePluginRoot` returns `versions/X.Y.Z`, never `current` — so it keeps
+// serving its own `web/dist` until the restart. There is no instant at which a new binary serves an
+// old bundle or the reverse (`cli/install-kind.test.ts` pins that assumption).
+//
+// Nothing here re-execs. `cmdUpdate`'s `_apply-update` handoff exists because the source path must
+// run the NEW build logic and the new binary does not exist yet; here nothing is compiled and the
+// old binary can perform every step.
+
+/**
+ * GitHub's `/tags` payload → the same `ReleaseTag[]` {@link parseRemoteTags} produces from
+ * `git ls-remote --tags`. Same anchor (`parsePrereleaseTag`), so a tag the banner would not announce
+ * is a tag this can never land on, and everything downstream — `planUpdate`, `compareSemver`,
+ * `followsTrain`, `releaseInMajor`, `trainInMajor` — is the code the git paths already run.
+ */
+export function parseApiTags(tags: readonly ApiTag[]): ReleaseTag[] {
+  return tags.flatMap((t) => {
+    const name = t.name.trim();
+    const parsed = parsePrereleaseTag(name);
+    if (parsed === null) return [];
+    return [
+      {
+        tag: name,
+        version: name.slice(1),
+        major: parsed.triple[0],
+        prerelease: parsed.prerelease,
+        commit: t.sha,
+      },
+    ];
+  });
+}
+
+/**
+ * The canonical platform id for a running process, or null where issance publishes no artifact.
+ * `linux-x64` ships as Bun's BASELINE target: the default requires AVX2 and dies with SIGILL on
+ * older hardware, which is exactly the hardware a self-hosted tool lives on, and issance is I/O-bound
+ * so the baseline penalty is not observable here.
+ */
+export function platformId(platform: string, arch: string): string | null {
+  // Windows ships x64 only (M43). Windows on ARM stays best effort, so it gets the honest refusal.
+  if (platform === "win32") return arch === "x64" ? "windows-x64" : null;
+  const os = platform === "linux" ? "linux" : platform === "darwin" ? "macos" : null;
+  const cpu = arch === "x64" ? "x64" : arch === "arm64" ? "arm64" : null;
+  return os === null || cpu === null ? null : `${os}-${cpu}`;
+}
+
+/** `%SystemRoot%\System32\tar.exe`: the bsdtar Windows ships, which reads a zip. */
+export function windowsTar(env: Environment, host: Host): string {
+  return host.path.join(envGet(env, "SystemRoot", host) ?? "C:\\Windows", "System32", "tar.exe");
+}
+
+/** `issance-<version>.manifest.json` — CONSTRUCTED from the version, never read from a document. */
+export const manifestAssetName = (version: string): string => `issance-${version}.manifest.json`;
+
+/** A release asset's URL, built from (repo, tag, name) alone — see `parseReleaseManifest`'s header
+ *  on why the manifest carries no URLs of its own. With a rehearsal mirror (`updateMirror`,
+ *  a loopback-only test seam, `bridge/update.ts`), the same path on that mirror. */
+export const releaseAssetUrl = (repo: string, tag: string, name: string, mirror: string | null = null): string =>
+  `${mirror ?? "https://github.com"}/${repo}/releases/download/${tag}/${name}`;
+
+/** The evidence line `doctor` and the refusal above both quote for an install we cannot name. */
+function unknownEvidence(
+  deps: UpdateDeps,
+  why: "no-marker" | "orphan-layout" | "loose-binary" | "broken-checkout",
+): string {
+  const root = deps.ctx.root;
+  switch (why) {
+    case "no-marker":
+      return `no herdr-plugin.toml at ${root}`;
+    case "orphan-layout":
+      return `a versions/ layout at ${binaryLayout(root, deps.host).installRoot} with no \`current\` symlink`;
+    case "broken-checkout":
+      return `${root}/.git exists but git will not read it`;
+    case "loose-binary":
+      // NOT "neither a checkout nor a layout": a staged checkout is BOTH, so the either/or would be
+      // read as a rule rather than as the two absent shapes it actually reports.
+      return `${root} has no .git of its own and no versions/ layout above it`;
+  }
+}
+
+/**
+ * One sentence for a failed HTTPS GET, with the rate limit named because it is the likely one, and
+ * the token named when the request carried one (#254). Only a request to `api.github.com` carries
+ * it, so only that one can be refused for it or be rate-limited despite it. The token is named by the
+ * VARIABLE it came from, never by value: this line reaches a terminal, a log and a bug report.
+ */
+function netError(deps: UpdateDeps, what: string, url: string, failure: NetFailure): void {
+  const credential = isGithubApiUrl(url) ? githubCredential(deps.ctx.env) : null;
+  if (failure.status === 401 && credential !== null) {
+    deps.io.err(`error: GitHub refused the token in ${credential.source} (HTTP 401). Fix it or unset it.`);
+    deps.io.err("       Nothing was changed.");
+    return;
+  }
+  if (failure.status === 403 || failure.status === 429) {
+    if (credential !== null) {
+      deps.io.err(`error: GitHub rate-limited ${what} (HTTP ${failure.status}), even with the token in`);
+      deps.io.err(`       ${credential.source}. Wait an hour, or follow docs/upgrading.md. Nothing was changed.`);
+    } else if (isGithubApiUrl(url)) {
+      deps.io.err(`error: GitHub rate-limited ${what} (HTTP ${failure.status}). Wait an hour, or set GH_TOKEN`);
+      deps.io.err("       to a GitHub token with no scopes, so the limit is yours (docs/upgrading.md).");
+      deps.io.err("       Nothing was changed.");
+    } else {
+      deps.io.err(`error: GitHub rate-limited ${what} (HTTP ${failure.status}). Wait an hour, or follow`);
+      deps.io.err("       docs/upgrading.md. Nothing was changed.");
+    }
+    return;
+  }
+  if (failure.status !== null) {
+    deps.io.err(`error: ${what} failed (HTTP ${failure.status}). Nothing was changed.`);
+    return;
+  }
+  deps.io.err(`error: could not reach github.com — ${what} failed (${failure.message}). Nothing was changed.`);
+}
+
+/** Everything under `.staging`, and everything in `.trash`. A killed update leaves scratch; entering
+ *  with a clean one costs nothing and removes a class of half-state. */
+function sweepScratch(deps: UpdateDeps, layout: BinaryLayout): void {
+  clearScratch(deps, layout.stagingDir);
+  for (const entry of deps.files.list(layout.trashDir)) {
+    clearScratch(deps, join(layout.trashDir, entry));
+  }
+}
+
+/**
+ * Remove one scratch tree. On Windows a file that a running process executes cannot be deleted: the
+ * Task Scheduler launcher runs the `issance.exe` of the version it started from until the next
+ * `issance stop` or logon, so when an update prunes that version, its `issance.exe` stays behind in
+ * `.trash`. The next update then died on that file before it asked for a release (M43 spec 08
+ * rehearsal, 2026-10-02). There it is a note, and a later update clears it. Elsewhere a failure still
+ * stops the update, as before.
+ */
+function clearScratch(deps: UpdateDeps, path: string): void {
+  if (deps.host.platform !== "win32") {
+    deps.files.removeTree(path);
+    return;
+  }
+  try {
+    deps.files.removeTree(path);
+  } catch (err) {
+    deps.io.out(`note: the old folder ${path} is still in use (${String(err)}), so it stays for now. It is harmless, and the next update removes it. This does not stop the update.`);
+  }
+}
+
+/** Move a version directory out of the way before it is deleted, so a half-deleted tree can never be
+ *  mistaken for an installable version. */
+function toTrash(deps: UpdateDeps, layout: BinaryLayout, version: string): void {
+  deps.files.mkdirp(layout.trashDir);
+  const held = join(layout.trashDir, `${version}.${Date.now().toString(36)}`);
+  deps.files.rename(join(layout.versionsDir, version), held);
+  deps.files.removeTree(held);
+}
+
+/**
+ * {@link toTrash} for the update itself, which must not die on a busy folder. On Windows a version
+ * folder is held while a process runs from it (the launcher, an old bridge): after a rollback, the
+ * next update to the same version finds that folder and its `issance.exe` in use. The move is retried
+ * like every rename here ({@link renameSettled}); a tree that moved but cannot be deleted yet stays in
+ * `.trash` with a note ({@link clearScratch}), and a later update clears it. `null` when the folder
+ * left `versions`, else why it could not.
+ */
+async function moveVersionAside(deps: UpdateDeps, layout: BinaryLayout, version: string): Promise<string | null> {
+  deps.files.mkdirp(layout.trashDir);
+  const held = deps.host.path.join(layout.trashDir, `${version}.${Date.now().toString(36)}`);
+  try {
+    await renameSettled(deps, deps.host.path.join(layout.versionsDir, version), held);
+  } catch (err) {
+    return String(err);
+  }
+  clearScratch(deps, held);
+  return null;
+}
+
+/** The versions on disk that are actually installable — a readable version name AND a binary. */
+function installedVersions(deps: UpdateDeps, layout: BinaryLayout): string[] {
+  return listVersions(deps, layout, "binary")
+    .filter((v) => v.complete)
+    .map((v) => v.version);
+}
+
+/**
+ * The version directory `current` names, or null when it points nowhere we laid down. Exported
+ * because `doctor` reports the same fact and may not derive it a second way.
+ */
+export function currentVersionDir(deps: { readonly link: LinkReader }, layout: BinaryLayout): string | null {
+  const probe = deps.link.probe(layout.currentLink);
+  if (probe.kind !== "symlink") return null;
+  const name = basename(probe.target);
+  return name === "" ? null : name;
+}
+
+/**
+ * Point `current` at `versions/<dir>` with ONE rename. `rename(2)` replaces the existing symlink
+ * atomically, so no window exists in which `current` is absent — which is why the new link is built
+ * beside it under a scratch name first. The target is RELATIVE, so the whole install root stays
+ * movable.
+ *
+ * THE ONLY SWAP IN THIS MODULE, and both install kinds go through it: a binary install flips to a
+ * downloaded payload directory (`versions/1.2.3`), a staged checkout to a git worktree
+ * (`versions/v1.2.3`) — so `dir` is a directory NAME, never a parsed version. A second
+ * implementation would be a second thing to get atomic.
+ */
+function flipCurrent(deps: UpdateDeps, layout: BinaryLayout, version: string): boolean {
+  if (deps.host.platform === "win32") return flipJunction(deps, layout, version);
+  const staged = deps.host.path.join(layout.installRoot, ".current.new");
+  try {
+    deps.link.remove(staged);
+    deps.link.symlink(deps.host.path.join("versions", version), staged);
+    deps.files.rename(staged, layout.currentLink);
+    return true;
+  } catch (err) {
+    deps.io.err(`error: could not point ${layout.currentLink} at versions/${version} — ${String(err)}`);
+    return false;
+  }
+}
+
+/** The one command that makes a junction by hand, in a form both cmd and PowerShell accept. */
+export const junctionCommand = (at: string, target: string): string => `cmd /c mklink /J "${at}" "${target}"`;
+
+/**
+ * The Windows flip. `current` is a directory junction there (`LinkWriter.junction`), and two facts
+ * measured on the Windows 11 VM on 2026-10-02 change the steps: a rename onto an existing junction
+ * fails with EPERM, so the one atomic rename above is not possible; and removing a junction never
+ * touches the folder it names. So the new junction is built beside `current` first, which proves the
+ * folder can be named before anything moves; then the old junction goes and the new one is renamed
+ * into its place. The time without a `current` is that one rename. When the rename fails, the old
+ * junction is put back, so a failure leaves `current` on the version it named before.
+ *
+ * A junction names an ABSOLUTE folder, so the install root is not movable on Windows the way the
+ * relative symlink keeps it movable elsewhere.
+ */
+function flipJunction(deps: UpdateDeps, layout: BinaryLayout, version: string): boolean {
+  const staged = deps.host.path.join(layout.installRoot, ".current.new");
+  const target = deps.host.path.join(layout.versionsDir, version);
+  const said = (why: string): void =>
+    deps.io.err(`error: could not point ${layout.currentLink} at versions/${version} — ${why}`);
+  const before = deps.link.probe(layout.currentLink);
+  if (before.kind === "other") {
+    // A real folder or a file has the name: it is not issance's link, so it is not issance's to remove.
+    said(`it is ${before.what}, not a junction`);
+    return false;
+  }
+  try {
+    deps.link.remove(staged);
+    deps.link.junction(target, staged);
+  } catch (err) {
+    said(String(err));
+    return false;
+  }
+  try {
+    if (before.kind === "symlink") deps.link.remove(layout.currentLink);
+    deps.files.rename(staged, layout.currentLink);
+    return true;
+  } catch (err) {
+    said(String(err));
+    if (before.kind === "symlink" && deps.link.probe(layout.currentLink).kind === "absent") {
+      try {
+        deps.link.junction(before.target, layout.currentLink);
+        deps.io.err(`       ${layout.currentLink} still names ${before.target}. Nothing was changed.`);
+      } catch (again) {
+        deps.io.err(`       ${layout.currentLink} is missing now, and putting it back failed too — ${String(again)}`);
+        deps.io.err(`       Make it again by hand: ${junctionCommand(layout.currentLink, before.target)}`);
+      }
+    }
+    return false;
+  }
+}
+
+/** How many times a Windows rename is tried while the folder is busy, about five seconds in all. */
+export const RENAME_TRIES = 5;
+
+/**
+ * `rename`, tried again on Windows while the folder is busy. A freshly unpacked folder is often held
+ * for a moment by Defender or the search indexer, and the rename then fails with EBUSY or EPERM. The
+ * pauses grow by half a second (0.5 s, 1 s, 1.5 s, 2 s). Any other error, or any error off Windows,
+ * is thrown at once, exactly as before.
+ */
+async function renameSettled(deps: Pick<UpdateDeps, "files" | "host" | "sleep">, from: string, to: string): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      deps.files.rename(from, to);
+      return;
+    } catch (err) {
+      // SAFETY: the assertion asserts nothing. `catch` binds `unknown`; a Node errno error carries a
+      // string `code`, and any other value reads `undefined` here, which is the "not busy" answer.
+      const code = (err as { code?: string }).code;
+      const busy = code === "EBUSY" || code === "EPERM" || code === "EACCES";
+      if (deps.host.platform !== "win32" || !busy || attempt >= RENAME_TRIES) throw err;
+      await deps.sleep(500 * attempt);
+    }
+  }
+}
+
+/** The design's 20 s bound on the smoke test: `version` answers in milliseconds, so a binary still
+ *  silent after this long is not slow, it is hung — and a hung candidate must FAIL the smoke, not
+ *  hang the update with it. */
+const SMOKE_TIMEOUT_MS = 20_000;
+
+/**
+ * What a child that is ANOTHER install's `issance` must not inherit from this process (#283).
+ *
+ * `bridge/root.ts` takes `ISSANCE_PLUGIN_ROOT` before anything else, and this process may well carry
+ * one: the macOS LaunchAgent and the systemd unit both inject the service's root, and the phone's
+ * update runs as a child of that service. A candidate run under it reads the OLD root's version
+ * files and answers with the OLD version; a `build` run under it builds the old tree; a `restart`
+ * run under it writes the old root back into the unit. So the variable is REMOVED, never set: the
+ * child then finds its own root from its own path (`<dir>/bin/issance`, or the source it runs from),
+ * which is exactly what it does when an operator types `issance update` in a shell — the path that
+ * has always worked. Setting it to the child's directory would say the same for a smoke and bake
+ * `current` into the unit for a restart, which no interactive update ever wrote.
+ */
+const ITS_OWN_ROOT = { ISSANCE_PLUGIN_ROOT: null } as const;
+
+/** The longest complaint a staging abort carries. It lands in the run record, which the phone
+ *  prints, so a binary's own wall of stderr does not get to blow up that screen. */
+const COMPLAINT_MAX = 160;
+
+function capComplaint(line: string): string {
+  return line.length <= COMPLAINT_MAX ? line : `${line.slice(0, COMPLAINT_MAX)}…`;
+}
+
+/** The last `n` non-empty lines of a stream, trimmed. */
+function tailLines(text: string, n: number): string[] {
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l !== "")
+    .slice(-n);
+}
+
+/**
+ * What the smoke found. `why` is one short clause; `headline` is the one line of the child's own
+ * that goes into the record (its first complaint on stderr, else its last word on stdout); `tail` is
+ * its last lines, for the log and the terminal.
+ */
+export type SmokeResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly why: string; readonly headline?: string; readonly tail: readonly string[] };
+
+/**
+ * `<dir>/bin/issance version` must exit 0, name `version`, and answer within the bound. This is
+ * where a wrong architecture, a truncated payload, a Gatekeeper refusal and a hang all surface.
+ *
+ * Run with {@link ITS_OWN_ROOT}, or the candidate answers with this process's version (#283). A
+ * failure says why and keeps the child's last lines, because "did not run" with nothing after it is
+ * the report that took a macOS operator three attempts and a log dive to not explain.
+ */
+export function smoke(
+  // `host` picks the binary's name (`issance.exe` on Windows); the running machine's when absent.
+  deps: Pick<UpdateDeps, "exec"> & { readonly host?: Host },
+  dir: string,
+  version: string,
+): SmokeResult {
+  let r: ExecResult;
+  try {
+    r = deps.exec.capture(collieBinary(dir, deps.host), ["version"], SMOKE_TIMEOUT_MS, undefined, ITS_OWN_ROOT);
+  } catch (err) {
+    // `capture` throws when the child cannot even start (ENOEXEC, EACCES).
+    return { ok: false, why: `it could not be started: ${err instanceof Error ? err.message : String(err)}`, tail: [] };
+  }
+  if (!r.found) return { ok: false, why: "its binary is missing or not executable", tail: [] };
+  const tail = tailLines(`${r.stdout}\n${r.stderr}`, SMOKE_TAIL_LINES);
+  const headline = r.stderr.split("\n").map((l) => l.trim()).find((l) => l !== "") ?? tailLines(r.stdout, 1)[0];
+  const failed = (why: string): SmokeResult =>
+    headline === undefined ? { ok: false, why, tail } : { ok: false, why, headline, tail };
+  if (r.signal !== undefined) return failed(`killed by ${r.signal}`);
+  if (r.code === 124) return failed(`no answer in ${Math.round(SMOKE_TIMEOUT_MS / 1000)}s`);
+  if (r.code !== 0) return failed(`exit ${r.code}`);
+  if (!r.stdout.includes(version)) {
+    const said = tailLines(r.stdout, 1)[0] ?? "nothing";
+    return { ok: false, why: `\`issance version\` answered ${said}, not ${version}`, tail: [] };
+  }
+  return { ok: true };
+}
+
+/** How many of the candidate's own lines a failed smoke keeps, for the log and the terminal. */
+const SMOKE_TAIL_LINES = 5;
+
+/**
+ * The run record's reason for a failed smoke, one line in the voice of the other aborts, capped as
+ * they are. The child's headline goes after the clause: on a Mac that is where a `dyld` or a
+ * Gatekeeper refusal names itself.
+ */
+export function smokeReason(result: Extract<SmokeResult, { ok: false }>): string {
+  const said = result.headline === undefined ? "" : `: ${result.headline}`;
+  return capComplaint(`the new version did not start here (${result.why})${said}`);
+}
+
+/**
+ * `issance update` on a binary install: fetch the release tags, plan with the SAME pure functions the
+ * git paths use, download and verify the platform artifact, lay it down, flip, restart, verify, and
+ * only then collect old versions.
+ */
+async function updateBinary(deps: UpdateDeps, args: readonly string[]): Promise<number> {
+  const layout = binaryLayout(deps.ctx.root, deps.host);
+  const repo = updateRepoOf(deps.ctx.env);
+  // 1. A redirected updater is never silent — the repo IS the trust boundary on this path.
+  if (repo !== DEFAULT_UPDATE_REPO) deps.io.out(`update source: github.com/${repo} (ISSANCE_UPDATE_REPO)`);
+  const platform = platformId(deps.host.platform, deps.arch);
+  if (platform === null) {
+    deps.io.err("error: issance publishes no release artifact for this platform.");
+    deps.io.err("       Update by pulling and rebuilding a checkout — see docs/install.md.");
+    return EXIT.FAIL;
+  }
+  // A rehearsal mirror is a test seam: it is said loudly, and a value that is not loopback stops here.
+  const mirror = updateMirror(deps.ctx.env);
+  if (!mirror.ok) {
+    deps.io.err(`error: ${mirrorRefusal(mirror.value)} Nothing was changed.`);
+    return EXIT.FAIL;
+  }
+  if (mirror.base !== null) deps.io.err(mirrorWarning(mirror.base));
+  // 2. Sweep scratch before anything else.
+  sweepScratch(deps, layout);
+
+  // 3. One HTTPS GET. Never a second endpoint, never a guessed version.
+  // Every request to a mirror refuses a redirect; with no mirror the requests are the ones they were.
+  // Every page of the tag list (`readAllTags`); a failed page is the failed release check.
+  const via = mirror.base === null ? undefined : MIRROR_FETCH;
+  let failedUrl = githubTagsUrl(repo, mirror.base);
+  const tagsResponse = await readAllTags(repo, mirror.base, async (url) => {
+    failedUrl = url;
+    const page = await deps.net.getJson(url, via);
+    // SAFETY: `Net.getJson` hands back what `Response.json()` produced, which IS a JsonValue by
+    // construction; `parseTagsResponse` checks every field it keeps.
+    return page.ok ? { ok: true, value: page.value as JsonValue } : page;
+  });
+  if (!tagsResponse.ok) {
+    netError(deps, "the release check", failedUrl, tagsResponse.failure);
+    return EXIT.FAIL;
+  }
+  const tags = parseApiTags(tagsResponse.tags);
+
+  // 4. The same plan the git paths make. `head: ""` is correct rather than a fudge: a binary install
+  //    has no checked-out commit, so `planUpdate`'s commit arm must never fire and the VERSION
+  //    comparison decides — which is the right question for an install whose identity IS its version.
+  const installed = installedVersion(deps);
+  // `--to-tag` pins this to ONE release (M16/04). It is applied to the plan rather than replacing it,
+  // so a refusal is the same sentence on every install kind and the four bad cases are decided in
+  // one pure function.
+  const choice = lineChoice(deps, args);
+  const pinnedBinary = pinPlan(
+    planUpdate({ tags, installed, head: "", crossMajor: wantsMajor(args), line: choice.line, rejected: choice.rejected }),
+    { tags, installed, wanted: wantsToTag(args), ...choice },
+  );
+  if (!pinnedBinary.ok) {
+    deps.io.err(`error: ${pinnedBinary.reason}.`);
+    return EXIT.FAIL;
+  }
+  const plan = pinnedBinary.plan;
+  if (plan.kind === "no-higher-major") {
+    printNoHigherMajor(deps, plan.major);
+    return nothingTaken(deps);
+  }
+  if (plan.kind === "no-release") {
+    printNoRelease(deps, plan.major, "leaving this install where it is");
+    announceMajor(deps, plan.higher);
+    return nothingTaken(deps);
+  }
+  if (plan.kind === "current") {
+    printCurrent(deps, plan.at);
+    announceMajor(deps, plan.higher);
+    return nothingTaken(deps);
+  }
+  const target = plan.kind === "unknown-version" ? plan.newest : plan.target;
+  if (target === null) {
+    deps.io.err(`error: github.com/${repo} publishes no release tags — there is nothing to install.`);
+    return EXIT.FAIL;
+  }
+  const higher = plan.kind === "advance" && !plan.crossesMajor ? plan.higher : null;
+  deps.io.out(
+    plan.kind === "advance" && plan.crossesMajor
+      ? `crossing to issance ${target.version} (--major given: consented)…`
+      : `updating issance (binary install: ${target.tag} for ${platform})…`,
+  );
+
+  // THE STAGING WINDOW OPENS HERE (M20/10), at the first step that costs time. Everything above is
+  // local: a version read, a tag list, a plan. Below it are two network round trips, an unpack and a
+  // smoke, and until this record existed the phone had nothing to say about any of them.
+  const progress = beginStaging(deps, {
+    from: currentVersionDir(deps, layout),
+    to: target.version,
+    runId: wantsRunId(args),
+  });
+  progress.note(`fetching ${target.version} for ${platform}`);
+
+  // 5. The manifest, and this platform's artifact inside it.
+  const manifestUrl = releaseAssetUrl(repo, target.tag, manifestAssetName(target.version), mirror.base);
+  const manifestResponse = await deps.net.getJson(manifestUrl, via);
+  if (!manifestResponse.ok) {
+    // A 404 here is one specific thing: the tag exists (the tag list just named it) and its assets do
+    // not, because release.yml publishes the release as its LAST step (#503). The phone could be
+    // offered the version in that window and started two updates against it. Say so, in the words the
+    // phone will print too, and keep every other manifest failure on its own wording.
+    if (manifestResponse.failure.status === 404) {
+      deps.io.err(
+        `error: issance ${target.version} is tagged, but its release is not published yet. Try again in a few minutes. Nothing was changed.`,
+      );
+      abandonStaging(deps, NOT_PUBLISHED_YET(target.version));
+      return EXIT.FAIL;
+    }
+    netError(deps, `the release manifest for ${target.version}`, manifestUrl, manifestResponse.failure);
+    return EXIT.FAIL;
+  }
+  // SAFETY: as above — a parsed JSON document, and `parseReleaseManifest` checks every field.
+  const verdict = parseReleaseManifest(manifestResponse.value as JsonValue);
+  if (!verdict.ok) {
+    if (verdict.reason === "schema") {
+      deps.io.err(
+        `error: this issance cannot read release ${target.version}'s manifest (schemaVersion ` +
+          `${verdict.schemaVersion}; this build understands ${MANIFEST_SCHEMA_VERSION}).`,
+      );
+      deps.io.err("       Reinstall to get an updater that can: curl -fsSL https://issance.com/install.sh | sh");
+      return EXIT.FAIL;
+    }
+    deps.io.err(`error: release ${target.version}'s manifest could not be read. Nothing was changed.`);
+    return EXIT.FAIL;
+  }
+  const artifact = verdict.manifest.artifacts.find((a) => a.platform === platform);
+  if (artifact === undefined && platform === "windows-x64") {
+    // For one release cycle a release may ship without its Windows zip (release.yml), and that must
+    // read as a pause, not as a reason to build from source on a machine with no toolchain.
+    const said = `release ${target.version} has no Windows build; try again after the next release`;
+    deps.io.err(`error: ${said}. Nothing was changed.`);
+    abandonStaging(deps, said);
+    return EXIT.FAIL;
+  }
+  if (artifact === undefined) {
+    deps.io.err(`error: release ${target.version} publishes no artifact for ${platform}.`);
+    deps.io.err('       Build from source instead: docs/install.md → "From source". Nothing was changed.');
+    return EXIT.FAIL;
+  }
+
+  // 6. Download into scratch — same filesystem as `versions/`, so every rename below is a real one.
+  const tarball = join(layout.stagingDir, artifact.name);
+  deps.files.mkdirp(layout.stagingDir);
+  const tarballUrl = releaseAssetUrl(repo, target.tag, artifact.name, mirror.base);
+  const got = await deps.net.download(tarballUrl, tarball, via);
+  if (!got.ok) {
+    deps.files.removeTree(layout.stagingDir);
+    netError(deps, `downloading ${artifact.name}`, tarballUrl, got.failure);
+    return EXIT.FAIL;
+  }
+  // 7. Verify. Hard fail, and there is no flag to skip it.
+  if (got.sha256 !== artifact.sha256 || (artifact.size !== null && got.size !== artifact.size)) {
+    deps.files.removeTree(layout.stagingDir);
+    deps.io.err(`error: checksum mismatch for ${artifact.name}`);
+    deps.io.err(`       expected ${artifact.sha256}  got ${got.sha256}`);
+    deps.io.err("       The download was discarded. Nothing was changed. If this repeats, report it —");
+    deps.io.err("       a mismatch is either a corrupt download or something worse.");
+    return EXIT.FAIL;
+  }
+
+  // 8. Lay down: extract, check the payload is whole, then ONE rename into `versions/<version>`.
+  progress.note(`unpacking ${artifact.name}`);
+  const unpacked = join(layout.stagingDir, "x");
+  deps.files.mkdirp(unpacked);
+  // The Windows asset is a zip. Windows' own `tar.exe` (bsdtar, in System32 since Windows 10) reads
+  // it, and it is named by its full path because Git for Windows can put a GNU tar first on PATH,
+  // and GNU tar cannot read a zip. `Expand-Archive` reads it too, but needs PowerShell and is slow.
+  const untar =
+    deps.host.platform === "win32"
+      ? deps.exec.capture(windowsTar(deps.ctx.env, deps.host), ["-xf", tarball, "-C", unpacked])
+      : deps.exec.capture("tar", ["-xzf", tarball, "-C", unpacked]);
+  if (!untar.found || untar.code !== 0) {
+    deps.files.removeTree(layout.stagingDir);
+    deps.io.err(`error: could not unpack ${artifact.name}${untar.found ? "" : " — tar is not installed"}.`);
+    deps.io.err("       Nothing was changed.");
+    return EXIT.FAIL;
+  }
+  const payload = join(unpacked, artifact.payloadRoot);
+  const required = [`bin/${binaryName(deps.host)}`, "web/dist/index.html", "herdr-plugin.toml", "package.json"];
+  const missingIn = (dir: string): string[] => required.filter((rel) => !deps.files.exists(join(dir, ...rel.split("/"))));
+  const missing = missingIn(payload);
+  if (missing.length > 0) {
+    deps.files.removeTree(layout.stagingDir);
+    deps.io.err(`error: ${artifact.name} is not a complete issance payload (missing ${missing.join(", ")}).`);
+    deps.io.err("       Nothing was changed.");
+    return EXIT.FAIL;
+  }
+  // tar carries the mode, and every runner that builds one sets it — but a umask or a re-packed
+  // archive can still land a non-executable binary, and the cost of being sure is one call. NTFS has
+  // no mode bit, so Windows skips it.
+  if (deps.host.platform !== "win32") deps.exec.capture("chmod", ["0755", collieBinary(payload, deps.host)]);
+  const laid = join(layout.versionsDir, target.version);
+  // A folder of this version is there already: a rollback left it, or an update stopped half way.
+  const stuck = deps.files.exists(laid) ? await moveVersionAside(deps, layout, target.version) : null;
+  if (stuck !== null) {
+    // On Windows the launcher keeps running from the version it started with, through a rollback and
+    // a `issance restart`, so the folder of the version rolled away from stays in use until the next
+    // `issance stop` or logon. That folder is used as it is only when it is COMPLETE and its
+    // `issance.exe` is byte for byte the one just downloaded: a release re-cut under the same version,
+    // or a folder an interrupted run left, is another build. The smoke below still checks that it runs.
+    const incomplete = missingIn(laid);
+    const held = deps.files.digest(collieBinary(laid, deps.host));
+    const same = incomplete.length === 0 && held !== null && held === deps.files.digest(collieBinary(payload, deps.host));
+    if (!same) {
+      const why = incomplete.length > 0 ? `it is missing ${incomplete.join(", ")}` : "its issance.exe is not the one just downloaded";
+      deps.files.removeTree(layout.stagingDir);
+      deps.io.err(`error: ${laid} is still in use, and ${why}, so this update cannot use it or replace it now (${stuck}).`);
+      deps.io.err("       Nothing was changed. Run `issance stop`, then `issance start`, then run `issance update` again.");
+      abandonStaging(deps, `the old ${target.version} folder is in use and is not this build`);
+      return EXIT.FAIL;
+    }
+    const said = `${laid} is still in use and holds this same build, so this update uses it as it is. This does not stop the update.`;
+    deps.io.out(`note: ${said}`);
+    progress.note(said);
+  } else {
+    deps.files.mkdirp(layout.versionsDir);
+    try {
+      await renameSettled(deps, payload, laid);
+    } catch (err) {
+      deps.files.removeTree(layout.stagingDir);
+      deps.io.err(`error: could not move ${artifact.payloadRoot} into ${layout.versionsDir} (${String(err)}).`);
+      deps.io.err("       Nothing was changed. Try again in a minute.");
+      abandonStaging(deps, `the unpacked ${target.version} could not be moved into versions`);
+      return EXIT.FAIL;
+    }
+  }
+  deps.files.removeTree(layout.stagingDir);
+
+  // 9. Smoke BEFORE the flip: nothing the operator can see has moved yet.
+  progress.note(`checking that ${target.version} runs here`);
+  const smoked = smoke(deps, laid, target.version);
+  if (!smoked.ok) {
+    // The failure below is the news; a folder that cannot leave yet is one more note under it.
+    const stuckAfterSmoke = await moveVersionAside(deps, layout, target.version);
+    if (stuckAfterSmoke !== null) {
+      const said = `${laid} stays for now (${stuckAfterSmoke}); a later update replaces it`;
+      deps.io.out(`note: ${said}`);
+      progress.note(said);
+    }
+    const reason = smokeReason(smoked);
+    // The child's own lines go to the staging log and the terminal (the runner log, on a phone's
+    // run): the reason in the record is one capped line, and this is the rest of it.
+    progress.note(reason);
+    for (const line of smoked.tail) progress.note(`  ${line}`);
+    deps.io.err(`error: ${target.version} did not run here (\`issance version\` failed before the swap: ${smoked.why}).`);
+    for (const line of smoked.tail) deps.io.err(`       | ${line}`);
+    deps.io.err(`       Nothing was changed — this install is still ${installed ?? "where it was"}.`);
+    abandonStaging(deps, reason);
+    return EXIT.FAIL;
+  }
+
+  // 10. HAND OFF — the same runner the staged checkout uses, because the flip is already the same
+  //     single rename for both kinds (M15/04). It flips, restarts through `current`, polls
+  //     `/api/health` until the new version answers, rolls back once if it does not, and only then
+  //     collects the old versions. Nothing below this line runs in this process.
+  const previous = currentVersionDir(deps, layout);
+  const handed = handOff(
+    deps,
+    layout,
+    {
+      to: target.version,
+      from: previous,
+      version: target.version,
+      commit: target.commit,
+      kind: "binary",
+      // A LOWER target is the way down (`--downgrade`): the switch back to Stable, recorded as such.
+      switch: installed !== null && compareSemver(target.version, installed) < 0,
+    },
+    wantsRunId(args),
+  );
+  if (handed !== EXIT.OK) return handed;
+  closeWithMajor(deps, higher);
+  return EXIT.OK;
+}
+
+/**
+ * The directory of the last Stable build to keep beside the live one, or null (M60 spec 01).
+ *
+ * WHILE A MACHINE IS ON EDGE, which is its line in `update-line.json` or an Edge build live, the kept
+ * builds are the live one, the previous one AND the newest complete Stable build below the live one.
+ * That last one is never pruned until the machine is back on Stable, so "Go back now" flips to it.
+ * Back on Stable, with a Stable build live, this answers null and pruning is what it always was.
+ */
+function lastStableKept(
+  deps: Pick<UpdateDeps, "files" | "ctx">,
+  live: string,
+  kept: readonly { readonly dir: string; readonly version: string }[],
+): string | null {
+  const onEdge = isEdgeBuild(live) || readUpdateLine((p) => deps.files.read(p), deps.ctx.stateDir).line === "edge";
+  if (!onEdge) return null;
+  const stable = kept
+    .filter((v) => isStrictRelease(v.version) && compareSemver(v.version, live) < 0)
+    .toSorted((a, b) => compareSemver(a.version, b.version))
+    .at(-1);
+  return stable?.dir ?? null;
+}
+
+/**
+ * Keep `current` plus the newest older versions, and remove the rest. Two hard guards, checked per
+ * candidate: never the target of `current`, and never the directory the running updater is executing
+ * from. A failure here is a warning — a successful update must not report failure because a stale
+ * directory was busy.
+ */
+function collectOldVersions(deps: UpdateDeps, layout: BinaryLayout, keepVersion: string): void {
+  const asked = Number.parseInt(deps.ctx.env.ISSANCE_KEEP_VERSIONS ?? "", 10);
+  const keep = Number.isFinite(asked) && asked >= 1 ? asked : 2;
+  // Newest first, the version just installed excluded — it is `current` and is retained by
+  // definition, so `keep` counts it and the list below holds only the ones that follow it.
+  const candidates = installedVersions(deps, layout)
+    .filter((v) => v !== keepVersion)
+    .toReversed();
+  const guards = new Set([keepVersion, layout.version, currentVersionDir(deps, layout) ?? keepVersion]);
+  // THE LAST STABLE BUILD, while on Edge (M60 spec 01): kept beside the live and previous builds,
+  // and never counted against `keep`, so "Go back now" is a flip and not a download.
+  const lastStable = lastStableKept(
+    deps,
+    keepVersion,
+    listVersions(deps, layout, "binary").filter((v) => v.complete).map((v) => ({ dir: v.dir, version: v.version })),
+  );
+  const counted = candidates.filter((v) => v !== lastStable);
+  const doomed = counted.slice(Math.max(0, keep - 1)).filter((v) => !guards.has(v));
+  for (const v of doomed) {
+    try {
+      toTrash(deps, layout, v);
+    } catch (err) {
+      deps.io.out(`note: could not remove the old version ${v} (${String(err)}) — it is harmless where it is.`);
+    }
+  }
+}
+
+/**
+ * `issance update --rollback` — no network, no manifest, no tags. The version list on disk IS the
+ * record; nothing is written to a state file.
+ *
+ * GC never runs here: the version just rolled away from is the one the operator is most likely to
+ * want back once the bug is understood.
+ */
+async function rollbackBinary(deps: UpdateDeps): Promise<number> {
+  const layout = binaryLayout(deps.ctx.root, deps.host);
+  const at = currentVersionDir(deps, layout) ?? layout.version;
+  const older = installedVersions(deps, layout).filter((v) => compareSemver(v, at) < 0);
+  const target = older[older.length - 1];
+  if (target === undefined) {
+    deps.io.err(`error: nothing to roll back to — ${at} is the only version installed.`);
+    return EXIT.FAIL;
+  }
+  deps.io.out(`rolling back ${at} → ${target}…`);
+  if (!flipCurrent(deps, layout, target)) return EXIT.FAIL;
+  const restarted = await deps.restart();
+  const smoked: SmokeResult =
+    restarted === EXIT.OK ? smoke(deps, layout.currentLink, target) : { ok: false, why: "the restart failed", tail: [] };
+  if (!smoked.ok) {
+    // Roll FORWARD again to where this started, and say so: a rollback that half-lands is worse than
+    // one that never happened.
+    flipCurrent(deps, layout, at);
+    await deps.restart();
+    deps.io.err(`error: ${target} did not come up (${smoked.why}) — rolled forward to ${at} again. Nothing was changed.`);
+    for (const line of smoked.tail) deps.io.err(`       | ${line}`);
+    return EXIT.FAIL;
+  }
+  deps.io.out(`✓ rolled back to ${target}`);
+  noteRollback(deps, at);
+  // The build rolled back to carries its own skill text, so the agents follow it down (ADR 0111).
+  syncSkill(deps, collieBinary(layout.currentLink, deps.host), false);
+  return EXIT.OK;
+}
+
+/**
+ * Where `issance update --rollback` would go on this install, decided without touching anything.
+ *
+ * THE ONE ANSWER TO "IS THERE A PREVIOUS BUILD" (M60 spec 01). The preflight reports it (the phone's
+ * Roll back button is offered from that report, and `POST /api/update/rollback` refuses without it),
+ * and the phone's rollback run hands exactly this target to the runner. The rule is the terminal
+ * rollback's own: the newest complete version on disk that is LOWER than the one `current` names.
+ * Lower by semver, so a second rollback steps further back, and a rollback never moves forward.
+ *
+ * `commit` is what the health gate checks the restarted build against: a staged checkout's marker
+ * names it, a binary install's payload names it in its own `web/dist/build-info.json`. Empty when
+ * neither says, which the gate then reads as "this version, no build stamp".
+ */
+export type RollbackTarget =
+  | {
+      readonly kind: "ready";
+      readonly layout: "binary" | "checkout";
+      /** The version DIRECTORY `current` names now, and the one to flip to. */
+      readonly from: string;
+      readonly to: string;
+      /** The dotted versions inside them. */
+      readonly fromVersion: string;
+      readonly toVersion: string;
+      readonly commit: string;
+    }
+  | { readonly kind: "none"; readonly reason: string };
+
+export function rollbackTarget(
+  deps: { readonly files: Files; readonly link: LinkReader; readonly host: Host },
+  root: string,
+  kind: InstallKind["kind"],
+): RollbackTarget {
+  if (kind === "packaged") return { kind: "none", reason: `${root} is a packaged install, and its package manager owns the previous version` };
+  if (kind === "binary") {
+    const layout = binaryLayout(root, deps.host);
+    const at = currentVersionDir(deps, layout) ?? layout.version;
+    const older = listVersions(deps, layout, "binary").filter((v) => v.complete && compareSemver(v.version, at) < 0);
+    const target = older[older.length - 1];
+    if (target === undefined) return { kind: "none", reason: `${at} is the only version installed` };
+    const commit = keptCommit(deps, layout, "binary", target.dir);
+    return { kind: "ready", layout: "binary", from: at, to: target.dir, fromVersion: at, toVersion: target.version, commit };
+  }
+  const isCheckout = kind === "linked-clone" || kind === "detached-checkout";
+  if (!isCheckout || !(underVersions(root, deps.host) || kind === "linked-clone")) {
+    return { kind: "none", reason: "this install advances in place and keeps no previous version on disk" };
+  }
+  const layout = layoutForCheckout(root, deps.host);
+  const at = stagedCurrent(deps, layout);
+  if (at === null) return { kind: "none", reason: "no staged version is current yet" };
+  const older = stagedVersions(deps, layout).filter((v) => v.complete && compareSemver(v.version, at.version) < 0);
+  const target = older[older.length - 1];
+  if (target === undefined) return { kind: "none", reason: `${at.dir} is the only complete version this checkout kept` };
+  return {
+    kind: "ready",
+    layout: "checkout",
+    from: at.dir,
+    to: target.dir,
+    fromVersion: at.version,
+    toVersion: target.version,
+    commit: keptCommit(deps, layout, "checkout", target.dir),
+  };
+}
+
+/**
+ * `issance update --rollback --run-id <id>`: the phone's rollback (M60 spec 01). The same target the
+ * terminal rollback takes ({@link rollbackTarget}), handed to the detached runner as a run whose
+ * record says `action: "rollback"`. The runner flips, restarts through `current`, checks the older
+ * build's health, flips forward again once if it does not come up, and prunes nothing: the version
+ * rolled away from is the one the operator is most likely to want back.
+ */
+function rollbackDetached(deps: UpdateDeps, kind: InstallKind["kind"], runId: string): number {
+  const target = rollbackTarget(deps, deps.ctx.root, kind);
+  if (target.kind === "none") {
+    deps.io.err(`error: nothing to roll back to — ${target.reason}.`);
+    return EXIT.FAIL;
+  }
+  const layout =
+    target.layout === "binary" ? binaryLayout(deps.ctx.root, deps.host) : layoutForCheckout(deps.ctx.root, deps.host);
+  deps.io.out(`rolling back ${target.fromVersion} → ${target.toVersion}…`);
+  noteRollback(deps, target.fromVersion);
+  return handOff(
+    deps,
+    layout,
+    { to: target.to, from: target.from, version: target.toVersion, commit: target.commit, kind: target.layout, rollback: true },
+    runId,
+  );
+}
+
+/**
+ * The way DOWN through a build this machine KEPT (M60 spec 01): "Go back now" to the last Stable
+ * build, which an Edge machine keeps beside its live and previous builds, or a crew member following
+ * its lead down to a build it still has. Instant: no download, no build, only the runner's flip,
+ * restart and health gate, recorded as `action: "switch"`.
+ *
+ * `null` when no complete kept build has that version, or it is not lower than the live one, or it
+ * crosses a major: the caller then takes the ordinary path, which downloads or stages the target and
+ * refuses what `planToTag` refuses.
+ */
+function keptStepDown(deps: UpdateDeps, kind: "binary" | "checkout", wanted: string, runId: string | null): number | null {
+  const version = wanted.startsWith("v") ? wanted.slice(1) : wanted;
+  const layout = kind === "binary" ? binaryLayout(deps.ctx.root, deps.host) : layoutForCheckout(deps.ctx.root, deps.host);
+  const live =
+    kind === "binary"
+      ? { dir: currentVersionDir(deps, layout) ?? layout.version, version: currentVersionDir(deps, layout) ?? layout.version }
+      : stagedCurrent(deps, layout);
+  if (live === null) return null;
+  if (compareSemver(version, live.version) >= 0 || majorOf(version) !== majorOf(live.version)) return null;
+  const kept = listVersions(deps, layout, kind).find((v) => v.complete && v.version === version && v.dir !== live.dir);
+  if (kept === undefined) return null;
+  deps.io.out(`going back ${live.version} → ${version} through the build this machine kept…`);
+  return handOff(
+    deps,
+    layout,
+    { to: kept.dir, from: live.dir, version, commit: keptCommit(deps, layout, kind, kept.dir), kind, switch: true },
+    runId,
+  );
+}
+
+/** The commit a kept build was made from: a staged checkout's marker, a payload's own build stamp. */
+function keptCommit(
+  deps: { readonly files: Files; readonly host: Host },
+  layout: BinaryLayout,
+  kind: "binary" | "checkout",
+  dir: string,
+): string {
+  if (kind === "checkout") return readBuildMarker(deps, deps.host.path.join(layout.versionsDir, dir))?.commit ?? "";
+  const stamp = readBuildInfo(deps.files.read(deps.host.path.join(layout.versionsDir, dir, "web", "dist", "build-info.json")));
+  const plus = stamp?.indexOf("+") ?? -1;
+  return stamp === null || plus < 0 ? "" : stamp.slice(plus + 1);
+}
+
+// ── The staged checkout path (M15/02) ────────────────────────────────────────
+// A checkout stops mutating itself in place. ONE layout serves both install kinds:
+//
+//   <install-root>/versions/v1.2.3/   a git WORKTREE of the release tag, built inside itself
+//   <install-root>/current            a RELATIVE symlink at one of them, flipped by `flipCurrent`
+//
+// Every version shares the one `.git`, so a version costs a checkout of the tree and not a second
+// object store. The running install is untouched for the whole build: a failure never moved
+// `current`, which is the skew hazard ADR 0006 was written against and could only mitigate while an
+// update advanced the live tree (its 2026-09-03 amendment records the swap).
+//
+// The install root of a MIGRATED checkout is the clone itself — `versions/` and `current` are
+// created inside it, and the original tree stays the main worktree that owns `.git`. After the first
+// staged update the running binary is `<install-root>/versions/vX.Y.Z/bin/issance`, so
+// `bridge/root.ts` resolves the WORKTREE as the plugin root, exactly as a binary install resolves
+// its version directory (`process.execPath` is realpath-resolved, so `current` is never the answer).
+// That is the mirror the spec asks for, and it is why `binaryLayout` re-derives the same five paths
+// from a staged checkout with no special case.
+//
+// Hangar-managed checkouts do NOT stage in this milestone: they are detached and shallow, their root
+// is Hangar's own plugin directory, and re-registering them is what ADR 0006 forbids.
+
+/** The completeness marker a finished build writes LAST into its version directory. */
+export const BUILD_MARKER = ".issance-build";
+
+/**
+ * How many version directories a staged checkout keeps: `current` plus the two newest previous ones.
+ * The count includes `current`, because "keep 3" is the sentence an operator can check against
+ * `ls versions/`.
+ */
+export const KEEP_VERSIONS = 3;
+
+/** What {@link BUILD_MARKER} carries — the version the build produced, and the commit it came from. */
+export interface BuildMarker {
+  readonly version: string;
+  readonly commit: string;
+}
+
+/**
+ * The versions layout of a checkout that has not been staged yet: the clone itself is the install
+ * root. {@link binaryLayout} derives the same five paths from a version DIRECTORY, which is what the
+ * running process sits in once the layout exists; this derives them from the root above it.
+ */
+export function checkoutLayout(installRoot: string, host: Host = HOST): BinaryLayout {
+  const at = (...parts: string[]): string => host.path.join(installRoot, ...parts);
+  return {
+    installRoot,
+    versionsDir: at("versions"),
+    currentLink: at("current"),
+    stagingDir: at(".staging"),
+    trashDir: at(".trash"),
+    version: "",
+  };
+}
+
+/** Does `root` sit at `<install-root>/versions/<name>` — i.e. is this install already staged? */
+function underVersions(root: string, host: Host = HOST): boolean {
+  return host.path.basename(host.path.dirname(root)) === "versions";
+}
+
+/** The layout a checkout at `root` updates under, whether it has been migrated yet or not. */
+function layoutForCheckout(root: string, host: Host): BinaryLayout {
+  return underVersions(root, host) ? binaryLayout(root, host) : checkoutLayout(root, host);
+}
+
+/** `<dir>/.issance-build`. */
+const markerPath = (dir: string): string => join(dir, BUILD_MARKER);
+
+/**
+ * The marker a staged version carries, or null when it has none or it cannot be read as one.
+ *
+ * A malformed marker is the SAME answer as a missing one on purpose: both mean "no evidence this
+ * build ran to the end", and the flip refuses on either.
+ */
+export function readBuildMarker(deps: { readonly files: Files }, dir: string): BuildMarker | null {
+  const text = deps.files.read(markerPath(dir));
+  if (text === null) return null;
+  let doc: { version?: string; commit?: string };
+  try {
+    // SAFETY: `JSON.parse` answers a JSON value, and these are the only two fields ever read off it.
+    // Neither is trusted: `version` is compared against the version being flipped to and a
+    // mismatch — including a field that is not a string at all — is a refusal, and `commit` is only
+    // ever printed.
+    doc = JSON.parse(text) as { version?: string; commit?: string };
+  } catch {
+    return null;
+  }
+  const version = doc.version ?? "";
+  if (version === "") return null;
+  return { version, commit: doc.commit ?? "" };
+}
+
+/**
+ * Write the marker — the LAST thing a successful build does, which is the whole design. A marker
+ * present means every step before it finished, so a killed build, a full disk or a half-copied
+ * directory is a REFUSAL at the flip rather than a symlink pointing at rubble.
+ */
+function writeBuildMarker(deps: UpdateDeps, dir: string, marker: BuildMarker): void {
+  deps.files.write(markerPath(dir), `${JSON.stringify(marker, null, 2)}\n`);
+}
+
+/** One version directory under `versions/`, in the two spellings the two install kinds use. */
+export interface VersionOnDisk {
+  /** The directory name — `v1.2.3` on a staged checkout (the tag), `1.2.3` on a binary install. */
+  readonly dir: string;
+  /** The dotted version inside it. */
+  readonly version: string;
+  /**
+   * Is this version usable? The evidence differs by kind because what a complete version IS differs:
+   * a downloaded payload is complete when it carries the binary that was verified before it was laid
+   * down, a staged checkout when its build wrote {@link BUILD_MARKER} as its last act.
+   */
+  readonly complete: boolean;
+}
+
+/**
+ * Every version directory under `versions/`, oldest first — the ONE lister, for both install kinds
+ * and for `doctor` as well as `update`. A name that is not a version is ignored rather than guessed
+ * at: `.staging`, a stray note, an operator's backup copy.
+ */
+export function listVersions(
+  deps: { readonly files: Files; readonly host?: Host },
+  layout: BinaryLayout,
+  kind: "binary" | "checkout",
+): VersionOnDisk[] {
+  return deps.files
+    .list(layout.versionsDir)
+    .flatMap((dir) => {
+      if (parsePrereleaseTag(kind === "checkout" ? dir : `v${dir}`) === null) return [];
+      const at = join(layout.versionsDir, dir);
+      const complete =
+        kind === "checkout"
+          ? readBuildMarker(deps, at) !== null
+          : deps.files.exists(collieBinary(at, deps.host));
+      return [{ dir, version: kind === "checkout" ? dir.slice(1) : dir, complete }];
+    })
+    .toSorted((a, b) => compareSemver(a.version, b.version));
+}
+
+/** The staged versions of a checkout install — {@link listVersions} under its own name. */
+const stagedVersions = (deps: { readonly files: Files }, layout: BinaryLayout): VersionOnDisk[] =>
+  listVersions(deps, layout, "checkout");
+
+/** The staged version `current` names, or null when it names nothing we laid down. */
+function stagedCurrent(deps: { readonly files: Files; readonly link: LinkReader }, layout: BinaryLayout): VersionOnDisk | null {
+  const at = currentVersionDir(deps, layout);
+  if (at === null) return null;
+  return stagedVersions(deps, layout).find((v) => v.dir === at) ?? null;
+}
+
+/** Why a flip was refused, in the words the operator reads. */
+type FlipVerdict = { readonly ok: true } | { readonly ok: false; readonly reason: string };
+
+/**
+ * The gate in front of {@link flipCurrent} on a staged checkout: the marker must be there, and it
+ * must name the version being flipped to. Every refusal is NAMED — a symlink that did not move for
+ * an unexplained reason is the one outcome worse than not flipping at all.
+ */
+function flipToStaged(deps: UpdateDeps, layout: BinaryLayout, v: VersionOnDisk): FlipVerdict {
+  const marker = readBuildMarker(deps, join(layout.versionsDir, v.dir));
+  if (marker === null) {
+    return { ok: false, reason: `${v.dir} carries no ${BUILD_MARKER} — its build never ran to the end` };
+  }
+  if (marker.version !== v.version) {
+    return { ok: false, reason: `${v.dir}'s ${BUILD_MARKER} names ${marker.version}, not ${v.version}` };
+  }
+  if (!flipCurrent(deps, layout, v.dir)) return { ok: false, reason: `${layout.currentLink} could not be moved` };
+  return { ok: true };
+}
+
+/** `git worktree prune` — the administrative half of removing a worktree DIRECTORY. */
+function worktreePrune(deps: UpdateDeps, root: string): void {
+  deps.exec.capture("git", gitArgs(root, ["worktree", "prune"]));
+}
+
+/**
+ * Remove one staged version, directory and administrative entry together. Both halves, always: a
+ * removed directory leaves git's `worktrees/<name>` record behind, and a stale record makes the next
+ * `worktree add` of the same name fail with "already registered".
+ */
+function removeStagedVersion(deps: UpdateDeps, layout: BinaryLayout, dir: string, git: string): void {
+  deps.files.removeTree(join(layout.versionsDir, dir));
+  worktreePrune(deps, git);
+}
+
+/**
+ * Keep the newest `keep` version directories — `current` among them, whatever its age — and remove
+ * the rest.
+ *
+ * **`update` does not call this, and that is deliberate.** Pruning during staging would destroy the
+ * rollback target of the very update that is about to need it. The order is stage, flip, restart,
+ * health passes, *then* prune — and the health gate is spec 04, which is what will call this. Until
+ * it exists a staged checkout accumulates versions, which is the safe direction to be wrong in.
+ *
+ * Returns the directory names removed, so the caller can report them.
+ */
+export function pruneVersions(
+  deps: UpdateDeps,
+  layout: BinaryLayout,
+  keep: number = KEEP_VERSIONS,
+): string[] {
+  const git = deps.ctx.root;
+  const at = currentVersionDir(deps, layout);
+  const newestFirst = stagedVersions(deps, layout).toReversed();
+  // `current` is retained by definition and counts against `keep`, so it is taken out of the
+  // ordering first and the survivors are the newest `keep - 1` of what is left.
+  // The last Stable build is kept while on Edge, outside the count (M60 spec 01).
+  const live = newestFirst.find((v) => v.dir === at)?.version ?? null;
+  const lastStable =
+    live === null ? null : lastStableKept(deps, live, newestFirst.filter((v) => v.complete && v.dir !== at));
+  const others = newestFirst.filter((v) => v.dir !== at && v.dir !== lastStable);
+  const doomed = at === null ? others.slice(keep) : others.slice(Math.max(0, keep - 1));
+  const removed: string[] = [];
+  for (const v of doomed) {
+    try {
+      removeStagedVersion(deps, layout, v.dir, git);
+      removed.push(v.dir);
+    } catch (err) {
+      deps.io.out(`note: could not remove ${v.dir} (${String(err)}) — it is harmless where it is.`);
+    }
+  }
+  return removed;
+}
+
+/**
+ * Restart THROUGH `current`, with the binary the flip just published.
+ *
+ * This process is the OLD version, and its `restart` would rewrite the service unit from ITS OWN
+ * root — pinning the supervisor to the version we just left, which would make the flip cosmetic. So
+ * the new binary restarts the service, exactly as the hooks nudge asks the new binary about hooks:
+ * the stable name is the one that was switched.
+ */
+function restartThroughCurrent(deps: UpdateDeps, layout: BinaryLayout): boolean {
+  // ITS OWN ROOT (#283): under this process's `ISSANCE_PLUGIN_ROOT` the new binary would take the OLD
+  // root for its own and write it back into the unit, which is the cosmetic flip this function exists
+  // to prevent, arriving by the environment instead.
+  const r = deps.exec.runIn(
+    collieBinary(layout.currentLink, deps.host),
+    ["restart"],
+    layout.installRoot,
+    undefined,
+    ITS_OWN_ROOT,
+  );
+  return r.found && r.code === 0;
+}
+
+/**
+ * Re-point the PATH name at `current` when it still names the pre-migration tree's binary.
+ *
+ * ADR 0021's rule survives the migration only if the pointer follows: `~/.local/bin/issance` was
+ * published at `<clone>/bin/issance`, and after the first staged update the live binary is behind
+ * `current`. Touched ONLY when the name is this install's own — `cmdLink` is the one implementation
+ * of publishing it, and a name pointing at somebody else's checkout stays theirs.
+ */
+function republishName(deps: UpdateDeps, root: string, previousBinary: string): void {
+  const at = linkPath(deps.ctx.home);
+  const probe = deps.link.probe(at);
+  if (probe.kind !== "symlink" || probe.target !== previousBinary) return;
+  if (!isCollieBinaryPath(probe.target, deps.host)) return;
+  cmdLink({ ctx: { ...deps.ctx, root }, io: deps.io, files: deps.files, fs: deps.link, host: deps.host });
+}
+
+/** Fetch one release tag and STORE it locally — the refspec `detachOnto` explains at length. */
+function fetchTag(deps: UpdateDeps, root: string, tag: string): boolean {
+  const ref = `refs/tags/${tag}`;
+  const spec = `+${ref}:${ref}`;
+  const remote = tagRemote(deps.exec, root);
+  const args = isShallow(deps.exec, root)
+    ? ["fetch", "--depth", "1", remote, spec]
+    : ["fetch", remote, spec];
+  const r = deps.exec.runIn("git", gitArgs(root, args), root);
+  if (!r.found) {
+    deps.io.err("error: git not found — cannot stage a version");
+    return false;
+  }
+  return r.code === 0;
+}
+
+/**
+ * `issance update` on a checkout that stages: resolve the target tag, add a worktree for it, build
+ * INSIDE that worktree, mark it complete, and only then flip `current`.
+ *
+ * Nothing the operator can see moves until the flip, so every failure below it is a no-op that names
+ * the stage it failed at.
+ */
+async function updateStagedCheckout(
+  deps: UpdateDeps,
+  layout: BinaryLayout,
+  args: readonly string[],
+): Promise<number> {
+  const root = deps.ctx.root;
+  // Every git call runs against the checkout we are RUNNING in. A worktree shares the repository, so
+  // `ls-remote`, `fetch`, `worktree add` and `worktree prune` are all answered the same from any of
+  // them — and using our own root means a migration and a re-stage spell it identically.
+  const git = root;
+  const migrating = !underVersions(root, deps.host);
+
+  if (!isGitCheckout(deps.exec, git)) {
+    deps.io.err(`error: ${git} is not a git checkout — refresh it with:`);
+    deps.io.err("       herdr plugin install issance/issance-app --yes");
+    return EXIT.FAIL;
+  }
+  // BEFORE any fetch. See {@link assertOrigin}: a fork's tags are not this install's to take.
+  if (!assertOrigin(deps, git)) return EXIT.FAIL;
+
+  const ls = deps.exec.capture("git", gitArgs(git, ["ls-remote", "--tags", tagRemote(deps.exec, git)]));
+  if (!ls.found || ls.code !== 0) {
+    deps.io.err("error: could not list the upstream release tags — is the remote reachable?");
+    return EXIT.FAIL;
+  }
+  const installed = installedVersion(deps);
+  const head = deps.exec.capture("git", gitArgs(root, ["rev-parse", "HEAD"])).stdout.trim();
+  const stagedTags = parseRemoteTags(ls.stdout);
+  // The same pin, the same four refusals — see `updateBinary` above.
+  const choice = lineChoice(deps, args);
+  const pinnedStaged = pinPlan(
+    planUpdate({ tags: stagedTags, installed, head, crossMajor: wantsMajor(args), line: choice.line, rejected: choice.rejected }),
+    { tags: stagedTags, installed, wanted: wantsToTag(args), ...choice },
+  );
+  if (!pinnedStaged.ok) {
+    deps.io.err(`error: ${pinnedStaged.reason}.`);
+    return EXIT.FAIL;
+  }
+  const plan = pinnedStaged.plan;
+
+  if (plan.kind === "no-higher-major") {
+    printNoHigherMajor(deps, plan.major);
+    return nothingTaken(deps);
+  }
+  if (plan.kind === "no-release") {
+    printNoRelease(deps, plan.major, "leaving this checkout where it is");
+    announceMajor(deps, plan.higher);
+    return nothingTaken(deps);
+  }
+  // "Nothing to take" ends the verb only when what is on disk is whole. On a staged install that
+  // means `current` resolves to a COMPLETE version; on one that has not migrated yet it is the same
+  // question `installIsIntact` already answers, and answering it that way is what keeps an update
+  // with nothing to take from staging a version nobody asked for. A half-staged install falls
+  // through and re-stages the version it failed on, which is the recovery the operator is told to
+  // run.
+  const whole = migrating ? installIsIntact(deps) : stagedCurrent(deps, layout)?.complete === true;
+  if (plan.kind === "current" && whole) {
+    printCurrent(deps, plan.at);
+    announceMajor(deps, plan.higher);
+    return nothingTaken(deps);
+  }
+  const target = plan.kind === "current" ? plan.at : plan.kind === "unknown-version" ? plan.newest : plan.target;
+  if (target === null) {
+    deps.io.err("error: no release tags on origin — cannot stage an unversioned checkout.");
+    return EXIT.FAIL;
+  }
+  // A crossing just TOOK `higher`; naming it again at the end of the transcript would advertise the
+  // release the operator is now standing on. An unversioned checkout has no major to compare against.
+  const higher =
+    plan.kind === "unknown-version" || (plan.kind === "advance" && plan.crossesMajor) ? null : plan.higher;
+
+  const dir = target.tag;
+  const at = join(layout.versionsDir, dir);
+  // DECIDED BEFORE BUN AND BEFORE THE RECORD (#231, #232). This check needs neither a compiler nor a
+  // fetch, so it runs ahead of both: an install whose target is already live must not be refused
+  // for a broken Bun it will never use, and must not open a `staging` record it would then have to
+  // close as an abort, which a waiting phone reads as "failed" about an install that is fine.
+  if (currentVersionDir(deps, layout) === dir) {
+    // The target is already live. This is not the `plan.kind === "current"` case above — that one is
+    // decided from the manifest of the version we are RUNNING, and an install whose root still
+    // names the pre-flip tree (a stale `ISSANCE_PLUGIN_ROOT`, an operator running the old binary by
+    // hand) reads as behind while `current` is not. Re-staging it would remove the running install.
+    if (stagedCurrent(deps, layout)?.complete === true) {
+      deps.io.out(`already current — ${dir} is staged and \`current\` points at it.`);
+      announceMajor(deps, higher);
+      return nothingTaken(deps);
+    }
+    deps.io.err(`error: ${dir} is what \`current\` points at, and it is incomplete — re-staging it`);
+    deps.io.err("       would remove the running install. Roll back first, or remove it by hand.");
+    return EXIT.FAIL;
+  }
+  const bun = requireRunnableBun(deps, "staging a version cannot build it; nothing was changed");
+  if (bun === null) return EXIT.FAIL;
+  deps.io.out(
+    plan.kind === "advance" && plan.crossesMajor
+      ? `crossing to issance ${target.version} (--major given: consented)…`
+      : `updating issance (staged checkout: building ${target.tag} beside the running version)…`,
+  );
+  if (migrating) {
+    deps.io.out(`  first staged update: ${layout.versionsDir} and ${layout.currentLink} are created now.`);
+  }
+
+  // THE STAGING WINDOW OPENS HERE (M20/10), at the first step that costs time. The fetch, the
+  // worktree and the build are minutes on slow hardware, and until this record existed the phone had
+  // nothing to say about any of them but "Starting…".
+  const progress = beginStaging(deps, {
+    from: stagedCurrent(deps, layout)?.dir ?? null,
+    to: target.version,
+    runId: wantsRunId(args),
+  });
+  progress.note(`fetching ${target.tag}`);
+
+  // 1. The tag, stored locally — a worktree is added from a ref, and the ref has to exist here.
+  if (!fetchTag(deps, git, target.tag)) {
+    deps.io.err(`error: update stopped at the FETCH stage — ${target.tag} could not be fetched.`);
+    deps.io.err("       Nothing was staged and nothing was swapped.");
+    return EXIT.FAIL;
+  }
+
+  // 2. The worktree. A leftover directory of the same name is removed first: it is either a killed
+  //    stage or the version we are re-staging after a failed build, and neither is `current`.
+  if (deps.files.exists(at)) removeStagedVersion(deps, layout, dir, git);
+  deps.files.mkdirp(layout.versionsDir);
+  const added = deps.exec.runIn(
+    "git",
+    gitArgs(git, ["worktree", "add", "--detach", "--force", at, `refs/tags/${target.tag}`]),
+    git,
+  );
+  if (!added.found || added.code !== 0) {
+    deps.io.err(`error: update stopped at the STAGE stage — \`git worktree add ${at}\` failed.`);
+    deps.io.err("       Nothing was swapped; the running version is untouched.");
+    worktreePrune(deps, git);
+    return EXIT.FAIL;
+  }
+  // An Edge tag's worktree names the build it is before it builds (M60 spec 01).
+  if (!stampCheckout(deps, at, target.tag)) {
+    removeStagedVersion(deps, layout, dir, git);
+    return EXIT.FAIL;
+  }
+
+  // 3. The build, INSIDE the worktree and from the NEW source — the same handoff reason the in-place
+  //    path re-execs for: the build logic that must run is the one that was just fetched.
+  //
+  // THE LONGEST STEP OF THE LONGEST WINDOW. Said out loud before it starts, because a minute of
+  // silence here is the minute that produced "Still starting. The host has not reported the run yet."
+  progress.note(`building ${target.tag} — this is the slow part`);
+  // ITS OWN ROOT (#283): the new source resolves its root from `ISSANCE_PLUGIN_ROOT` first, so under
+  // this process's value it would build the RUNNING tree and leave the worktree without a binary.
+  const built = deps.exec.runIn(bun.path, [join(at, "cli", "main.ts"), "build"], at, dirname(bun.path), ITS_OWN_ROOT);
+  if (!built.found || built.code !== 0) {
+    deps.io.err(`error: update stopped at the BUILD stage — ${target.tag} did not build.`);
+    deps.io.err("       `current` never moved: the running bridge and the served UI are unchanged.");
+    deps.io.err("       The failed version was removed. Fix the build and re-run update.");
+    removeStagedVersion(deps, layout, dir, git);
+    return EXIT.FAIL;
+  }
+
+  // 4. The marker, LAST — the evidence the flip demands.
+  progress.note(`${target.version} built, handing off to the runner`);
+  writeBuildMarker(deps, at, { version: target.version, commit: target.commit });
+
+  // 5. HAND OFF. The flip, the restart, the health gate and the one rollback all happen in the
+  //    DETACHED RUNNER (M15/04) — this process may not do them, because the restart would kill the
+  //    bridge that quite possibly asked for this update, and a killed updater cannot roll back.
+  const previous = stagedCurrent(deps, layout);
+  const handed = handOff(
+    deps,
+    layout,
+    {
+      to: dir,
+      from: previous?.dir ?? null,
+      version: target.version,
+      commit: target.commit,
+      kind: "checkout",
+      switch: installed !== null && compareSemver(target.version, installed) < 0,
+    },
+    wantsRunId(args),
+  );
+  if (handed !== EXIT.OK) return handed;
+  deps.io.out(
+    previous === null
+      ? "  nothing to roll back to yet — this was the first staged version, so a failed health check" +
+          " has no target to flip back to."
+      : `  a failed health check flips back to ${previous.dir} by itself.`,
+  );
+  closeWithMajor(deps, higher);
+  return EXIT.OK;
+}
+
+/**
+ * `issance update --rollback` on a staged checkout — the checkout half of {@link rollbackBinary}, and
+ * the same act: flip `current` back to the newest retained previous version. No network, no build;
+ * the version directories on disk ARE the record.
+ *
+ * Nothing is pruned here either — the version rolled away from is the one the operator is most
+ * likely to want back once the bug is understood.
+ */
+async function rollbackCheckout(deps: UpdateDeps, layout: BinaryLayout): Promise<number> {
+  const at = stagedCurrent(deps, layout);
+  const kept = stagedVersions(deps, layout).filter((v) => v.complete);
+  if (at === null) {
+    deps.io.err(`error: nothing to roll back to — ${layout.currentLink} points at no version this`);
+    deps.io.err(`       checkout staged. ${kept.length === 0 ? "No version has been staged yet: the next `issance update` creates the first." : "Re-run `issance update` to stage one."}`);
+    return EXIT.FAIL;
+  }
+  const older = kept.filter((v) => compareSemver(v.version, at.version) < 0);
+  const target = older[older.length - 1];
+  if (target === undefined) {
+    deps.io.err(`error: nothing to roll back to — ${at.dir} is the only complete version this checkout`);
+    deps.io.err("       kept. A previous version is retained by the update that replaces it, so the");
+    deps.io.err("       first staged version has none, and a pruned one is gone for good.");
+    return EXIT.FAIL;
+  }
+  deps.io.out(`rolling back ${at.dir} → ${target.dir}…`);
+  const flip = flipToStaged(deps, layout, target);
+  if (!flip.ok) {
+    deps.io.err(`error: ${flip.reason} — nothing was changed.`);
+    return EXIT.FAIL;
+  }
+  if (!restartThroughCurrent(deps, layout)) {
+    // Roll FORWARD again: a rollback that half-lands is worse than one that never happened.
+    flipToStaged(deps, layout, at);
+    restartThroughCurrent(deps, layout);
+    deps.io.err(`error: ${target.dir} did not come up — rolled forward to ${at.dir} again. Nothing was changed.`);
+    return EXIT.FAIL;
+  }
+  refreshRegistry(deps, layout.currentLink);
+  deps.io.out(`✓ rolled back to ${target.version}`);
+  noteRollback(deps, at.version);
+  syncSkill(deps, collieBinary(layout.currentLink, deps.host), false);
+  return EXIT.OK;
+}
+
+// ── The detached updater (M15/04) ────────────────────────────────────────────
+// An update is TWO PROCESSES, and the split is forced by step three of it: restart the service. The
+// bridge IS the service, so a bridge that drove its own update would be killed halfway through —
+// nobody left to notice the new version never answered, nobody left to flip `current` back.
+//
+// So `issance update` stages, and then HANDS OFF. The runner (`_apply-update --to …`) flips, restarts,
+// polls `/api/health` and rolls back once if it has to; the machine it runs is `cli/update-run.ts`,
+// a pure reducer over injected effects. Everything it knows goes into `<state dir>/update.json`,
+// which the bridge reads at startup and the standby door serves while the main port is down.
+
+/**
+ * The binary the detached runner is launched as: the one THIS process is executing.
+ *
+ * Not `<root>/bin/issance`, and the difference is real. A issance run through the PATH name, or from a
+ * clone that has not been built in place, is executing a binary that path does not name — and
+ * launching a file that is not there is a handoff that never happens. The fallback is for the one
+ * case where `execPath` is NOT a issance: `bun cli/main.ts`, the bootstrap path, where the binary the
+ * checkout owns is the right answer.
+ */
+function runnerBinary(deps: UpdateDeps): string {
+  return isCollieBinaryPath(deps.execPath, deps.host) ? deps.execPath : collieBinary(deps.ctx.root, deps.host);
+}
+
+/** The one thing an operator is told to run, and it is a path, not a verb — `current` may be wrong. */
+function recoveryCommand(layout: BinaryLayout, from: string | null, host: Host): string {
+  if (from === null) return "issance update  (there is no previous version on disk to flip back to)";
+  return `${collieBinary(join(layout.versionsDir, from), host)} update --rollback`;
+}
+
+/** What the runner was asked to do, parsed out of its own argv. */
+export interface ApplyArgs {
+  /** The version DIRECTORY to make live — `v1.2.3` on a staged checkout, `1.2.3` on a binary install. */
+  readonly to: string;
+  /** The version directory to fall back to, or null when this install has none yet. */
+  readonly from: string | null;
+  /** The dotted version `to` must answer with, and the commit it was built from (may be ""). */
+  readonly version: string;
+  readonly commit: string;
+  readonly kind: "checkout" | "binary";
+  /** The pid of the process that staged this run and wrote the lock — see {@link handOff}. */
+  readonly handoff: number;
+  /**
+   * A rollback run (M60 spec 01, `--rollback` in the runner's argv): `to` is the OLDER build. The
+   * runner prunes nothing after it, and its record says `action: "rollback"`. Absent on an update.
+   */
+  readonly rollback?: boolean;
+  /**
+   * A step DOWN that is not a rollback (M60 spec 01, `--switch`): "Go back now" to Stable, or a crew
+   * member following its lead down. Pruned like a rollback (nothing), recorded as `action: "switch"`.
+   */
+  readonly switch?: boolean;
+}
+
+const flagValue = (args: readonly string[], name: string): string | null => {
+  const at = args.indexOf(name);
+  return at < 0 ? null : (args[at + 1] ?? null);
+};
+
+/**
+ * The runner's argv, or null when this is the OLD `_apply-update` — the in-place second half a
+ * Hangar-managed checkout still takes (ADR 0006), which stages nothing and has nothing to flip.
+ */
+export function parseApplyArgs(args: readonly string[]): ApplyArgs | null {
+  const to = flagValue(args, "--to");
+  if (to === null || to === "") return null;
+  const from = flagValue(args, "--from");
+  const parsed: ApplyArgs = {
+    to,
+    from: from === null || from === "" ? null : from,
+    version: flagValue(args, "--version") ?? "",
+    commit: flagValue(args, "--commit") ?? "",
+    kind: flagValue(args, "--kind") === "binary" ? "binary" : "checkout",
+    handoff: Number.parseInt(flagValue(args, "--handoff") ?? "", 10) || 0,
+  };
+  // An update's argv carries neither `--rollback` nor `--switch`, and its parse carries no such key.
+  if (args.includes("--rollback")) return { ...parsed, rollback: true };
+  return args.includes("--switch") ? { ...parsed, switch: true } : parsed;
+}
+
+/** {@link ApplyArgs} back as argv — one spelling, so the handoff and the parser can never drift. */
+export function applyArgv(a: ApplyArgs): string[] {
+  return [
+    "_apply-update",
+    "--to",
+    a.to,
+    ...(a.from === null ? [] : ["--from", a.from]),
+    "--version",
+    a.version,
+    "--commit",
+    a.commit,
+    "--kind",
+    a.kind,
+    "--handoff",
+    String(a.handoff),
+    ...(a.rollback === true ? ["--rollback"] : []),
+    ...(a.switch === true ? ["--switch"] : []),
+  ];
+}
+
+/**
+ * The environment the detached runner is started with.
+ *
+ * A NARROW, NAMED list, and that is the point on the `systemd-run` path: `--setenv=` puts a value on
+ * a command line every process on the box can read out of `ps`. None of these is a credential — they
+ * are the instance's identity and its paths. Everything else the runner needs it re-reads from the
+ * same `.env` this process did (`cli/context.ts`), which is where the secrets stay.
+ */
+export const RUNNER_ENV_KEYS = [
+  "HOME",
+  "PATH",
+  "XDG_RUNTIME_DIR",
+  "ISSANCE_INSTANCE",
+  // The multiplexer this install mirrors. The runner RESTARTS the service, and `restart` refuses to
+  // guess a mux — so a runner without it dies on a question nobody is there to answer.
+  "ISSANCE_MUX",
+  "ISSANCE_CONFIG_DIR",
+  // The base config file's path, when the operator moved it. The runner re-reads `~/.issance/config.toml`
+  // from its own $HOME and the instance file from its own config dir, exactly as it re-reads the
+  // `.env` — but a path nobody can re-derive has to travel (ADR 0040).
+  "ISSANCE_CONFIG",
+  "ISSANCE_STATE_DIR",
+  "ISSANCE_PLUGIN_ROOT",
+  "ISSANCE_PORT",
+  "ISSANCE_KEEP_VERSIONS",
+  HEALTH_TIMEOUT_ENV,
+] as const;
+
+export function runnerEnv(env: Environment): EnvVars {
+  const out: EnvVars = {};
+  for (const key of RUNNER_ENV_KEYS) {
+    const value = env[key];
+    if (value !== undefined && value !== "") out[key] = value;
+  }
+  return out;
+}
+
+/** The lock's verdict for this install, with the pid liveness question answered by the process table. */
+function updateLockVerdict(deps: UpdateDeps): ReturnType<typeof lockVerdict> {
+  const held = readLock(deps.files, deps.ctx.stateDir);
+  const alive = held !== null && deps.exec.processCommand(held.pid) !== null;
+  return lockVerdict(held, deps.now(), alive, STALE_AFTER_MS);
+}
+
+/** The record on disk as of now, or null — the staleness rule applied through the process table. */
+function currentRun(deps: UpdateDeps): UpdateRun | null {
+  return readRun(deps.files, deps.ctx.stateDir, deps.now(), (pid) => deps.exec.processCommand(pid) !== null);
+}
+
+/**
+ * Run one of the two staging arms, and close the record behind it if it did not hand off.
+ *
+ * `beginStaging` writes `staging` at the FIRST expensive step, which is the whole point of it — but
+ * every failure below that line (a fetch, a worktree, a build, a smoke) returns an exit code and
+ * writes nothing. Without this the record would sit at `staging` until the staleness rule caught it
+ * ten minutes later and reported `interrupted`, "the updater pid is gone", about a process that had
+ * exited cleanly with a diagnosis already on the operator's terminal. Worse, the phone reads that
+ * record as a live run and disables the button, so the retry is not offered either.
+ *
+ * `abort` is the state machine's own word for it: staging gave up, nothing had moved, the record
+ * goes back to `idle` carrying the reason.
+ */
+async function withStagingRecord(deps: UpdateDeps, arm: () => Promise<number>): Promise<number> {
+  const code = await arm();
+  if (code !== EXIT.OK) abandonStaging(deps);
+  return code;
+}
+
+/** Return this process's own `staging` record to `idle`. Another process's record is never touched. */
+function abandonStaging(deps: UpdateDeps, reason: string = STAGING_GAVE_UP): void {
+  try {
+    const run = currentRun(deps);
+    if (run === null || run.state !== "staging" || run.pid !== deps.pid) return;
+    writeRun(deps.files, deps.ctx.stateDir, reduce(run, { kind: "abort", reason }, deps.now()));
+  } catch {
+    /* see `beginStaging`: nothing about the record may fail an update, and this one has failed already */
+  }
+}
+
+/** What an aborted staging record says. The terminal above it has already said which step and why. */
+const STAGING_GAVE_UP = "staging stopped before the new version was laid down";
+/** The abort reason when the tag exists but its release is not published yet (#503): its manifest
+ *  answers 404. The phone prints the record's reason as it stands, so this is the sentence it shows. */
+const NOT_PUBLISHED_YET = (version: string): string =>
+  `${version} is not published yet, try again in a few minutes`;
+/** The abort reason when the target was already `current`: nothing was staged because nothing needed to be. */
+
+/**
+ * THE STAGING WINDOW, REPORTING ITSELF (M20/10).
+ *
+ * Two things start together and end together: a `staging` run record on disk, written BEFORE the
+ * fetch rather than after the build, and a progress file this recorder appends whole lines to.
+ * Between them the phone has a state to render and something in it that changes, over the one part
+ * of an update that actually takes a minute.
+ *
+ * `staging` is the existing state and not a new one. The wire already carries it, every reader
+ * already renders it as "Staging {version}…", and a seventh run state would be a word on the wire
+ * that no released phone knows for a window it already has a word for. It is simply written earlier
+ * than it used to be, which is what the operator was missing.
+ *
+ * NOTHING HERE MAY FAIL AN UPDATE. Every write is best-effort: a state directory that cannot be
+ * written is a progress file that does not exist, and a progress file that does not exist reads as
+ * "this bridge is older than the field" — exactly the absent-means-closed reading the rest of the
+ * update wire takes.
+ */
+interface StagingProgress {
+  /** Say what is happening now. One whole line, appended, bounded to the last few. */
+  note(line: string): void;
+}
+
+function beginStaging(deps: UpdateDeps, a: { from: string | null; to: string; runId: string | null }): StagingProgress {
+  const now = deps.now();
+  // THE LOCK IS READ FIRST. `handOff` refuses a second update, but it refuses at the END of staging,
+  // and this record is written at the start of it — so without this a terminal `issance update` run
+  // beside a live one would overwrite the live run's record, and its progress file, minutes before
+  // being told no. `update.json` has one writer at a time, and that is how it stays that way.
+  if (!updateLockVerdict(deps).ok) return { note: () => {} };
+  // AND A LIVE RECORD IS NOT OVERWRITTEN EITHER, which is the rest of that same question. The lock is
+  // taken at `handOff`, i.e. at the END of staging, so two updates started minutes apart inside one
+  // staging window both read an unheld lock and the check above lets both through. The record on
+  // disk closes the gap: an in-flight state that another process wrote is that process's record, and
+  // `readUpdateRun` has already applied the staleness rule to it, so a crashed updater's marker does
+  // not block a retry for ever. One writer at a time, which is the file's whole contract.
+  const live = currentRun(deps);
+  if (live !== null && live.pid !== deps.pid && inFlight(live.state)) return { note: () => {} };
+  // The record FIRST, so the phone has something to read from the first second. `handOff` writes the
+  // same state again when staging ends; `reduce` is a pure fold over the same events, so the second
+  // write is the same shape with a later `updatedAt` rather than a contradiction.
+  try {
+    writeRun(
+      deps.files,
+      deps.ctx.stateDir,
+      reduce(
+        reduce(idleRun(now), { kind: "begin", from: a.from, to: a.to, pid: deps.pid, runId: a.runId }, now),
+        { kind: "stage" },
+        now,
+      ),
+    );
+  } catch {
+    /* a record nobody could write is a record the phone reads as absent — never a failed update */
+  }
+  if (a.runId === null) return { note: () => {} };
+  const path = stagingLogPath(deps.ctx.stateDir, a.runId);
+  // The PREVIOUS run's file goes now, on the one tick that knows a new run has started. Keyed names
+  // already make a stale file unreadable as the current one; this is so they do not accumulate.
+  try {
+    for (const name of deps.files.list(deps.ctx.stateDir)) {
+      if (name.startsWith(STAGING_LOG_PREFIX) && join(deps.ctx.stateDir, name) !== path) {
+        deps.files.remove(join(deps.ctx.stateDir, name));
+      }
+    }
+  } catch {
+    /* best effort — a leftover file is untidy, never wrong */
+  }
+  // Held in memory and rewritten whole, which is what bounds the file and what guarantees it always
+  // ends on a line boundary. `Files` has `write` and no `append`, and adding one for this would be a
+  // new seam for every verb to carry for the sake of forty lines.
+  const kept: string[] = [];
+  return {
+    note(line) {
+      for (const part of line.split("\n")) {
+        if (part.trim() !== "") kept.push(part);
+      }
+      if (kept.length > STAGING_LOG_LINES) kept.splice(0, kept.length - STAGING_LOG_LINES);
+      try {
+        deps.files.write(path, `${kept.join("\n")}\n`, 0o600);
+      } catch {
+        /* see the header: never fail an update over a progress line */
+      }
+    },
+  };
+}
+
+/**
+ * The `.service` unit this process is a member of the cgroup of, or null when it is not in one.
+ *
+ * Read through the {@link Files} seam so a test can state either answer. cgroup v2 writes one line,
+ * `0::<path>`; v1 writes one per controller. The path is the last colon-separated field either way,
+ * and only a leaf ending in `.service` is the case that matters: a `session-<n>.scope` (an ssh
+ * shell) has no main process, so nothing in it exiting tears the cgroup down.
+ */
+function serviceCgroup(files: Files): string | null {
+  for (const line of (files.read("/proc/self/cgroup") ?? "").split("\n")) {
+    const path = line.split(":").at(-1)?.trim() ?? "";
+    if (path.endsWith(".service")) return path.split("/").at(-1) ?? path;
+  }
+  return null;
+}
+
+/**
+ * Stage is done: write `staging`, launch the runner with its own lifetime, and get out of the way.
+ *
+ * This function does not flip and does not restart. It exits 0 the moment the child is away, because
+ * the thing it just started is going to kill this process's own service — and on a Hangar action or
+ * an `/api/update` call, quite possibly this process's own parent.
+ */
+/** The record's `action` for a runner's argv: `rollback`, `switch`, or absent on an update. */
+function runActionOf(a: Pick<ApplyArgs, "rollback" | "switch">): RunAction | undefined {
+  if (a.rollback === true) return "rollback";
+  return a.switch === true ? "switch" : undefined;
+}
+
+function handOff(
+  deps: UpdateDeps,
+  layout: BinaryLayout,
+  a: Omit<ApplyArgs, "handoff">,
+  runId: string | null = null,
+): number {
+  const verdict = updateLockVerdict(deps);
+  if (!verdict.ok) {
+    deps.io.err(`error: ${verdict.reason}.`);
+    deps.io.err("       Watch it with `issance update --status`; a run whose updater is gone stops");
+    deps.io.err(`       blocking a retry ${Math.round(STALE_AFTER_MS / 60_000)} minutes after its last transition.`);
+    return EXIT.FAIL;
+  }
+  const now = deps.now();
+  takeLock(deps.files, deps.ctx.stateDir, deps.pid, now);
+  // The run id rides the RECORD, not the runner's argv: `runApply` picks the staging record up off
+  // disk and keeps driving it, so the id reaches every later state without `--to` growing a sibling.
+  const plain: RunEvent = { kind: "begin", from: a.from, to: a.to, pid: deps.pid, runId };
+  const action = runActionOf(a);
+  const begin: RunEvent = action === undefined ? plain : { ...plain, action };
+  const staging = reduce(reduce(idleRun(now), begin, now), { kind: "stage" }, now);
+  writeRun(deps.files, deps.ctx.stateDir, staging);
+
+  const plan = launchPlan({
+    host: deps.host,
+    binary: runnerBinary(deps),
+    args: applyArgv({ ...a, handoff: deps.pid }),
+    unit: unitName(deps.ctx.instance),
+    stamp: now.toString(36),
+    hasSystemdRun: deps.exec.which("systemd-run") !== null && systemdUserReachable(deps.exec, deps.ctx.env),
+    hasSetsid: deps.exec.which("setsid") !== null,
+  });
+  const logPath = logFilePath(deps.ctx.configDir, deps.ctx.instance);
+  // A handoff that did not happen is a FAILURE, printed and recorded. Without this branch the record
+  // sits at `staging` until the staleness rule reads it as `interrupted` ten minutes later, the phone
+  // shows a live-looking run for that whole window, and a retry is refused for it.
+  // The complaint text ends up in the abort reason, which the phone displays: {@link COMPLAINT_MAX}.
+
+  const refused = (reason: string, said: string): number => {
+    releaseLock(deps.files, deps.ctx.stateDir);
+    writeRun(deps.files, deps.ctx.stateDir, reduce(staging, { kind: "abort", reason }, deps.now()));
+    deps.io.err(`error: ${said}`);
+    deps.io.err(`       Nothing was swapped. Apply it by hand: ${runnerBinary(deps)} ${applyArgv({ ...a, handoff: 0 }).join(" ")}`);
+    return EXIT.FAIL;
+  };
+
+  if (plan.confirms === "manager") {
+    // The client is a client: `systemd-run` without `--wait` returns as soon as the manager has
+    // accepted the job and started the unit, so waiting for it costs tens of milliseconds and buys
+    // the whole guarantee. The runner is then in a unit of its own, and this process may exit —
+    // which, as the main process of a service, is exactly what used to kill the client mid-flight
+    // (`Exec.spawnDetached`, and ADR 0037).
+    const client = deps.exec.runLogged(plan.command, {
+      cwd: layout.installRoot,
+      env: runnerEnv(deps.ctx.env),
+      logPath,
+      timeoutMs: HANDOFF_CONFIRM_MS,
+    });
+    if (client.code !== 0) {
+      // The manager's own complaint, because `exit 1` on its own tells an operator nothing. Capped:
+      // this text lands in the abort reason, which the phone displays, and a manager can be verbose.
+      const first = client.stderr.split("\n").map((l) => l.trim()).find((l) => l !== "");
+      const complaint = first === undefined ? undefined : capComplaint(first);
+      const why = client.timedOut ? `timeout after ${Math.round(HANDOFF_CONFIRM_MS / 1000)}s` : `exit ${client.code}`;
+      const reason = `the ${plan.kind} handoff was refused (${why})${complaint === undefined ? "" : `: ${complaint}`}`;
+      return refused(reason, `the update was staged, but ${reason}.`);
+    }
+  } else {
+    // This tier has no manager to ask, and its child is not a fast client — it IS the runner. So a
+    // launch from inside a service cgroup dies within milliseconds of this function returning: this
+    // process is the unit's main process, and its exit has systemd tear the cgroup down under the
+    // default `KillMode=control-group`, taking the runner with it long before the swap it was
+    // started for. That is worse than the stall this spec removes. Refusing is the honest answer.
+    const unit = serviceCgroup(deps.files);
+    if (unit !== null) {
+      const reason = `the ${plan.kind} handoff cannot run from inside ${unit}: a hand-off from inside a service needs the user manager`;
+      return refused(reason, `the update was staged, but ${reason}.`);
+    }
+    const pid = deps.exec.spawnDetached(plan.command, {
+      cwd: layout.installRoot,
+      env: runnerEnv(deps.ctx.env),
+      logPath,
+    });
+    if (pid === null) {
+      return refused(plan.note, "the update was staged, but the detached updater could not be started.");
+    }
+  }
+  deps.io.out(`✓ ${a.to} is staged — ${plan.note}.`);
+  deps.io.out("  The swap, the restart and the health check run there, so this command is done.");
+  deps.io.out("  Watch it with: issance update --status");
+  return EXIT.OK;
+}
+
+/**
+ * `issance update --status` — the record, read out loud. `--json` prints it verbatim for a script.
+ *
+ * It reads the same file, through the same staleness rule, that the bridge and the standby door do,
+ * so the terminal and the phone can never tell two different stories about one run.
+ */
+export function cmdUpdateStatus(deps: UpdateDeps, args: readonly string[]): number {
+  const run = currentRun(deps);
+  if (args.includes("--json")) {
+    deps.io.out(JSON.stringify(run, null, 2));
+    return EXIT.OK;
+  }
+  if (run === null) {
+    deps.io.out("no update has run on this install yet.");
+    return EXIT.OK;
+  }
+  const target = run.to ?? "?";
+  const heading =
+    run.state === "done"
+      ? `✓ updated to ${target}`
+      : run.state === "rolled-back"
+        ? `rolled back to ${run.from ?? "the previous version"} — ${target} did not come up`
+        : run.state === "stuck"
+          ? `STUCK — ${target} did not come up and neither did the rollback`
+          : run.state === "interrupted"
+            ? `interrupted — the updater is gone and ${target} was mid-flight`
+            : `${run.state} — ${run.from ?? "?"} → ${target}`;
+  deps.io.out(heading);
+  deps.io.out(`  started ${new Date(run.startedAt).toISOString()}, last moved ${new Date(run.updatedAt).toISOString()}`);
+  if (run.reason !== undefined) deps.io.out(`  reason: ${run.reason}`);
+  if (run.recovery !== undefined) deps.io.out(`  recover with: ${run.recovery}`);
+  if (run.logTail !== undefined && run.logTail !== "") {
+    deps.io.out("  last lines of the service log:");
+    for (const line of run.logTail.split("\n")) deps.io.out(`    ${line}`);
+  }
+  return run.state === "stuck" ? EXIT.FAIL : EXIT.OK;
+}
+
+/** `--status` anywhere in the verb's argv. */
+export const wantsStatus = (args: readonly string[]): boolean => args.includes("--status");
+
+/**
+ * The runner proper: flip, restart, verify, roll back once. Everything impure is an effect handed to
+ * {@link driveApply}, which is where the machine lives.
+ */
+async function runApply(deps: UpdateDeps, a: ApplyArgs): Promise<number> {
+  const layout = a.kind === "binary" ? binaryLayout(deps.ctx.root, deps.host) : layoutForCheckout(deps.ctx.root, deps.host);
+  const stateDir = deps.ctx.stateDir;
+  // The lock this run inherits is the one the staging process took (`--handoff <pid>`). Any other
+  // holder is somebody else's run and refuses us, exactly as it refuses a second `issance update`.
+  const held = readLock(deps.files, stateDir);
+  if (held !== null && held.pid !== a.handoff) {
+    const verdict = updateLockVerdict(deps);
+    if (!verdict.ok) {
+      deps.io.err(`error: ${verdict.reason} — this runner will not touch \`current\`.`);
+      return EXIT.FAIL;
+    }
+  }
+  takeLock(deps.files, stateDir, deps.pid, deps.now());
+
+  const onDisk = currentRun(deps);
+  const action = runActionOf(a);
+  const start: UpdateRun =
+    onDisk !== null && onDisk.state === "staging"
+      ? { ...onDisk, pid: deps.pid }
+      : reduce(
+          reduce(
+            idleRun(deps.now()),
+            action === undefined
+              ? { kind: "begin", from: a.from, to: a.to, pid: deps.pid }
+              : { kind: "begin", from: a.from, to: a.to, pid: deps.pid, action },
+            deps.now(),
+          ),
+          { kind: "stage" },
+          deps.now(),
+        );
+
+  const flipTo = (dir: string): boolean =>
+    a.kind === "binary"
+      ? flipCurrent(deps, layout, dir)
+      : flipToStaged(deps, layout, { dir, version: dir.replace(/^v/, ""), complete: true }).ok;
+
+  // The wall-clock moment of the latest restart, for the peer-listener check: the bridge stamps its
+  // runtime marker with `Date.now()` at boot, and only a marker from after this moment is the
+  // restarted process. Infinite until a restart happens, so nothing passes before one.
+  let restartedAt = Number.POSITIVE_INFINITY;
+
+  const run = await driveApply(
+    {
+      flip: flipTo,
+      // Through `current`, for BOTH install kinds. This process is the OLD version, and its own
+      // `restart` would rewrite the unit from its own root — pinning the supervisor to the version
+      // the flip just left, which would make the flip cosmetic.
+      restart: () => {
+        // Each restart moves it, so a rollback's bridge must boot after the SECOND one.
+        restartedAt = deps.now();
+        return Promise.resolve(restartThroughCurrent(deps, layout));
+      },
+      // Not "loopback and the front-door port": a wide bind and a peer's TLS-pinned listener are
+      // both real, and both make that URL the wrong door (`cli/update-run.ts` → `updateHealthTarget`).
+      // A peer with no standby door has no plain-HTTP door at all, so it is asked for its own
+      // certificate on the main port instead.
+      health: updateHealthProbe(
+        deps.net,
+        updateHealthTarget(probeConfigOf(deps.ctx.env, deps.files, deps.ctx.stateDir, deps.ctx.port)),
+        bootEvidenceOf(deps.files, stateDir, () => restartedAt, (pid) => {
+          const found = deps.exec.processLookup(pid);
+          return found.kind === "unknown" ? null : found.kind === "running";
+        }),
+      ),
+      prune: () => {
+        // A rollback prunes nothing: the version it left is the one most likely wanted back. A
+        // switch down neither: the Edge build it left is the one a volunteer may want again.
+        if (runActionOf(a) !== undefined) return;
+        if (a.kind === "binary") collectOldVersions(deps, layout, a.to);
+        else pruneVersions(deps, layout);
+      },
+      logTail: () =>
+        serviceLogTail(deps, unitName(deps.ctx.instance), logFilePath(deps.ctx.configDir, deps.ctx.instance)),
+      now: deps.now,
+      sleep: deps.sleep,
+      write: (record) => writeRun(deps.files, stateDir, record),
+      timeoutMs: healthTimeoutMs(deps.ctx.env),
+      pollMs: HEALTH_POLL_MS,
+    },
+    { to: a.to, from: a.from, version: a.version, commit: a.commit, recovery: recoveryCommand(layout, a.from, deps.host) },
+    start,
+  );
+  releaseLock(deps.files, stateDir);
+
+  if (run.state === "done") {
+    // The two names that must follow a flip, and the nudge and the skill sync that must be asked of
+    // the NEW binary.
+    if (a.kind === "checkout") {
+      if (!underVersions(deps.ctx.root, deps.host)) {
+        republishName(deps, deps.host.path.join(layout.versionsDir, a.to), collieBinary(deps.ctx.root, deps.host));
+      }
+      refreshRegistry(deps, layout.currentLink);
+    }
+    const verb = a.rollback === true ? "rolled back" : a.switch === true ? "went back" : "updated";
+    deps.io.out(`✓ ${verb} to ${a.version === "" ? a.to : a.version}`);
+    nudgeHooks(deps, collieBinary(layout.currentLink, deps.host));
+    syncSkill(deps, collieBinary(layout.currentLink, deps.host));
+    return EXIT.OK;
+  }
+  if (run.state === "rolled-back") {
+    // AN EDGE BUILD THAT FAILED ITS CHECK IS NOT OFFERED AGAIN (ADR 0110). Only on an update: a
+    // rollback or a switch that fails left nothing new behind. The member's own health gate is this
+    // same runner, so a member rejects the build the same way.
+    if (runActionOf(a) === undefined) noteFailedBuild(deps, a.version === "" ? a.to : a.version);
+    deps.io.err(
+      a.rollback === true
+        ? `error: ${a.to} did not pass its health check — rolled forward to ${a.from ?? "?"} again.`
+        : `error: ${a.to} did not pass its health check — rolled back to ${a.from ?? "?"}.`,
+    );
+    deps.io.err(`       ${run.reason ?? "no reason recorded"}`);
+    return EXIT.FAIL;
+  }
+  deps.io.err(`error: ${a.to} did not come up, and neither did the rollback. Nothing will restart again.`);
+  deps.io.err(`       ${run.reason ?? "no reason recorded"}`);
+  deps.io.err(`       Recover with: ${run.recovery ?? recoveryCommand(layout, a.from, deps.host)}`);
+  return EXIT.FAIL;
+}

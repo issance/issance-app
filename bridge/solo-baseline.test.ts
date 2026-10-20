@@ -1,0 +1,1594 @@
+import { describe, expect, test } from "bun:test";
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, sep } from "node:path";
+
+import { AuditLog, fileAuditAppender, formatAuditLine, type AuditEntry } from "./audit.ts";
+import { ActivityLedger } from "./activity.ts";
+import { loadConfig, type Config } from "./config.ts";
+import { CONFIG_SETTINGS } from "./config-schema.ts";
+import { computeEtag } from "./http-cache.ts";
+import { muxOk } from "./mux/types.ts";
+import { NotifyPrefsStore } from "./notify-prefs.ts";
+import { FolderStore } from "./folders.ts";
+import { WorktreeBaseStore } from "./worktree-bases.ts";
+import { SentStore, sentFileIo } from "./sent.ts";
+import { WorktreeReceiptStore } from "./worktree-receipts.ts";
+import { MachineAlertStore } from "./machine-alerts.ts";
+import { loadMachineHistory, saveMachineHistory } from "./machine-history.ts";
+import { machineRosterOf, MachineWatch, SOLO_MACHINE_ID } from "./machines.ts";
+import type { PushMessage } from "./push.ts";
+import { TrustStore } from "./crew/trust-store.ts";
+import { Snooze } from "./snooze.ts";
+import { bootSources, planPrograms, sourcesPath, type DurableSource } from "./sources.ts";
+import {
+  SessionRegistry,
+  herdTagFor,
+  type SessionFactory,
+  type SessionParts,
+} from "./sessions.ts";
+import type { EngineSnapshot } from "./state-engine.ts";
+import { toPaneWire } from "./types.ts";
+import type {
+  AgentView,
+  DeviceAuth,
+  PaneWire,
+  SessionSummary,
+  SnapshotResponse,
+  TabView,
+  UpdateStatus,
+  WorkspaceView,
+} from "./types.ts";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOLO ZERO-TAX BASELINE — you are not allowed to tax a solo user.
+//
+// Crew federation (M3/M4) is being built on top of this code. The contract in CREW_PROTOCOL.md §11
+// says that with ZERO peers enrolled, issance's observable behaviour stays byte-for-byte what it is
+// TODAY: no added snapshot field, no shifted ETag, no new route, no new state file, no new env key,
+// no changed notification tag or audit line.
+//
+// This file is a CHARACTERIZATION baseline, landed BEFORE any federation code exists. That timing is
+// the whole point: written afterwards, it would only re-record whatever the new code does. A failure
+// here does NOT mean "the golden is stale" — it means a solo instance's observable behaviour moved,
+// and the change either has to become peer-conditional or the contract has to be renegotiated.
+//
+// REGENERATING A GOLDEN IS A DELIBERATE ACT:
+//   ISSANCE_REGEN_SOLO_BASELINE=1 bun test bridge/solo-baseline.test.ts
+// rewrites the fixtures under bridge/fixtures/solo-baseline/. Any PR that does so MUST say so in its
+// description, with the reason and the §11 row it renegotiates. Silent regeneration defeats the test.
+//
+// Two layers, deliberately:
+//   • TYPE level — an exhaustive `satisfies Record<keyof T, true>` per wire type. `keyof` includes optional
+//     keys, so adding `servers?:` or `host?:` to a wire type fails `bun run typecheck` at the exact
+//     line the field was added. server.ts emits its snapshot `satisfies SnapshotResponse`, so a new
+//     emitted key must first exist on the type — the chain has no gap.
+//   • BYTE level — a golden body, deep-equalled and byte-compared, plus its ETag.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const FIXTURES = join(import.meta.dir, "fixtures", "solo-baseline");
+const REGEN = process.env.ISSANCE_REGEN_SOLO_BASELINE === "1";
+
+function golden(name: string): string {
+  // A Windows checkout may turn the committed LF into CRLF (core.autocrlf); the bytes the code
+  // produces are LF, so the fixture is read as the LF text that was committed.
+  return readFileSync(join(FIXTURES, name), "utf8").replace(/\r\n/g, "\n");
+}
+
+/** Compare against a committed golden, or rewrite it under ISSANCE_REGEN_SOLO_BASELINE=1. */
+function expectGolden(name: string, actual: string): void {
+  if (REGEN) {
+    writeFileSync(join(FIXTURES, name), actual);
+    console.warn(`[solo-baseline] REGENERATED ${name} — say so in the PR description, with a reason.`);
+  }
+  expect(actual).toBe(golden(name));
+}
+
+// ── The fixed fake herd ───────────────────────────────────────────────────────
+// A solo instance: one herdr session (the primary), two agent panes, one shell pane, one space,
+// one tab. Frozen inputs — every number here is arbitrary but must never change, or the golden
+// stops being a comparison against yesterday.
+
+const TS = 1_754_000_000_000;
+
+const claudePane: AgentView = {
+  paneId: "w1:p1",
+  workspaceId: "w1",
+  workspaceLabel: "issance",
+  workspaceNumber: 1,
+  tabId: "w1:t1",
+  agent: "claude",
+  status: "blocked",
+  cwd: "/home/you/playground/issance",
+  focused: true,
+  kind: "agent",
+  paneLabel: "guard work",
+  sessionName: "guard-work",
+  // Server-side only: toPaneWire must strip this to `hasSession` and never leak the value.
+  agentSession: { kind: "id", value: "abc-123" },
+  readableLines: 48,
+  tabLabel: "issance",
+  lastActiveAt: TS - 60_000,
+  lastSeenAt: TS - 300_000,
+};
+
+const codexPane: AgentView = {
+  paneId: "w1:p2",
+  workspaceId: "w1",
+  workspaceLabel: "issance",
+  workspaceNumber: 1,
+  tabId: "w1:t1",
+  agent: "codex",
+  status: "working",
+  cwd: "/home/you/playground/issance",
+  focused: false,
+  kind: "agent",
+};
+
+const shellPane: AgentView = {
+  paneId: "w1:p3",
+  workspaceId: "w1",
+  workspaceLabel: "issance",
+  workspaceNumber: 1,
+  tabId: "w1:t1",
+  agent: "shell",
+  status: "idle",
+  cwd: "/home/you",
+  focused: false,
+  kind: "shell",
+};
+
+const workspaces: WorkspaceView[] = [
+  {
+    workspaceId: "w1",
+    number: 1,
+    label: "issance",
+    focused: true,
+    activeTabId: "w1:t1",
+    tabCount: 1,
+    paneCount: 3,
+  },
+];
+
+const tabs: TabView[] = [
+  { tabId: "w1:t1", workspaceId: "w1", number: 1, label: "issance", focused: true, paneCount: 3 },
+];
+
+const engineSnapshot: EngineSnapshot = {
+  agents: [claudePane, codexPane],
+  shellPanes: [shellPane],
+  workspaces,
+  tabs,
+  bridge: "connected",
+};
+
+const updateStatus: UpdateStatus = {
+  current: "1.0.0-alpha.1",
+  latest: null,
+  latestUrl: null,
+  releaseAvailable: false,
+  majorAvailable: null,
+  majorUrl: null,
+  installKind: "detached-checkout",
+  dismissedVersion: null,
+  dismissedCrewVersion: null,
+  bridgeStale: false,
+  restartNeeded: false,
+  checkedAt: null,
+};
+
+/**
+ * Every member of {@link SessionParts} is a class with private fields, so no fake can ever *be* one
+ * structurally. `Partial<T>` keeps the compiler checking each method a fake DOES supply against the
+ * real class (a renamed or re-typed method still breaks this file); only the "the rest is never
+ * reached" step is asserted.
+ */
+function stubPart<T>(impl: Partial<T>): T {
+  // SAFETY: SessionRegistry only ever calls the methods these fakes implement — `engine.current()`
+  // and the `stop()`/`clearAll()` disposal hooks. `hangar` is stored and handed back, never called,
+  // on the paths this file drives (registry construction, `list()`, and the snapshot assembly).
+  return impl as T;
+}
+
+/** Only claude has a journal adapter in this fixture — codex/shell must not advertise History. */
+const hasJournal = (agent: string) => agent === "claude";
+
+/**
+ * A registry over exactly one session (the primary), built with the same fake-factory convention as
+ * sessions.test.ts. `list()` is the REAL implementation — this pins what a solo `sessions` looks like.
+ */
+function soloRegistry(sources: readonly DurableSource[] = []): SessionRegistry {
+  const factory: SessionFactory = () => ({
+    // The registry's only discovery: an adapter reporting nothing but the primary itself.
+    herdr: stubPart<SessionParts["herdr"]>({ listSessions: () => Promise.resolve(muxOk([])) }),
+    engine: stubPart<SessionParts["engine"]>({ current: () => engineSnapshot, stop: () => {} }),
+    poker: stubPart<SessionParts["poker"]>({ stop: () => {} }),
+    notifications: stubPart<SessionParts["notifications"]>({ clearAll: () => {} }),
+  });
+  return new SessionRegistry({
+    configRoot: "/home/you/.config/hangar",
+    primarySocketPath: "/home/you/.config/hangar/herdr.sock",
+    factory,
+    multiSession: true,
+    sources,
+  });
+}
+
+/**
+ * Assemble the snapshot body exactly as the `/api/snapshot` handler does
+ * (bridge/server.ts:193-212) for a solo instance: device auth off (so the key is absent), no peers.
+ * Kept in lockstep with that handler by the `satisfies SnapshotResponse` on both sides plus the
+ * exhaustive key assertions below — a key added there must exist on the type, which fails here.
+ */
+function soloSnapshot(registry: SessionRegistry): SnapshotResponse {
+  const { agents, shellPanes, workspaces: ws, tabs: tb, bridge } = registry.get()!.engine.current();
+  return {
+    bridge,
+    // device: omitted — ISSANCE_DEVICE_HEADER unset is the default deployment.
+    agents: agents.map((p) => toPaneWire(p, hasJournal)),
+    shellPanes: shellPanes.map((p) => toPaneWire(p, hasJournal)),
+    workspaces: ws,
+    tabs: tb,
+    sessions: registry.list(),
+    notifications: { snoozedUntil: null },
+    update: updateStatus,
+    ts: TS,
+  } satisfies SnapshotResponse;
+}
+
+// ── 1. Wire shapes: the crew dimension exists on the TYPE, never in solo's BYTES ──
+// §11 rows: "Snapshot bytes", "?h=". These maps are exhaustive by construction — `satisfies
+// Record<keyof T,…>` makes every key of T (optional ones included) required here and rejects any key
+// that is NOT on T, so adding a federation field to a wire type is a TYPECHECK failure, not a silent
+// widening.
+//
+// ── THE TRIPWIRE FIRED, ONCE, IN M4/04 ───────────────────────────────────────
+// `servers?:` (SnapshotResponse) and `host?:` (SessionSummary, PaneWire) were added by the snapshot
+// merge and are recorded below. Read that as what it is: the type-level guard doing its job, forcing
+// the addition to be acknowledged here rather than slipping in. **No golden was regenerated and no
+// byte moved** — all three are optional-and-absent, so a solo body still contains none of them,
+// which §2/§3 below assert directly and which is why they are `?:` and not required (§11's "Why
+// `servers` is optional-and-absent"). The key-LIST assertions in this section are therefore the one
+// authorised change; every byte-level assertion in this file is untouched.
+
+const SNAPSHOT_KEYS = {
+  bridge: true,
+  device: true,
+  agents: true,
+  shellPanes: true,
+  workspaces: true,
+  tabs: true,
+  sessions: true,
+  notifications: true,
+  update: true,
+  ts: true,
+  // Present on the type since M4/04, absent from every solo body — see the section header.
+  servers: true,
+  // Not a crew dimension: present only while the mux is down for a refused durable token (M50 spec
+  // 14), so a healthy solo body carries no such key and no golden byte moved.
+  muxFault: true,
+} satisfies Record<keyof SnapshotResponse, true>;
+
+const SESSION_SUMMARY_KEYS = {
+  name: true,
+  isPrimary: true,
+  reachable: true,
+  agents: true,
+  working: true,
+  blocked: true,
+  host: true,
+} satisfies Record<keyof SessionSummary, true>;
+
+const PANE_WIRE_KEYS = {
+  paneId: true,
+  workspaceId: true,
+  workspaceLabel: true,
+  workspaceNumber: true,
+  tabId: true,
+  agent: true,
+  status: true,
+  cwd: true,
+  focused: true,
+  kind: true,
+  paneLabel: true,
+  sessionName: true,
+  readableLines: true,
+  tabLabel: true,
+  lastActiveAt: true,
+  lastSeenAt: true,
+  hasSession: true,
+  host: true,
+  // NOT a crew dimension — an ordinary optional feature field (0.29.0, panes named by their OSC
+  // title). Recorded here because the tripwire is exhaustive over `keyof PaneWire`, not because it
+  // carries a host: like the fields above it is optional-and-absent when the pane has no meaningful
+  // title, and no golden byte moved.
+  terminalTitle: true,
+  // Also not a crew dimension: a presentation flag on the field above, set only when the title
+  // outlived the program that printed it. Absent on every pane in this baseline, so no golden byte
+  // moved.
+  terminalTitleStale: true,
+  // Also not a crew dimension: an optional sentence the bridge composes for one kind of pane
+  // (M11/05). Absent on every pane in this baseline, so no golden byte moved.
+  hint: true,
+  // The OTHER half of a pane's address, and the one field here that is written by a request rather
+  // than by the pane's own state: present only when the caller asked to widen (`?sessions=all`),
+  // and then on every pane in the body. Nothing in this baseline asks, so it is absent on every
+  // pane here and no golden byte moved — which is the claim, not an aside.
+  session: true,
+  // The pane's prompt-cache reading (M28/02). Also not a crew dimension, and also absent here: no
+  // pane in this baseline names a session a probe could read, so no golden byte moved — which is the
+  // claim the feature makes, not an aside. The bridge never guesses a number before it measures one.
+  cache: true,
+  // The pane's active todo list (bridge/todos.ts). Not a crew dimension, and absent here: the
+  // baseline builds no todo tracker, so no golden byte moved.
+  todos: true,
+  // The pane's running subagents (bridge/subagents.ts). Not a crew dimension, and absent here: the
+  // baseline builds no subagent tracker, so no golden byte moved.
+  subagents: true,
+  // Not a crew dimension: the model the pane's agent is on, from the same probe as `cache` and absent
+  // here for the same reason, so no golden byte moved.
+  model: true,
+  // Not a crew dimension: the effort beside that model, from the same probe, and absent here for the
+  // same reason, so no golden byte moved.
+  effort: true,
+  // Not crew dimensions: the operator's name for this pane's one-pane tab, and the pane's position in
+  // its tab. Computed on the machine the pane lives on; an older peer omits both.
+  soleTabName: true,
+  tabPosition: true,
+  // Not a crew dimension: what the checkout holding the pane's folder is on, read off that machine's
+  // own disk. Attached at serialise time like `cache`, and absent here: this baseline builds its body
+  // with no reader, so no golden byte moved.
+  gitHead: true,
+  // Not a crew dimension: the open asks of a pane whose adapter raises them as data (ADR 0100). Only
+  // the `durable` adapter fills it, so it is absent on every pane here and no golden byte moved.
+  asks: true,
+  // Not a crew dimension either: the newest turn of a pane whose adapter takes guarded controls
+  // (ADR 0101). Only the `durable` adapter fills it, so it is absent here and no golden byte moved.
+  turnId: true,
+  // Not crew dimensions: a durable program's line under the title and its small mark (WIRE.md 7.11).
+  // Only the `durable` adapter fills them, so they are absent here and no golden byte moved.
+  subtitle: true,
+  badge: true,
+  progress: true,
+  // Not a crew dimension either: the belt buttons of a pane whose program lists actions (M53 spec 07).
+  // Only the `durable` adapter fills it, so it is absent here and no golden byte moved.
+  actions: true,
+  // Not a crew dimension: the pane's input surface (M56 spec 04). Only Surface shadow mode fills it,
+  // and it is off by default, so it is absent on every pane here and no golden byte moved.
+  surface: true,
+  // Not a crew dimension: the pane's hook source, live or none (M56 spec 11). It rides with `surface`
+  // only, on a session that takes hook edges, and this harness builds none, so no golden byte moved.
+  hooks: true,
+  // Not a crew dimension: the pane's hook-held permission (M56 spec 12). It rides with `surface` only,
+  // on a session that takes holds, and this harness builds none, so no golden byte moved.
+  hold: true,
+  // Not a crew dimension: the Send Protocol's mark (M56 spec 05). It is on by default since spec 06
+  // (ISSANCE_SEND_PROTOCOL=0 turns text sending off), but a pane carries it only when its session runtime
+  // has a Send Protocol, and this harness builds none, so it is absent here and no golden byte moved.
+  sendProtocol: true,
+  // Not a crew dimension: the pane's held sends (M56 spec 15). They ride with `sendProtocol` and only
+  // when a send is held, and this harness builds no Send Protocol, so no golden byte moved.
+  held: true,
+  // Not a crew dimension: the pane's walky talky instance token (bridge/walky/instances.ts, added
+  // 2026-10-18). A live solo bridge carries it on every pane, the change this baseline records on
+  // purpose; the harness builds its wire with no instance registry, so no golden byte moved.
+  instance: true,
+} satisfies Record<keyof PaneWire, true>;
+
+const DEVICE_AUTH_KEYS = {
+  enforced: true,
+  device: true,
+  authorized: true,
+} satisfies Record<keyof DeviceAuth, true>;
+
+const UPDATE_STATUS_KEYS = {
+  current: true,
+  latest: true,
+  latestUrl: true,
+  releaseAvailable: true,
+  majorAvailable: true,
+  majorUrl: true,
+  installKind: true,
+  bridgeStale: true,
+  checkedAt: true,
+  // The detached updater's run record (M15/04). Optional on the wire: an install that has never
+  // updated through the runner sends no `run` key at all.
+  run: true,
+  // Every release newer than the running one (M15/05) — the card lists what one update folds in.
+  newerVersions: true,
+  // The package manager's own upgrade command (M17/02). Optional: only a packaged install under a
+  // prefix issance recognises has one to name.
+  packageCommand: true,
+  // The files on disk stopped naming the version this process runs (M17/02), and the command that
+  // clears it — the latter optional, because most installs never reach the state.
+  restartNeeded: true,
+  restartCommand: true,
+  // The two bands the operator can close (M17/08) — the offer for this host, and the quiet notice
+  // about a machine a package manager owns. Two decisions, two keys, both required and null when
+  // nothing was closed, so the golden below carries two more. They are facts about the HOST, which
+  // is the whole point: a dismissal kept per browser is a dismissal that holds in one browser.
+  dismissedVersion: true,
+  dismissedCrewVersion: true,
+  // When the crew notice was closed (1.21.1). Optional, and absent until a crew close is made, so the
+  // golden bodies below carry no such key.
+  dismissedCrewAt: true,
+  // The release ahead changes the crew wire (M27/06). Optional, and ABSENT on a solo instance by
+  // construction: there is no link to change, so the golden bodies below carry no such key.
+  linkChange: true,
+  // The newest urgent release in the delta (ADR 0046). Optional, and absent on every ordinary
+  // release — an urgent one is rare by construction, so the golden bodies below carry no such key.
+  urgent: true,
+  // The release line and the way back to Stable (M60 spec 01). Optional: the line rides beside a
+  // monitor with the line seam, and `back` only on an Edge build ahead of Stable on the Stable line,
+  // so the golden bodies below carry neither key.
+  line: true,
+  back: true,
+} satisfies Record<keyof UpdateStatus, true>;
+
+const WORKSPACE_KEYS = {
+  workspaceId: true,
+  number: true,
+  label: true,
+  focused: true,
+  activeTabId: true,
+  tabCount: true,
+  paneCount: true,
+  repoRoot: true,
+  isWorktree: true,
+  // The space's own folder when the multiplexer keeps one (Changes view root, ADR 0065). Optional and
+  // not a crew dimension: it is present on a solo instance whenever the mux reports it.
+  folder: true,
+  // A crew dimension, and the SAME one a pane and a session carry: Hangar numbers spaces per machine,
+  // so `(host, workspaceId)` is a space's identity in a crew and `workspaceId` alone collides. Like
+  // `PaneWire.host` it is present exactly when `servers` is, which is never in this baseline — the
+  // golden bodies below are the proof that no byte moved for a solo instance.
+  host: true,
+} satisfies Record<keyof WorkspaceView, true>;
+
+const TAB_KEYS = {
+  tabId: true,
+  workspaceId: true,
+  number: true,
+  label: true,
+  focused: true,
+  paneCount: true,
+  /** Same dimension, same rule as {@link WORKSPACE_KEYS}'s — a tab id is `w1:t1` on every install. */
+  host: true,
+} satisfies Record<keyof TabView, true>;
+
+describe("solo zero-tax — wire shapes carry no crew dimension", () => {
+  test("SnapshotResponse carries `servers` as OPTIONAL and nothing else new (and `muxFault`, absent while healthy)", () => {
+    expect(Object.keys(SNAPSHOT_KEYS).toSorted()).toEqual([
+      "agents",
+      "bridge",
+      "device",
+      "muxFault",
+      "notifications",
+      "servers",
+      "sessions",
+      "shellPanes",
+      "tabs",
+      "ts",
+      "update",
+      "workspaces",
+    ]);
+  });
+
+  test("SessionSummary gained `host` and nothing else", () => {
+    expect(Object.keys(SESSION_SUMMARY_KEYS).toSorted()).toEqual([
+      "agents",
+      "blocked",
+      "host",
+      "isPrimary",
+      "name",
+      "reachable",
+      "working",
+    ]);
+  });
+
+  // `host` and `session` are the pane's ADDRESS — the `?h=` and `?s=` halves — and they are the only
+  // two fields here a REQUEST can turn on. Both are optional-and-absent unless something asked: a
+  // host tag exists only on a merged crew body, a session tag only on a widened one
+  // (`?sessions=all`). Neither is asked for anywhere in this baseline, which is what the golden
+  // bodies below prove; this list is the tripwire that a THIRD such field cannot be added quietly.
+  test("PaneWire carries the two address dimensions and nothing else", () => {
+    expect(Object.keys(PANE_WIRE_KEYS).toSorted()).toEqual([
+      "actions",
+      "agent",
+      "asks",
+      "badge",
+      "cache",
+      "cwd",
+      "effort",
+      "focused",
+      "gitHead",
+      "hasSession",
+      "held",
+      "hint",
+      "hold",
+      "hooks",
+      "host",
+      "instance",
+      "kind",
+      "lastActiveAt",
+      "lastSeenAt",
+      "model",
+      "paneId",
+      "paneLabel",
+      "progress",
+      "readableLines",
+      "sendProtocol",
+      "session",
+      "sessionName",
+      "soleTabName",
+      "status",
+      "subagents",
+      "subtitle",
+      "surface",
+      "tabId",
+      "tabLabel",
+      "tabPosition",
+      "terminalTitle",
+      "terminalTitleStale",
+      "todos",
+      "turnId",
+      "workspaceId",
+      "workspaceLabel",
+      "workspaceNumber",
+    ]);
+  });
+
+  test("the supporting wire types are unchanged too", () => {
+    expect(Object.keys(DEVICE_AUTH_KEYS).toSorted()).toEqual(["authorized", "device", "enforced"]);
+    expect(Object.keys(UPDATE_STATUS_KEYS).toSorted()).toEqual([
+      // The way back to Stable (M60 spec 01) — optional, present only on an Edge build ahead of
+      // Stable on the Stable line.
+      "back",
+      "bridgeStale",
+      "checkedAt",
+      "current",
+      // The two bands the operator can close (M17/08): this host's offer, and the quiet notice about
+      // a machine a package manager owns. Required and null when nothing was closed.
+      "dismissedCrewAt",
+      "dismissedCrewVersion",
+      "dismissedVersion",
+      "installKind",
+      "latest",
+      "latestUrl",
+      // The release line (M60 spec 01) — optional, present beside a monitor with the line seam.
+      "line",
+      // Whether the release ahead changes the CREW WIRE (M27/06) — optional, and absent on a solo
+      // install, which has no link to change.
+      "linkChange",
+      "majorAvailable",
+      "majorUrl",
+      "newerVersions",
+      // The package manager's own upgrade command (M17/02) — optional, and present only on a
+      // packaged install under a prefix issance recognises.
+      "packageCommand",
+      "releaseAvailable",
+      // The command that clears the restart, optional beside the flag that raises it (M17/02).
+      "restartCommand",
+      "restartNeeded",
+      // The detached updater's run record (M15/04) — optional, so an install that has never run one
+      // sends no such key at all.
+      "run",
+      // The newest urgent release in the delta (ADR 0046) — optional, and absent unless a release
+      // asked for the daily cadence.
+      "urgent",
+    ]);
+    expect(Object.keys(WORKSPACE_KEYS).toSorted()).toEqual([
+      "activeTabId",
+      "focused",
+      "folder",
+      "host",
+      "isWorktree",
+      "label",
+      "number",
+      "paneCount",
+      "repoRoot",
+      "tabCount",
+      "workspaceId",
+    ]);
+    expect(Object.keys(TAB_KEYS).toSorted()).toEqual([
+      "focused",
+      "host",
+      "label",
+      "number",
+      "paneCount",
+      "tabId",
+      "workspaceId",
+    ]);
+  });
+});
+
+// ── 2. The golden snapshot body ──────────────────────────────────────────────
+
+describe("solo zero-tax — the snapshot body is byte-for-byte today's", () => {
+  const body = JSON.stringify(soloSnapshot(soloRegistry()), null, 2);
+
+  test("assembles to the committed golden, byte for byte", () => {
+    expectGolden("snapshot.json", `${body}\n`);
+  });
+
+  // ISSANCE_PROGRAMS=off (M55 spec 16): a sources.json that lists a program is ignored whole, so the
+  // registry the bridge would build from it lists the same sessions and the snapshot is these bytes.
+  test("ISSANCE_PROGRAMS=off: a sources.json with a program leaves the snapshot byte-identical to solo", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issance-programs-off-"));
+    try {
+      writeFileSync(sourcesPath(dir), JSON.stringify([{ name: "desk", kind: "durable", socket: "/run/desk.sock" }]), { mode: 0o600 });
+      const plan = (env: Record<string, string>) =>
+        planPrograms({ durableOnly: false, env, sources: bootSources(dir, env), primaryName: "herdr" });
+      // The control: with the switch unset the same file does add a program, so the assertion below is not vacuous.
+      expect(plan({}).others).toHaveLength(1);
+      const off = plan({ ISSANCE_PROGRAMS: "off" });
+      expect(off).toEqual({ primary: undefined, others: [] });
+      expect(JSON.stringify(soloSnapshot(soloRegistry(off.others)), null, 2)).toBe(body);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Deep equality, not a subset match: an added key fails here even if the golden were regenerated
+  // carelessly, because the parsed golden is compared BOTH ways.
+  test("deep-equals the golden with no extra keys on either side", () => {
+    // SAFETY: the golden is this file's own committed output — written by `expectGolden` from a
+    // `satisfies SnapshotResponse` body — so its parse is a SnapshotResponse by construction. The
+    // two-way `toEqual` below is what actually checks that, key for key.
+    const parsed = JSON.parse(golden("snapshot.json")) as SnapshotResponse;
+    const actual = soloSnapshot(soloRegistry());
+    expect(actual).toEqual(parsed);
+    expect(parsed).toEqual(actual);
+  });
+
+  test("a solo snapshot names no crew anywhere in its bytes", () => {
+    expect(body).not.toMatch(/"servers"|"peers"|"crew"|"host":|"lead"/);
+  });
+
+  test("solo emits exactly one session, the primary, and never a session ref", () => {
+    const snap = soloSnapshot(soloRegistry());
+    expect(snap.sessions).toEqual([
+      { name: "default", isPrimary: true, reachable: true, agents: 2, working: 1, blocked: 1 },
+    ]);
+    // hasSession is the flag; agentSession (a filesystem path for pi) must never reach the wire.
+    // Asked with `hasOwn` rather than by reading the property, because it is not on PaneWire at all
+    // — which is the point: an absent key, not an undefined value.
+    expect(snap.agents.map((p) => Object.hasOwn(p, "agentSession"))).toEqual([false, false]);
+    expect(snap.agents.map((p) => p.hasSession)).toEqual([true, undefined]);
+  });
+});
+
+// ── 3. ETag stability ────────────────────────────────────────────────────────
+// §11: the solo snapshot ETag is UNCHANGED — a hard requirement, not an accepted one-time break.
+// The literal hash is deliberately NOT pinned: Bun.hash is a runtime implementation detail and a Bun
+// upgrade legitimately moves it. What §11 actually promises is that the *body bytes* don't move, and
+// that the ETag is a pure function of those bytes. Both are asserted; the negative control below
+// proves the gate has teeth.
+
+describe("solo zero-tax — ETag", () => {
+  test("is a pure function of the body: identical bytes → identical ETag", () => {
+    const a = JSON.stringify(soloSnapshot(soloRegistry()));
+    const b = JSON.stringify(soloSnapshot(soloRegistry()));
+    expect(a).toBe(b);
+    expect(computeEtag(a)).toBe(computeEtag(b));
+  });
+
+  test("the golden body's ETag matches the assembled body's", () => {
+    const fromGolden = JSON.stringify(JSON.parse(golden("snapshot.json")));
+    const fromCode = JSON.stringify(soloSnapshot(soloRegistry()));
+    expect(computeEtag(fromCode)).toBe(computeEtag(fromGolden));
+  });
+
+  // NEGATIVE CONTROL — this is the tax, measured. It is why `servers` is optional-and-absent rather
+  // than an always-present empty array (CREW_PROTOCOL.md §11).
+  test("adding an empty `servers: []` would move every solo ETag", () => {
+    const today = JSON.stringify(soloSnapshot(soloRegistry()));
+    const taxed = JSON.stringify({ ...soloSnapshot(soloRegistry()), servers: [] });
+    expect(computeEtag(taxed)).not.toBe(computeEtag(today));
+  });
+});
+
+// ── 4. Routes ────────────────────────────────────────────────────────────────
+// §11: zero routes added, no `/crew` prefix registered. The dispatch lives inside `Bun.serve`, which
+// `bun test` cannot stand up (CLAUDE.md), so the route table is pinned by reading the source's route
+// literals. Crude, but it is the actual registration site — a new `if (pathname === "/crew/…")` in
+// server.ts fails here even though no server was started.
+
+function declaredRoutes(): string[] {
+  const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+  const exact = [...src.matchAll(/pathname === "([^"]+)"/g)].map((m) => m[1]!);
+  const prefixes = [...src.matchAll(/pathname\.startsWith\("([^"]+)"\)/g)].map((m) => `${m[1]}*`);
+  const patterns = [...src.matchAll(/^const \w*ROUTE = (\/\^.+\/);$/gm)].map((m) => m[1]!);
+  return [...new Set([...exact, ...prefixes, ...patterns])].toSorted();
+}
+
+describe("solo zero-tax — routes", () => {
+  test("server.ts registers exactly today's routes", () => {
+    expect(declaredRoutes()).toEqual([
+      "/",
+      // `focus` is the pane action that moves the OPERATOR's own terminal, and it is named here for
+      // the reason every other one is: a route arrives on purpose or it does not arrive.
+      // One content-addressed image out of a pi/omp journal's blob store — a SOLO route that
+      // legitimately extends this list, named here rather than exempted. Session-scoped and
+      // read-gated like the pane read beside it, so a `?host=` call forwards to the member whose
+      // journal named the file (CREW_PROTOCOL.md §9.1).
+      "/^\\/api\\/blobs\\/([^/]+)$/",
+      // A durable program's own history (M53 spec 11): its conversation list, and the items or a reopen of one.
+      // Session-scoped like the pane routes: an adapter without the reads answers `unsupported`, and a `?host=`
+      // call forwards to the member the program runs on.
+      "/^\\/api\\/durable\\/conversation\\/([^/]+)\\/(items|reopen)$/",
+      "/^\\/api\\/durable\\/conversations$/",
+      // Machines (ADR 0084): one machine's day of minutes, and its alert rules. A lead and a solo
+      // issance answer for every machine they keep watch over; a peer 404s (`crew.not_lead`), and none
+      // is forwardable — `bridge/crew/router.test.ts` pins all three as 404 across a link.
+      "/^\\/api\\/machines\\/([^/]+)\\/(history|alerts)$/",
+      // `changes` is the Changes view (ADR 0065): read-only git over the pane's folder, read-gated
+      // like `history` beside it and forwarded to the member that owns the pane. `chat` is the live
+      // half of `history` (journal/live.ts): the same log, asked "anything after this?" — a read, on
+      // the poll path, forwarded to the owning member and taxing a solo instance with nothing.
+      // `files` is the Files view (ADR 0083): one folder or one file under the Changes root, a read
+      // gated on an authorised device and forwarded to the owning member like `changes`.
+      // `answer` answers an ask by id (ADR 0100): a write, forwarded to the owning member, and only a
+      // pane whose adapter raises asks as data takes it, so a solo Hangar bridge answers it the refusal.
+      // `send` and `abort` name the turn the phone saw (ADR 0101): writes, forwarded the same way, and
+      // only a pane whose adapter takes guarded controls takes them; a Hangar pane gets the refusal.
+      "/^\\/api\\/pane\\/([^/]+)(?:\\/(reply|keys|upload|close|rename|history|chat|changes|files|focus|answer|send|abort|action))?$/",
+      // The slash commands Claude Code would load in the pane's cwd: a read of this machine's disk,
+      // asked only when the palette opens, so a solo instance pays nothing per poll.
+      "/^\\/api\\/pane\\/([^/]+)\\/claude-commands$/",
+      // Which paths exist under the Files root (ADR 0088), asked in one batch for the pane view's
+      // links: a read with the Files gate, one `lstat` per path, not forwarded across a crew link.
+      "/^\\/api\\/pane\\/([^/]+)\\/files\\/exist$/",
+      // One picture under the Files root, as its bytes (ADR 0090): the Files read's checks and gate,
+      // the type read off the bytes, forwarded to the owning member like `files`.
+      "/^\\/api\\/pane\\/([^/]+)\\/files\\/image$/",
+      // One Claude subagent's own JSONL transcript, read on demand when the subagent sheet opens.
+      "/^\\/api\\/pane\\/([^/]+)\\/subagent\\/([^/]+)$/",
+      // Walky talky's list for one pane (M62): the messages that reached it, newest first. A read, gated
+      // like the pane read, this issance's own panes only until spec 03 makes it forwardable.
+      "/^\\/api\\/pane\\/([^/]+)\\/walky$/",
+      // A space's rename (M53 spec 05): a write, forwarded to the owning member, and only an adapter that
+      // declares `renameSpace` takes it; every other bridge answers it the refusal.
+      "/^\\/api\\/space\\/([^/]+)\\/rename$/",
+      // The Whistle model as bytes (ADR 0096 Decision 9): a content-addressed READ, the hash compared
+      // with the held file's and never made into a path. Lead-local, not forwardable.
+      "/^\\/api\\/stt\\/model\\/([^/]+)$/",
+      "/^\\/api\\/tab\\/([^/]+)\\/(rename|close)$/",
+      // The Changes view asked by workspace (ADR 0065): the same read as the pane route's `changes`,
+      // read-gated and forwarded with `?host=` to the member that owns the space.
+      "/^\\/api\\/workspace\\/([^/]+)\\/changes$/",
+      // The Files view asked by workspace (ADR 0083): the pane route's `files`, by space, gated and
+      // forwarded the same way.
+      "/^\\/api\\/workspace\\/([^/]+)\\/files$/",
+      // The same existence check, asked by workspace (ADR 0088).
+      "/^\\/api\\/workspace\\/([^/]+)\\/files\\/exist$/",
+      // The same picture read, asked by workspace (ADR 0090).
+      "/^\\/api\\/workspace\\/([^/]+)\\/files\\/image$/",
+      // Default closed (ADR 0086): an `/api/*` path no route claims passes the read gate, pairing
+      // included, and then answers 404 instead of the SPA's app shell. Not a route of its own, and it
+      // registers nothing on the crew link.
+      "/api/*",
+      // Ask v1 (M56 spec 08): a SOLO route that legitimately extends this list, named here rather than
+      // exempted. Write-gated through the same closure a send rides, this issance's own sessions only,
+      // and a 404 when the Send Protocol is off (ISSANCE_SEND_PROTOCOL=0, on by default since spec 06). No crew route.
+      "/api/ask/*",
+      // The prompt-cache rule catalog (M28/02). A process-scoped READ, gated exactly as `/api/config`
+      // is, and the only route this feature adds. Not forwarded across the crew link.
+      "/api/cache-rules",
+      "/api/config",
+      // The Crew overview (bridge/crew/status-wire.ts) — a FRONT-DOOR route, and it legitimately
+      // extends this list rather than being exempted, exactly as pairing and STT do. It is not a
+      // crew route: `/crew/v1/*` is the link a peer answers (ADR 0013), and this is the lead's own
+      // browser answering its own operator. A solo instance registers it and 404s
+      // (`crew.not_lead`) — the same shape `/api/stt` has when no provider is configured.
+      "/api/crew",
+      // Device pairing (bridge/pairing.ts) — a SOLO feature that legitimately extends this list.
+      // It is named here, not exempted: the guard's job is that a route arrives on purpose.
+      "/api/devices",
+      "/api/devices/revoke",
+      // The new-space sheet's folder list (M40/02, #289) — two SOLO routes that legitimately extend
+      // this list, named here rather than exempted. Session-scoped through the same closure
+      // `/api/launchers` rides, the read gated as a read and the star as a write, so a `?host=` call
+      // forwards to the member whose folders they are. A solo instance registers both and answers
+      // about its own `folders.json`, which it writes only once the operator uses it (see §6 below).
+      "/api/folders",
+      // The New page's folder browser (#467) — a SOLO read beside them, named here rather than
+      // exempted. It lists folder names under home on the Files view's bound and gate (ADR 0083),
+      // writes nothing, and forwards with `?host=` like the list.
+      "/api/folders/browse",
+      "/api/folders/star",
+      // The detached updater's probe (M15/04) — a solo feature that legitimately extends this list,
+      // named here rather than exempted. It is the one ungated `/api/*` route: the prober is a local
+      // updater holding no credential, and what it answers is `{ ok, version, deposed, mode }`.
+      "/api/health",
+      // The operator's own launcher rows (`launchers.toml`) — a SOLO route that legitimately
+      // extends this list, named here rather than exempted. It is session-scoped and write-gated
+      // through the same closure `/api/workspace` rides, and the configured rows are its allowlist:
+      // the client names a row, never a command line. An operator who declares none can call it,
+      // and every call is refused.
+      "/api/launch",
+      // Remove one line from THIS machine's one-off command history, or clear it (ADR 0095): two
+      // SOLO writes that legitimately extend this list, named here rather than exempted. Session-scoped
+      // and write-gated through the same closure `/api/launch` rides, so a `?host=` call lands in that
+      // member's own `commands-recent.json`.
+      // Check one typed line before it runs (ADR 0095, amendment): a SOLO read that legitimately extends
+      // this list, named here rather than exempted. Read-gated and session-scoped through the same
+      // closure `/api/launch` rides, so a `?host=` call forwards to the member whose scan it is.
+      "/api/launch/check",
+      "/api/launch/recent/clear",
+      "/api/launch/recent/remove",
+      // This host's own launcher rows, read live off its `launchers.toml` — a SOLO route that
+      // legitimately extends this list, named here rather than exempted. Session-scoped and
+      // read-gated through the same closure `/api/launch` rides, so a `?host=` call forwards to
+      // the peer that runs the rows rather than reading the lead's own file.
+      "/api/launchers",
+      // Rows a phone adds, removes and renames on THIS machine (ADR 0094) — three SOLO writes that
+      // legitimately extend this list, named here rather than exempted. Session-scoped and write-gated
+      // through the same closure `/api/launch` rides, so a `?host=` call lands in that member's own
+      // store. A fourth path, the crew's forget (`FORGET_DEVICE_PATH`), is refused on the browser path
+      // and served on the link only, so it registers no browser route here.
+      "/api/launchers/added",
+      "/api/launchers/added/remove",
+      "/api/launchers/added/rename",
+      // Machines (ADR 0084): the list with each machine's latest sample. A read, gated as one.
+      "/api/machines",
+      // The prompt-cache watch list (M28/03, ADR 0042). Three SOLO routes in the notifications family,
+      // named here rather than exempted: the preference lives on the issance holding the subscription, so
+      // none of the three is forwardable and `bridge/crew/router.test.ts` pins all three as 404 across a
+      // link. A solo instance registers them and answers about its own panes.
+      "/api/notifications/cache-watch",
+      "/api/notifications/cache-watch/forget",
+      "/api/notifications/cache-watch/list",
+      "/api/notifications/prefs",
+      "/api/notifications/snooze",
+      // The Crew overview (bridge/crew/status-wire.ts) — a FRONT-DOOR route, and it legitimately
+      // extends this list rather than being exempted, exactly as pairing and STT do. It is not a
+      // crew route: `/crew/v1/*` is the link a peer answers (ADR 0013), and this is the lead's own
+      // browser answering its own operator. A solo instance registers it and 404s
+      // (`crew.not_lead`) — the same shape `/api/stt` has when no provider is configured.
+      "/api/pair",
+      // "Look now" (ADR 0031) — a SOLO route that legitimately extends this list, named here rather
+      // than exempted. It is session-scoped and read-gated, and it registers no crew route of its
+      // own: a lead reaches a peer's through the peer's existing `/crew/v1/*` dispatch.
+      "/api/refresh",
+      // The Send Protocol (M56 spec 05): a SOLO route that legitimately extends this list, named here
+      // rather than exempted. Write-gated through the same closure a reply rides, this issance's own
+      // sessions only, and a 404 only when the operator set ISSANCE_SEND_PROTOCOL=0 (the flag is on by
+      // default since spec 06). No crew route.
+      "/api/send",
+      // The Cancel on a queued row (M56 spec 15): `DELETE /api/send/<id>`, write-gated like a send, this
+      // issance's own sessions only. No crew route.
+      "/api/send/*",
+      "/api/send/receipts",
+      // Sent (ADR 0107): this machine's record of shell lines, one read and two writes, three SOLO routes
+      // that legitimately extend this list, named here rather than exempted. Session-scoped through the
+      // same closure `/api/launch` rides, the read on the read gate and the writes on the write gate, so
+      // a `?host=` call reaches that member's own `sent.jsonl`. A solo instance registers all three and
+      // answers about its own file, which it writes only once a shell line is kept (see §6 below).
+      "/api/sent",
+      "/api/sent/clear",
+      "/api/sent/remove",
+      "/api/snapshot",
+      // Speech-to-text (bridge/stt/) — a SOLO feature that legitimately extends this list, named
+      // here rather than exempted, exactly as device pairing is. It is off until an operator
+      // configures a provider, and it registers no crew route.
+      "/api/stt",
+      // The host's speech provider (ADR 0097): a SOLO route that legitimately extends this list, named
+      // here rather than exempted. Lead-local like `/api/stt`, its write gated like it, not forwardable.
+      // A bridge whose operator never opens Settings → Voice runs nothing and writes nothing through it.
+      "/api/stt/host",
+      // The Whistle model (ADR 0096): a SOLO route that legitimately extends this list, named here
+      // rather than exempted. Lead-local like `/api/stt`, gated like it, and not forwardable. A bridge
+      // whose operator never taps "Download to host" downloads nothing and writes nothing through it.
+      "/api/stt/whistle",
+      "/api/subscribe",
+      // Surface shadow mode's debug read (M56 spec 04): a SOLO route that legitimately extends this
+      // list, named here rather than exempted. Read-gated, this issance's own sessions only, and a 404
+      // unless the operator set ISSANCE_SURFACE_SHADOW=1. It registers no crew route.
+      "/api/surface",
+      "/api/tab",
+      // Starting an update from the phone (M15/05) — a SOLO route that legitimately extends this
+      // list, named here rather than exempted. Write-gated through the same closure a send rides,
+      // and it registers no crew sibling: a peer is levelled from the lead's terminal
+      // (`issance crew update`), never over the link (ADR 0016).
+      "/api/update",
+      // "Go back now" from Edge to Stable (M60 spec 01) — solo, no crew sibling, for the rollback
+      // route's reason.
+      "/api/update/back",
+      "/api/update/check",
+      // Closing the update band (M17/08) — solo, no crew sibling: it writes the lead's own update
+      // record, and the band a peer's operator closes is that machine's own decision.
+      "/api/update/dismiss",
+      // This machine's release line, Stable or Edge (M60 spec 01) — solo, no crew sibling: a member
+      // takes its lead's line from §20's `X-Crew-Lead-Line`, never over a route.
+      "/api/update/line",
+      // Rolling back from the phone (M60 spec 01) — solo, no crew sibling, for the update route's
+      // reason: it moves this machine's own build. The crew follows the lead's rollback over §20's
+      // headers, never over a route of its own.
+      "/api/update/rollback",
+      // The digest's "remind me next digest" dismiss — solo, no crew sibling: it writes the lead's
+      // own notify record, and a peer never pushes an update notification of its own.
+      "/api/update/snooze",
+      // Walky talky (M62): a message from the phone as an operator (a write under the device gate), and
+      // the list of reachable targets (a read). SOLO routes; an address on another member is the crew
+      // seam's business, never a route here.
+      "/api/walky",
+      "/api/walky/who",
+      "/api/workspace",
+      // The New sheet's branch from a FOLDER (M48, ADR 0093): the plan it shows before Start, and the
+      // create. Two SOLO routes, named here rather than exempted. Session-scoped through the gate and
+      // lead-local like the worktree create: neither is forwardable.
+      "/api/worktree",
+      "/api/worktree/plan",
+      "/auth",
+      "/auth/*",
+    ]);
+  });
+
+  // §11's actual promise, and it is about the PREFIX: `/crew/v1/*` is not routed here on any
+  // instance, solo or otherwise — it is declared in `bridge/crew/router.ts` and reached through the
+  // `crewRouter` closure, which is what lets this file prove by grep that server.ts names no crew
+  // path. A front-door route whose NAME merely contained the word would be a different thing
+  // entirely and would be pinned by the list above; matching on the substring would have conflated
+  // the two.
+  //
+  // 1.7.0's prefix is asserted too, and since 1.9.0 dropped the overlap (ADR 0039) it is absent on
+  // both counts: server.ts never named it, and now nothing routes it either.
+  test("no crew prefix is routed at all, and 1.7.0's is gone with the overlap", () => {
+    const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    expect(declaredRoutes().filter((r) => r.startsWith("/crew") || r.startsWith("/pack"))).toEqual([]);
+    expect(src).not.toMatch(/"\/crew/);
+    expect(src).not.toMatch(/"\/pack/);
+  });
+});
+
+// ── 5. Config: no crew keys, no crew env ─────────────────────────────────────
+
+const CONFIG_KEYS = {
+  mux: true,
+  muxEndpoint: true,
+  tmuxBin: true,
+  zellijBin: true,
+  ternBin: true,
+  socketPath: true,
+  dialMode: true,
+  auditContent: true,
+  redact: true,
+  sent: true,
+  commandsFile: true,
+  keysFile: true,
+  quickRepliesFile: true,
+  themeFile: true,
+  fontsDir: true,
+  launchersFile: true,
+  cacheRulesFile: true,
+  maxUploadBytes: true,
+  port: true,
+  host: true,
+  pollMs: true,
+  pollIdleMs: true,
+  notifyDelayMs: true,
+  readLines: true,
+  transcript: true,
+  journalRoots: true,
+  submitKeys: true,
+  trustedUser: true,
+  trustedUserOptional: true,
+  deviceHeader: true,
+  deviceAllowlist: true,
+  allowedOrigins: true,
+  publicHosts: true,
+  tailscaleHosts: true,
+  allowAnyHost: true,
+  allowNonLoopbackBind: true,
+  vapidPublic: true,
+  vapidPrivate: true,
+  vapidSubject: true,
+  stateDir: true,
+  multiSession: true,
+  surfaceShadow: true,
+  sendProtocol: true,
+  walky: true,
+  skipServe: true,
+  basePath: true,
+  uploadExtraTypes: true,
+  cacheWarnSeconds: true,
+  accessTeam: true,
+  accessAud: true,
+} satisfies Record<keyof Config, true>;
+
+describe("solo zero-tax — config", () => {
+  test("Config carries no crew/peer/lead key", () => {
+    const keys = Object.keys(CONFIG_KEYS).toSorted();
+    expect(keys).toEqual([
+      "accessAud",
+      "accessTeam",
+      "allowAnyHost",
+      "allowNonLoopbackBind",
+      "allowedOrigins",
+      "auditContent",
+      "basePath",
+      "cacheRulesFile",
+      "cacheWarnSeconds",
+      "commandsFile",
+      "deviceAllowlist",
+      "deviceHeader",
+      "dialMode",
+      "fontsDir",
+      "host",
+      "journalRoots",
+      "keysFile",
+      "launchersFile",
+      "maxUploadBytes",
+      "multiSession",
+      "mux",
+      "muxEndpoint",
+      "notifyDelayMs",
+      "pollIdleMs",
+      "pollMs",
+      "port",
+      "publicHosts",
+      "quickRepliesFile",
+      "readLines",
+      "redact",
+      "sendProtocol",
+      "sent",
+      "skipServe",
+      "socketPath",
+      "stateDir",
+      "submitKeys",
+      "surfaceShadow",
+      "tailscaleHosts",
+      "ternBin",
+      "themeFile",
+      "tmuxBin",
+      "transcript",
+      "trustedUser",
+      "trustedUserOptional",
+      "uploadExtraTypes",
+      "vapidPrivate",
+      "vapidPublic",
+      "vapidSubject",
+      // Walky talky (M62): whether this machine takes messages for its panes. A solo switch, on by default.
+      "walky",
+      "zellijBin",
+    ]);
+    expect(keys.filter((k) => /crew|peer|lead|federat/i.test(k))).toEqual([]);
+  });
+
+  test("loadConfig with a bare environment produces exactly those keys and one loopback port", () => {
+    const cfg = loadConfig();
+    expect(Object.keys(cfg).toSorted()).toEqual(Object.keys(CONFIG_KEYS).toSorted());
+    // §11 "Ports opened": exactly one, loopback.
+    expect(cfg.host).toBe("127.0.0.1");
+    expect(Number.isInteger(cfg.port)).toBe(true);
+  });
+
+  test("the poll cadence defaults are unchanged — no second timer to configure", () => {
+    // §11 "Poll cadence". Env is not scrubbed here (a deployment may override), so assert the
+    // defaults from the source rather than from a live env.
+    const src = readFileSync(join(import.meta.dir, "config.ts"), "utf8");
+    expect(src).toContain('envInt("ISSANCE_POLL_MS", 1500');
+    expect(src).toContain('envInt("ISSANCE_POLL_IDLE_MS", 12_000');
+  });
+
+  // Read from `bridge/config-schema.ts` rather than by grepping `config.ts`'s source, because the
+  // schema is now the single declaration of what every setting is (ADR 0040). The rows that carry a
+  // `configField` are exactly the settings `loadConfig` resolves, which is the list §11 pins. A
+  // CONFIG FILE ADDS NO ENV KEY, so this list is the 38 names it has always been plus `ISSANCE_BASE_PATH` (ADR 0052), `ISSANCE_MUSE_ROOT`, `ISSANCE_OPENCLAW_ROOT` (#401), the two `ISSANCE_ACCESS_*` keys (ADR 0081) and `ISSANCE_SENT` (ADR 0107) — the two
+  // `ISSANCE_MUX_ENDPOINT_<NAME>` rows collapse back to the prefix the old grep saw, because the env
+  // name is built at the call site and the file key must not be.
+  test("the schema names exactly today's ISSANCE_* env keys — no crew enrollment key", () => {
+    const keys = [
+      ...new Set(
+        CONFIG_SETTINGS.filter((s) => s.configField !== undefined && s.env.startsWith("ISSANCE_")).map(
+          (s) => (s.env.startsWith("ISSANCE_MUX_ENDPOINT_") ? "ISSANCE_MUX_ENDPOINT_" : s.env),
+        ),
+      ),
+    ].toSorted();
+    expect(keys).toEqual([
+      "ISSANCE_ACCESS_AUD",
+      "ISSANCE_ACCESS_TEAM",
+      "ISSANCE_ALLOWED_ORIGINS",
+      "ISSANCE_ALLOW_ANY_HOST",
+      "ISSANCE_ALLOW_NON_LOOPBACK_BIND",
+      "ISSANCE_AUDIT_CONTENT",
+      "ISSANCE_BASE_PATH",
+      "ISSANCE_CACHE_WARN_SECONDS",
+      "ISSANCE_CODEX_ROOT",
+      "ISSANCE_DEVICE_ALLOWLIST",
+      "ISSANCE_DEVICE_HEADER",
+      "ISSANCE_GROK_ROOT",
+      "ISSANCE_HERDR_DIAL",
+      "ISSANCE_HERMES_ROOT",
+      "ISSANCE_HOST",
+      "ISSANCE_MAX_UPLOAD_MB",
+      "ISSANCE_MULTI_SESSION",
+      "ISSANCE_MUSE_ROOT",
+      "ISSANCE_MUX",
+      "ISSANCE_MUX_ENDPOINT_",
+      "ISSANCE_NOTIFY_DELAY_MS",
+      "ISSANCE_OPENCLAW_ROOT",
+      "ISSANCE_OPENCODE_ROOT",
+      "ISSANCE_PI_ROOT",
+      "ISSANCE_POLL_IDLE_MS",
+      "ISSANCE_POLL_MS",
+      "ISSANCE_PORT",
+      "ISSANCE_PUBLIC_HOSTS",
+      "ISSANCE_READ_LINES",
+      "ISSANCE_REDACT",
+      "ISSANCE_SEND_PROTOCOL",
+      "ISSANCE_SENT",
+      "ISSANCE_SKIP_SERVE",
+      "ISSANCE_STATE_DIR",
+      "ISSANCE_SUBMIT_KEYS",
+      "ISSANCE_SURFACE_SHADOW",
+      "ISSANCE_TAILSCALE_HOSTS",
+      "ISSANCE_TERN_BIN",
+      "ISSANCE_TMUX_BIN",
+      "ISSANCE_TRANSCRIPT",
+      "ISSANCE_TRANSCRIPT_ROOT",
+      "ISSANCE_TRUSTED_USER",
+      "ISSANCE_TRUSTED_USER_OPTIONAL",
+      "ISSANCE_UPLOAD_EXTRA_TYPES",
+      "ISSANCE_VAPID_PRIVATE",
+      "ISSANCE_VAPID_PUBLIC",
+      "ISSANCE_VAPID_SUBJECT",
+      "ISSANCE_WALKY",
+      "ISSANCE_ZELLIJ_BIN",
+    ]);
+  });
+});
+
+// ── 6. Files written ─────────────────────────────────────────────────────────
+// §11: a solo instance writes exactly today's set — no key, no certificate, no trust store, no
+// roster. Two assertions, because neither alone is enough: driving the stores proves what actually
+// lands on disk; scanning the source proves no OTHER module has a `<stateDir>/…` writer at all.
+
+/** Every `<stateDir>/…` path any bridge module names. `uploads` is a directory, the rest are files. */
+const STATE_DIR_ENTRIES = [
+  // Windows only (M43 spec 04): the access lists issance saved before it changed one, so the change can
+  // be undone with `icacls /restore`. Absent until the bridge actually repaired a loose folder or file;
+  // never on Linux or macOS, and never on a Windows install whose folders were private already.
+  "acl-backups",
+  "activity.json",
+  // One receipt per answer to an ask (ADR 0100), written before the answer leaves. Written by use and
+  // by nothing else: absent until the first answer from a phone.
+  "answer-receipts.json",
+  "audit.log",
+  // Agent beacons (M11/01) — a directory, and one no bridge module ever writes: the bridge only ever
+  // READS it, and the emitter that fills it is a CLI verb the operator installs a hook for. An
+  // instance whose operator never ran `issance hooks install` never has this directory at all.
+  "beacons",
+  // The prompt-cache watch list (M28/03). Absent until the first watch toggle or the first warning sent
+  // under the global switch — both are events, so a bridge that is merely started still writes the four
+  // entries asserted below.
+  "cache-watch.json",
+  // The one-off lines a phone ran on this machine, newest first (ADR 0095). Written by use and by
+  // nothing else: absent until the first one-off run that works.
+  "commands-recent.json",
+  // One receipt per send or abort on a durable pane (ADR 0101), written before the control leaves.
+  // Written by use and by nothing else: absent until the first one from a phone.
+  "control-receipts.json",
+  // The bridge's own log of a durable program's panes (ADR 0099), one file per pane inside this folder.
+  // Written only by a bridge that drives `ISSANCE_MUX=durable`: the factory that builds the writer is
+  // never called for Hangar, tmux or zellij, so every other instance never has this folder.
+  "durable",
+  // The push guard's memory for asks that travel as data (ADR 0100), keyed on (host, toolCallId).
+  // Written only when a pane that carries asks opens or closes one: a bridge with no durable pane,
+  // and no peer with one, never writes it.
+  "durable-asks.json",
+  // The hook edges (M56 spec 11): a spool directory the bridge takes from and empties, and one no
+  // bridge module ever writes into. The emitter behind `issance hooks install` fills it, so an instance
+  // whose operator never installed the hooks never has this directory at all.
+  "edges",
+  // The new-space sheet's folder list (M40/02, #289), and a §11 row RENEGOTIATED ON PURPOSE: it is
+  // the one entry here a solo instance's own operator writes through ordinary use, from the phone.
+  // Absent until the first space created with a folder or the first star — both are acts, and a
+  // bridge that is only started, only read, or only ever asked for spaces in home writes none of it,
+  // so the four entries asserted below hold. Driven in "the folder list appears only on use".
+  "folders.json",
+  // The hold queue (M56 spec 15): one file per send the harness could not take during its turn, kept
+  // until the pane reads free, so a restart replays it. Created with the Send Protocol, like `sends`.
+  "held",
+  // One receipt per launch the phone tagged with a request id (ADR 0091), so a retried Start never
+  // opens a second pane. Written by use and by nothing else: absent until the first launch that
+  // carries an id succeeds.
+  "launch-receipts.json",
+  // The launcher rows phones added on this machine (ADR 0094). Written by use and by nothing else:
+  // absent until the first add from a phone succeeds.
+  "launchers-added.json",
+  // The host's own read credential (bridge/local-secret.ts), a §11 row RENEGOTIATED ON PURPOSE: reads
+  // need the pairing token (ADR 0086), so the CLI's own reads of its bridge need a credential too. A
+  // started bridge writes it (one 0600 file, rotated per start) and a clean stop deletes it, so a
+  // stopped solo instance holds none. It is written in index.ts, which the stores driven below are not.
+  "local-secret",
+  // Machines (ADR 0084), a §11 row RENEGOTIATED ON PURPOSE. The alert rules are absent until the
+  // operator sets the first one. The history is written from the tick at most once every five minutes,
+  // and only once a minute has been recorded — so a solo issance that runs for five minutes writes it,
+  // and a bridge only started and stopped does not. Both are driven in "the machine files appear …".
+  "machine-alerts.json",
+  "machine-history.json",
+  "notify-prefs.json",
+  // Device pairing. Both are absent until the operator runs `issance pair`, and an install that
+  // never does keeps writing exactly the six entries above it.
+  "paired-devices.json",
+  "pairing-pending.json",
+  "push-subscriptions.json",
+  // The Send Protocol's request files and receipts (M56 spec 05), one per request id in this folder.
+  // Created by a bridge that sends text, which is the default since spec 06: with ISSANCE_SEND_PROTOCOL=0
+  // nothing builds the store, so such an instance never has this folder.
+  "sends",
+  // Sent (ADR 0107): the shell lines a person sent through issance on this machine, one JSON record per
+  // line. Written by use and by nothing else: absent until the first line sent to a shell pane, or the
+  // first one-off run, that the skip rules keep. `ISSANCE_SENT=off` never writes it.
+  "sent.jsonl",
+  "snooze.json",
+  // One receipt per starter a phone ran on a durable program (ADR 0102). Written by use and by nothing
+  // else: absent until the first starter run, which only a peer on `ISSANCE_MUX=durable` can offer.
+  "starter-receipts.json",
+  // Speech-to-text settings. Absent until the operator runs `issance stt setup`. The bridge writes it
+  // in one case only: the Host speech provider card in Settings, which writes Whistle or Codex (after
+  // the consent) or removes the file, and only while no key, command or environment names a provider
+  // (bridge/stt/host-http.ts, ADR 0097).
+  "stt.json",
+  // The Surface counters (M56 spec 09): one counters file a day, the lab's inbox and its examples, all
+  // in this folder. Created by a bridge that computes a Surface (the Send Protocol, on by default, or
+  // ISSANCE_SURFACE_SHADOW=1) the first time it reads an agent pane or settles a send.
+  "surface",
+  // The detached updater's own stdout and stderr (#283), with the run before it kept beside it as
+  // `update-runner.log.1`. Absent until the first update started from the phone: the bridge opens it
+  // only to hand the descriptor to the runner it spawns.
+  // This machine's release line and the builds it rolled back from (M60 spec 01, ADR 0110). A NEW
+  // file, absent until the line is switched or an Edge build is rolled back from; absent reads as
+  // Stable with nothing rejected.
+  "update-line.json",
+  "update-runner.log",
+  "update-state.json",
+  // The detached updater's run record and its lock (M15/04). WRITTEN BY THE CLI, never by the
+  // bridge — `bridge/update-run.ts` only reads them, so the scan below sees the names here and no
+  // writer anywhere under `bridge/`. Absent until the first `issance update`.
+  "update.json",
+  "update.lock",
+  "uploads",
+  // The Whistle model's folder, `whistle/` (ADR 0096): the model, its manifest and a download's
+  // part file. Absent until a write device taps "Download to host" or the operator runs
+  // `issance stt whistle`; nothing else creates it.
+  // Walky talky (M62): the local socket `walky/sock` (0600, made at start like the hold socket), and
+  // the message log and per-pane inboxes, written by use and by nothing else: absent until the first
+  // message reaches this machine. On Windows the socket is not built.
+  "walky",
+  "whistle",
+  // The ref each new worktree was cut from (ADR 0089, amended). Written by use and by nothing else:
+  // absent until the first create that named a starting point succeeds. Driven in "the worktree
+  // bases appear only on use".
+  "worktree-bases.json",
+  // The New sheet's last branch choices per repo (M48). Written by use and by nothing else: absent
+  // until the first branch create from a folder succeeds.
+  "worktree-choices.json",
+  // One receipt per worktree create the phone tagged with a request id (ADR 0089), so a retried
+  // create replays instead of making a second worktree. Written by use and by nothing else: absent
+  // until the first create that carries an id succeeds. Driven in "the worktree receipts appear only
+  // on use".
+  "worktree-receipts.json",
+];
+
+/**
+ * The `<stateDir>` entries the FEDERATION modules name. Solo writes none of them — the whole point —
+ * but the scan below must still see them, or it would stop guarding the moment federation code moved
+ * one directory down.
+ *
+ * This list is a second allowlist, not an exemption: a new writer under `bridge/crew/` fails this
+ * test until it is declared here, exactly as a new writer in `bridge/` fails against the list above.
+ * The behavioural half of the guard — that an instance which never enrolled writes NONE of these —
+ * is the `TrustStore` case in "driving every solo write path".
+ */
+const CREW_STATE_DIR_ENTRIES = [
+  "crew-ops.json",
+  "crew-runtime.json",
+  "crew-trust.json",
+  // The lead's paired-device registry, synced to the DEPUTY only (RFC §6.5, CREW_PROTOCOL.md §18.14).
+  // **A solo instance can never have one**, and the reason is structural rather than a check anyone
+  // has to remember: it is written on exactly one path — a `POST /crew/v1/pairing` that cleared the
+  // crew's two factors, came from this issance's own pinned LEAD, and found a verified warrant naming
+  // THIS machine as deputy. A solo instance has no trust store, so it registers no crew routes at all,
+  // so none of those three can ever be true of it.
+  //
+  // It is a separate file from `paired-devices.json` on purpose and permanently: `enforced()` is "the
+  // registry is non-empty", so merging the two would arm the deputy's own write gate for its own
+  // operator (`bridge/crew/standby-devices.ts`).
+  // 1.7.0's trust-store name, and the one entry on this list NOTHING here ever writes, reads or
+  // moves. `legacyStateFileNotice` (`crew/trust-store.ts`, ADR 0045) asks whether it is present so a
+  // state directory that never saw 1.8.x is named rather than adopted in silence. One `exists()` on
+  // the boot path, no open, no rename; a solo instance finds nothing and says nothing.
+  "pack-trust.json",
+  "standby-devices.json",
+];
+
+/** Every `.ts` module under `dir`, recursively, excluding tests. */
+function sourceFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...sourceFiles(full));
+    else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) out.push(full);
+  }
+  return out;
+}
+
+/** Every `<stateDir>/…` entry a module names, however the state dir and the name reached it. */
+function stateDirEntriesNamedBy(files: string[]): string[] {
+  const named = new Set<string>();
+  for (const f of files) {
+    const src = readFileSync(f, "utf8");
+    // Broader than the original `cfg.stateDir` + string-literal scan, in two directions, because a
+    // writer using either other form would have slipped past it entirely:
+    //  • the state dir arrives as `cfg.stateDir`, `this.cfg.stateDir` or a bare `stateDir` param;
+    //  • the entry name may be a string literal or a `const NAME = "…"` in the same module.
+    const constants = new Map(
+      [...src.matchAll(/^(?:export )?const ([A-Z][A-Z0-9_]*) = "([^"]+)";$/gm)].map((m) => [m[1]!, m[2]!]),
+    );
+    for (const m of src.matchAll(/join\([^)]*stateDir,\s*(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))\)/g)) {
+      const literal = m[1] ?? (m[2] === undefined ? undefined : constants.get(m[2]));
+      if (literal !== undefined) named.add(literal);
+      else if (m[2] !== undefined) {
+        throw new Error(`${f}: <stateDir>/${m[2]} — the scan cannot resolve that name, so it cannot guard it`);
+      }
+    }
+  }
+  return [...named].toSorted();
+}
+
+describe("solo zero-tax — the filesystem", () => {
+  test("the bridge names exactly today's <stateDir> entries and nothing else", () => {
+    const files = sourceFiles(import.meta.dir).filter((f) => !f.includes(`${sep}crew${sep}`));
+    expect(stateDirEntriesNamedBy(files)).toEqual(STATE_DIR_ENTRIES);
+  });
+
+  test("the federation modules name only their own declared entries", () => {
+    // Scanned separately rather than merged in, so the two sets can never be confused for each
+    // other: anything here is a file a solo instance must be proven never to create.
+    const files = sourceFiles(join(import.meta.dir, "crew"));
+    expect(stateDirEntriesNamedBy(files)).toEqual(CREW_STATE_DIR_ENTRIES);
+    expect(CREW_STATE_DIR_ENTRIES.filter((e) => STATE_DIR_ENTRIES.includes(e))).toEqual([]);
+  });
+
+  test("driving every solo write path produces only known files", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "issance-solo-baseline-"));
+    try {
+      const cfg: Config = { ...loadConfig(), stateDir };
+      await new Snooze(cfg, () => TS).set(TS + 60_000);
+      await new NotifyPrefsStore(cfg).set({ blocked: false });
+      // The folder list, loaded as index.ts loads it at startup and fed the two things an idle solo
+      // bridge sees: a space created in home, and nothing at all. Neither is an entry, so no file.
+      const folders = new FolderStore(cfg, "/home/op");
+      await folders.load();
+      await folders.recordRecent("/home/op");
+      await folders.recordRecent("");
+      const ledger = new ActivityLedger({ stateDir }, () => TS, 60 * 60 * 1000);
+      ledger.ensure("default", "w1:p1");
+      await ledger.flush();
+      new AuditLog(fileAuditAppender(join(stateDir, "audit.log")), { now: () => TS }).record({
+        action: "reply",
+        paneId: "w1:p1",
+        detail: { text: "ok" },
+      });
+      // The trust store, resolved exactly as index.ts resolves it at startup. A solo instance has
+      // never enrolled, so this must open a file that isn't there and create NOTHING — not the
+      // store, not a key, not a default. §11's "Files written" row, driven rather than read.
+      expect(await new TrustStore(stateDir).load()).toBeNull();
+      // The audit append is fire-and-forget; let its microtask + write land.
+      await Bun.sleep(20);
+      const written = (await readdir(stateDir)).toSorted();
+      expect(written).toEqual(["activity.json", "audit.log", "notify-prefs.json", "snooze.json"]);
+      expect(written.filter((f) => !STATE_DIR_ENTRIES.includes(f))).toEqual([]);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  // §11's "Files written" row, amended on purpose by M40/02: `folders.json` is written by use and by
+  // nothing else. Driven, so the amendment is a fact about the store rather than a sentence.
+  test("the folder list appears only on use: a create with a folder, or a star", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "issance-solo-baseline-"));
+    try {
+      const folders = new FolderStore({ stateDir }, "/home/op");
+      await folders.load();
+      expect(await readdir(stateDir)).toEqual([]);
+      await folders.recordRecent("/home/op/proj");
+      expect(await readdir(stateDir)).toEqual(["folders.json"]);
+      expect(STATE_DIR_ENTRIES).toContain("folders.json");
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  // The same shape for the worktree receipts (ADR 0089): loading writes nothing, a create with a
+  // request id writes the one file.
+  test("the worktree receipts appear only on use: a create that carries a request id", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "issance-solo-baseline-"));
+    try {
+      const receipts = new WorktreeReceiptStore(stateDir);
+      await receipts.load();
+      expect(await readdir(stateDir)).toEqual([]);
+      await receipts.record({
+        requestId: "0b9e6a1c-3f2d-4c5e-8a7b-1d2e3f4a5b6c",
+        at: 1,
+        workspaceId: "w2",
+        paneId: "w2:p1",
+        path: "/home/op/repo/.worktrees/x",
+        branch: "worktree/x",
+        launcherStarted: false,
+      });
+      expect(await readdir(stateDir)).toEqual(["worktree-receipts.json"]);
+      expect(STATE_DIR_ENTRIES).toContain("worktree-receipts.json");
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  // The same shape for the worktree bases (ADR 0089, amended): loading writes nothing, a create that
+  // named a starting point writes the one file.
+  test("the worktree bases appear only on use: a create that named a starting point", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "issance-solo-baseline-"));
+    try {
+      const bases = new WorktreeBaseStore(stateDir);
+      await bases.load();
+      expect(await readdir(stateDir)).toEqual([]);
+      await bases.record("/home/op/repo/.worktrees/x", { base: "main", createdAt: 1 });
+      expect(await readdir(stateDir)).toEqual(["worktree-bases.json"]);
+      expect(STATE_DIR_ENTRIES).toContain("worktree-bases.json");
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  // The same shape for Sent (ADR 0107): building the store writes nothing, a skipped line writes
+  // nothing, the switch off writes nothing, and the first kept line writes the one file.
+  test("Sent appears only on use: a shell line the skip rules keep", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "issance-solo-baseline-"));
+    try {
+      const off = new SentStore(sentFileIo(stateDir), { off: true, home: "/home/op" });
+      expect(await off.record("git status", "/home/op/proj", "shell")).toBe("skipped");
+      const sent = new SentStore(sentFileIo(stateDir), { home: "/home/op" });
+      expect(await sent.record(" git status", "/home/op/proj", "shell")).toBe("skipped");
+      expect(await sent.record("export AWS_SECRET_ACCESS_KEY=x", "/home/op/proj", "shell")).toBe("skipped");
+      expect(await sent.clear()).toBe(0);
+      expect(await readdir(stateDir)).toEqual([]);
+      expect(await sent.record("git status", "/home/op/proj", "shell")).toBe("recorded");
+      expect(await readdir(stateDir)).toEqual(["sent.jsonl"]);
+      expect(STATE_DIR_ENTRIES).toContain("sent.jsonl");
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// §11's "Files written" row, amended on purpose by ADR 0084, and driven like the folder list above:
+// the watch exactly as index.ts builds it on a solo issance, over a temp state folder.
+describe("solo zero-tax — the machine files", () => {
+  test("the history appears on the first save after five minutes of samples; the rules only on a rule", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "issance-solo-baseline-"));
+    try {
+      let now = TS;
+      const watch = new MachineWatch({
+        now: () => now,
+        roster: () => machineRosterOf(null, { id: SOLO_MACHINE_ID, name: "solo" }),
+        history: await loadMachineHistory(stateDir, now),
+        alerts: await MachineAlertStore.load(stateDir),
+        saveHistory: (history, at) => saveMachineHistory(stateDir, history, at),
+        muted: () => false,
+        enabled: () => true,
+        send: () => {},
+      });
+      // Started, ticked, and stopped with nothing sampled: nothing on disk.
+      watch.tick();
+      await watch.flush();
+      expect(await readdir(stateDir)).toEqual([]);
+
+      // Sampled for a while, but inside the five-minute save interval: still nothing.
+      const sample = { cpu: 0.2, cores: 4, memUsed: 1e9, memTotal: 8e9 };
+      for (let i = 0; i < 4; i++) {
+        watch.observe(SOLO_MACHINE_ID, sample, now);
+        now += 60_000;
+        watch.tick();
+      }
+      await Bun.sleep(5);
+      expect(await readdir(stateDir)).toEqual([]);
+
+      now += 60_000;
+      watch.observe(SOLO_MACHINE_ID, sample, now);
+      watch.tick();
+      // The tick's save is already on the chain and the history is no longer dirty, so flush waits for
+      // that write and adds none. A fixed sleep listed the folder mid-rename on Windows (the .tmp file).
+      await watch.flush();
+      expect(await readdir(stateDir)).toEqual(["machine-history.json"]);
+
+      await watch.setAlerts(SOLO_MACHINE_ID, { cpu: { above: 0.9, forMin: 10 } });
+      expect((await readdir(stateDir)).toSorted()).toEqual(["machine-alerts.json", "machine-history.json"]);
+      expect((await readdir(stateDir)).filter((f) => !STATE_DIR_ENTRIES.includes(f))).toEqual([]);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── 7. Notification tags and push payload ────────────────────────────────────
+
+describe("solo zero-tax — notifications", () => {
+  test("the primary session keeps the bare issance:herd tag", () => {
+    expect(herdTagFor(true, "default")).toBe("issance:herd");
+    // Whatever the primary is NAMED, its tag stays bare — the name never enters the solo tag.
+    expect(herdTagFor(true, "work")).toBe("issance:herd");
+  });
+
+  test("push.ts stamps `session` and `host` only when the message names one", () => {
+    // Pinned at the source, because Push.send needs the web-push module to broadcast. The shape of
+    // the `data` payload is the contract an installed service worker already caches.
+    //
+    // ── RENEGOTIATED BY M4/06, THE SAME WAY THE WIRE-TYPE ROWS WERE BY M4/04 ──
+    // This assertion used to read `expect(src).not.toMatch(/data\.host/)`. It was a source-text
+    // PROXY for the row it defends — "push payload unchanged: no `host` field, mirroring how
+    // `session` is stamped only for non-primary" (§11) — written before there was a host to stamp.
+    // The row itself is intact and is now pinned where it belongs: `host` is conditional exactly as
+    // `session` is, so a solo instance (which never has a host) emits the identical bytes, and
+    // `push.test.ts` asserts the produced `data` object for both cases rather than the source that
+    // builds it. What would be a real regression is an UNCONDITIONAL stamp — hence the two
+    // `if (… !== undefined)` lines below being the pinned form.
+    const src = readFileSync(join(import.meta.dir, "push.ts"), "utf8");
+    expect(src).toContain("if (msg.session !== undefined) data.session = msg.session;");
+    expect(src).toContain("if (msg.host !== undefined) data.host = msg.host;");
+    // Never stamped unconditionally: an unguarded assignment is what would change the solo payload.
+    const stamps = src.split(/\r?\n/).filter((l) => l.includes("data.host"));
+    expect(stamps).toEqual(["    if (msg.host !== undefined) data.host = msg.host;"]);
+  });
+
+  test("a solo payload has no host: the sink stamps it only when a host is named", async () => {
+    // The behavioural half of the row above, at the layer that decides: `makeNotifySink` is what
+    // every local session's coordinator renders through, and a solo instance passes it no host.
+    const { makeNotifySink } = await import("./notifications.ts");
+    const sent: PushMessage[] = [];
+    const sink = makeNotifySink({ send: (m: PushMessage) => sent.push(m) }, { isMuted: () => false }, "issance:herd");
+    sink.render({
+      title: "claude needs you",
+      titleCode: "agent.blocked",
+      titleDetail: { agent: "claude" },
+      body: "demo · /home/you",
+      paneId: "p1",
+      renotify: true,
+    });
+    sink.clear();
+    expect(sent).toEqual([
+      {
+        title: "claude needs you",
+        titleCode: "agent.blocked",
+        titleDetail: { agent: "claude" },
+        body: "demo · /home/you",
+        tag: "issance:herd",
+        paneId: "p1",
+        renotify: true,
+      },
+      { type: "clear", tag: "issance:herd" },
+    ]);
+    expect(sent.every((m) => !("host" in m))).toBe(true);
+  });
+});
+
+// ── 8. Audit lines ───────────────────────────────────────────────────────────
+
+const AUDIT_ENTRIES: AuditEntry[] = [
+  { action: "reply", paneId: "w1:p1", detail: { text: "ship it" } },
+  { action: "keys", paneId: "w1:p1", detail: { keys: ["ctrl+c"] } },
+  { action: "tab.create", detail: { workspaceId: "w1" } },
+  { action: "pane.close", paneId: "w1:p3", session: "issance-demo", detail: {} },
+  { action: "upload", paneId: "w1:p1", device: "phone", detail: { filename: "shot.png", size: 1234 } },
+];
+
+describe("solo zero-tax — audit lines", () => {
+  test("format exactly as they do today: `host` absent, not null", () => {
+    const lines = AUDIT_ENTRIES.map((e) => formatAuditLine(e, TS)).join("\n");
+    expectGolden("audit.jsonl", `${lines}\n`);
+    expect(lines).not.toMatch(/"host"/);
+  });
+});

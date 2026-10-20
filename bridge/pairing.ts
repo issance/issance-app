@@ -1,0 +1,874 @@
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+
+import type { JsonObject, JsonValue } from "./json.ts";
+
+// ── DEVICE PAIRING: A CREDENTIAL THE DEVICE HOLDS, NOT A NAME THE NETWORK ASSERTS ─────────────
+//
+// The pre-existing write gate (ISSANCE_DEVICE_HEADER + ISSANCE_DEVICE_ALLOWLIST, bridge/server.ts
+// `deviceAuth`) trusts a header a proxy injects: the device is whoever the tailnet says it is. That
+// is only as good as the proxy's sanitisation and the identity provider's naming, and it cannot be
+// revoked from the phone that lost the device. This module adds the other kind of proof — a bearer
+// credential the device itself holds — on the same reasoning the crew link already runs on: network
+// position is not identity (ADR 0013).
+//
+// The two gates are INDEPENDENT and compose by AND. Configuring one says nothing about the other,
+// and the header gate's behaviour here is unchanged in every case.
+//
+// ── ENROLMENT ────────────────────────────────────────────────────────────────────────────────
+// `bin/issance pair` mints a one-time code, writes its HASH (never the code) to
+// `<stateDir>/pairing-pending.json`, and prints the code to the operator's terminal. The phone posts
+// `{code,label}` to `/api/pair`, which mints a 256-bit token, stores only its SHA-256 in
+// `<stateDir>/paired-devices.json`, and returns the token exactly once. The bridge re-reads both
+// files at request time, so a pairing minted by the CLI needs no `systemctl restart`.
+//
+// ── WHY EVERY SIDE EFFECT IS INJECTED ────────────────────────────────────────────────────────
+// The whole of this module is reachable from `bun test` (CLAUDE.md: Bun.serve/Bun.connect code is
+// not). Nothing below opens a file itself — {@link PairingIo} is the only door out, and
+// {@link filePairingIo} is the one implementation that touches a disk.
+
+/** File under the state dir holding the pending (unclaimed) pairing code. */
+export const PENDING_FILENAME = "pairing-pending.json";
+/** File under the state dir holding the paired-device registry. */
+export const DEVICES_FILENAME = "paired-devices.json";
+
+/** How long a minted code stays claimable. */
+export const CODE_TTL_MS = 10 * 60 * 1000;
+/** Wrong-code attempts before the pending pairing is destroyed. */
+export const CODE_ATTEMPTS = 5;
+/** Codes are this many characters. */
+export const CODE_LENGTH = 8;
+/**
+ * The code alphabet, with every glyph pair a human mistypes removed: no `0`/`O`, no `1`/`I`/`L`,
+ * no `U`/`V`. The operator reads this off a terminal and types it on a phone keyboard.
+ */
+export const CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTWXYZ";
+
+/** At most one `lastSeenAt` write per device per this interval — a poll every 1.5s must not be a write. */
+export const SEEN_THROTTLE_MS = 60_000;
+
+/** A minted, not-yet-claimed pairing code. Only its hash is ever persisted. */
+export type PendingPairing = {
+  /** SHA-256 (hex) of the normalised code. */
+  codeHash: string;
+  /** Epoch ms after which the CODE is dead. Nothing to do with the token's own lifetime below. */
+  expiresAt: number;
+  /** Wrong guesses left before the pending pairing is destroyed. */
+  attemptsLeft: number;
+  /**
+   * How long the TOKEN this code mints stays valid, in ms — set only by `issance pair --expires`.
+   * Carried as a lifetime rather than a date so it counts from the claim, not from the minute the
+   * operator ran the verb. Absent ⇒ the token never expires, exactly as before the flag existed.
+   * The phone never chooses it: the operator's terminal is the only writer of this file.
+   */
+  tokenLifetimeMs?: number;
+};
+
+/** One paired device. The token itself was shown once, at claim time, and is not recoverable. */
+export type PairedDevice = {
+  /** Operator-facing name, unique across the registry. */
+  label: string;
+  /** SHA-256 (hex) of the bearer token. */
+  tokenHash: string;
+  createdAt: number;
+  lastSeenAt: number;
+  /**
+   * Epoch ms from which the token is refused (M46 spec 01). OPTIONAL and absent on every device
+   * paired without `--expires`: such an entry is never given the key, on disk or in memory, so a
+   * registry written before expiry existed reads and writes back byte for byte.
+   */
+  expiresAt?: number;
+};
+
+/** The on-disk registry shape. An object (not a bare array) so it can gain keys without a migration. */
+export type PairedRegistry = {
+  devices: PairedDevice[];
+};
+
+/** A paired device as the API reports it — the hash never leaves the bridge. */
+export interface PairedDeviceWire {
+  label: string;
+  createdAt: number;
+  lastSeenAt: number;
+  /** Epoch ms the token stops working, or null for a token with no expiry. */
+  expiresAt: number | null;
+  /** True once `expiresAt` has passed. The device stays listed (and enforcing) until revoked. */
+  expired: boolean;
+  /** True for the device making this request (so the UI can say "this device"). */
+  current: boolean;
+}
+
+export const EMPTY_REGISTRY: PairedRegistry = { devices: [] };
+
+/**
+ * The registry file is THERE and cannot be read as a registry: a half-written or truncated file, a
+ * value that is not an object, a read the OS refused.
+ *
+ * Its own state, never "nobody is paired". Reading it as an empty registry turned a torn write into
+ * `403 device not paired` for every phone, and the phone answers that refusal by wiping what it
+ * stored. The gate answers `503 pairing unavailable` instead (`guard` in bridge/server.ts), which the
+ * phone reads as an outage and retries. A MISSING file is not this: that is a bridge nobody has
+ * paired with yet, and the empty registry is the truth.
+ */
+export class RegistryUnreadableError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "RegistryUnreadableError";
+  }
+}
+
+/** Whether an error is a missing file (`ENOENT`) — the one read failure that means "no registry". */
+function isMissing(err: Error): boolean {
+  return "code" in err && err.code === "ENOENT";
+}
+
+/**
+ * A parsed registry file, or the error that says it is not one. Only the outer shape is checked here:
+ * an object. The entries inside are {@link coerceRegistry}'s, which drops an incomplete one, because
+ * a hand-edited entry is a reason to lose THAT device, not to call the whole store unreadable.
+ */
+function registryValue(value: JsonValue): JsonValue {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new RegistryUnreadableError(`${DEVICES_FILENAME} is not a registry object`);
+  }
+  return value;
+}
+
+// ── Pure helpers ─────────────────────────────────────────────────────────────────────────────
+
+/** SHA-256 as lowercase hex. Used for both codes and tokens — never store either in the clear. */
+export function sha256Hex(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+/**
+ * Compare two hex digests without leaking where they diverge. Both are SHA-256 output, so they are
+ * always the same length here; a length mismatch (a corrupted file) is a plain `false` rather than a
+ * throw from `timingSafeEqual`.
+ */
+export function hashesEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+}
+
+/**
+ * Uppercase and strip everything that isn't in the alphabet, so the operator may type the code with
+ * spaces, dashes or in lower case. Deliberately NOT a spelling-correction pass (`O`→`0`): the
+ * alphabet has no confusable pairs left, so anything outside it is a typo the attempt counter should
+ * see, not a character to guess at.
+ */
+export function normalizeCode(raw: string): string {
+  return raw.toUpperCase().replace(new RegExp(`[^${CODE_ALPHABET}]`, "g"), "");
+}
+
+/** Mint a fresh code. `random` is injected so the generator is testable and deterministic. */
+export function generateCode(random: (n: number) => Buffer = randomBytes): string {
+  // Rejection-free and unbiased enough: one byte per character, modulo an alphabet that divides
+  // 256 unevenly, biases the first few glyphs by <1.5% — which changes nothing for a code that
+  // lives 10 minutes behind a 5-attempt counter. Drawn a byte at a time so a short read is loud.
+  const bytes = random(CODE_LENGTH);
+  let out = "";
+  for (let i = 0; i < CODE_LENGTH; i++) out += CODE_ALPHABET[bytes[i]! % CODE_ALPHABET.length];
+  return out;
+}
+
+/** Mint a 256-bit bearer token, base64url. This is the only time the token exists in the clear. */
+export function generateToken(random: (n: number) => Buffer = randomBytes): string {
+  return random(32).toString("base64url");
+}
+
+/**
+ * A fresh pending pairing for `code`, expiring `ttlMs` from `now`. `tokenLifetimeMs` is the lifetime
+ * of the token the code will mint, and is written only when given — a plain `issance pair` leaves the
+ * file exactly as it always was.
+ */
+export function newPending(
+  code: string,
+  now: number,
+  ttlMs = CODE_TTL_MS,
+  tokenLifetimeMs?: number,
+): PendingPairing {
+  const pending: PendingPairing = {
+    codeHash: sha256Hex(normalizeCode(code)),
+    expiresAt: now + ttlMs,
+    attemptsLeft: CODE_ATTEMPTS,
+  };
+  if (tokenLifetimeMs !== undefined) pending.tokenLifetimeMs = tokenLifetimeMs;
+  return pending;
+}
+
+// ── Token lifetimes (M46 spec 01) ────────────────────────────────────────────────────────────
+
+/** Longest lifetime `--expires` accepts: ten years. Past that it is "never", which is no flag. */
+export const MAX_LIFETIME_MS = 3650 * 24 * 60 * 60 * 1000;
+
+/** Milliseconds per `--expires` unit, or undefined for anything that is not one. */
+function lifetimeUnitMs(unit: string): number | undefined {
+  switch (unit.toLowerCase()) {
+    case "h":
+      return 60 * 60 * 1000;
+    case "d":
+      return 24 * 60 * 60 * 1000;
+    case "w":
+      return 7 * 24 * 60 * 60 * 1000;
+    default:
+      return undefined;
+  }
+}
+
+export type LifetimeParse = { ok: true; ms: number } | { ok: false; reason: string };
+
+/**
+ * Parse an operator's `--expires` value: a whole number and one unit, `h`, `d` or `w` (`12h`,
+ * `30d`, `2w`). Zero, negative, fractional, unit-less and unknown-unit values are refused with the
+ * sentence the CLI prints.
+ *
+ * NO MINUTES, deliberately: `6m` reads as six months to as many people as it reads as six minutes,
+ * and a credential lifetime is the wrong place to find out which one the parser meant.
+ */
+export function parseLifetime(raw: string): LifetimeParse {
+  const value = raw.trim();
+  const match = /^(-?\d+)\s*([a-zA-Z]+)$/.exec(value);
+  const usage = "write a whole number and a unit: h (hours), d (days) or w (weeks), for example 30d";
+  if (!match) return { ok: false, reason: `\`${raw}\` is not a duration. To fix, ${usage}` };
+  const unit = lifetimeUnitMs(match[2]!);
+  if (unit === undefined) return { ok: false, reason: `\`${match[2]}\` is not a unit. To fix, ${usage}` };
+  const count = Number(match[1]);
+  if (!Number.isSafeInteger(count) || count <= 0) {
+    return { ok: false, reason: `\`${raw}\` is not a lifetime, it must be more than zero` };
+  }
+  const ms = count * unit;
+  if (ms > MAX_LIFETIME_MS) {
+    return { ok: false, reason: `\`${raw}\` is longer than ten years. Leave out --expires for no expiry` };
+  }
+  return { ok: true, ms };
+}
+
+/** Whether `device` carries an expiry and it has passed. A device without one never expires. */
+export function isExpired(device: { readonly label: string; readonly expiresAt?: number }, now: number): boolean {
+  return device.expiresAt !== undefined && now >= device.expiresAt;
+}
+
+/** Coerce an untrusted parsed value into a {@link PendingPairing}, or null if it isn't one. */
+export function coercePending(raw: JsonValue | undefined): PendingPairing | null {
+  if (typeof raw !== "object" || raw === null || raw === undefined || Array.isArray(raw)) return null;
+  const o: JsonObject = raw;
+  if (typeof o.codeHash !== "string" || o.codeHash === "") return null;
+  if (typeof o.expiresAt !== "number" || !Number.isFinite(o.expiresAt)) return null;
+  if (typeof o.attemptsLeft !== "number" || !Number.isFinite(o.attemptsLeft)) return null;
+  const pending: PendingPairing = {
+    codeHash: o.codeHash,
+    expiresAt: o.expiresAt,
+    attemptsLeft: Math.floor(o.attemptsLeft),
+  };
+  // A lifetime that is not a positive number is dropped, not trusted: the code still pairs, and the
+  // token it mints simply has no expiry — the shape every pairing had before the flag existed.
+  const lifetime = o.tokenLifetimeMs;
+  if (typeof lifetime === "number" && Number.isFinite(lifetime) && lifetime > 0) {
+    pending.tokenLifetimeMs = lifetime;
+  }
+  return pending;
+}
+
+/**
+ * Coerce an untrusted parsed value into a registry, dropping any entry that isn't a complete device.
+ * A half-written or hand-edited file therefore degrades to "fewer paired devices", never to a device
+ * with an empty `tokenHash` — which would otherwise authorise a caller whose token hashes to "".
+ */
+export function coerceRegistry(raw: JsonValue | undefined): PairedRegistry {
+  const o: JsonObject =
+    typeof raw === "object" && raw !== null && raw !== undefined && !Array.isArray(raw) ? raw : {};
+  const list = Array.isArray(o.devices) ? o.devices : [];
+  const devices: PairedDevice[] = [];
+  for (const d of list) {
+    if (typeof d !== "object" || d === null || Array.isArray(d)) continue;
+    if (typeof d.label !== "string" || d.label.trim() === "") continue;
+    if (typeof d.tokenHash !== "string" || d.tokenHash.length !== 64) continue;
+    if (devices.some((x) => x.label === d.label)) continue;
+    const device: PairedDevice = {
+      label: d.label,
+      tokenHash: d.tokenHash,
+      createdAt: typeof d.createdAt === "number" ? d.createdAt : 0,
+      lastSeenAt: typeof d.lastSeenAt === "number" ? d.lastSeenAt : 0,
+    };
+    // Only a present value adds the key at all — an entry from before expiry existed keeps its exact
+    // shape. `null` is read as "no expiry" (what a hand edit meaning "never" would write). Anything
+    // else that is not a finite number (a string, a date written by hand) is read as ALREADY
+    // EXPIRED, never as "no expiry": a field set to limit a credential must not turn into an
+    // unlimited one by being malformed.
+    if (d.expiresAt !== undefined && d.expiresAt !== null) {
+      device.expiresAt = typeof d.expiresAt === "number" && Number.isFinite(d.expiresAt) ? d.expiresAt : 0;
+    }
+    devices.push(device);
+  }
+  return { devices };
+}
+
+/**
+ * A registry file's text, parsed, or null when it is not a registry: not JSON, or JSON that is not an
+ * object. The bridge reads such a file as unreadable ({@link RegistryUnreadableError}) and answers
+ * `503 pairing unavailable`; `issance doctor` asks this to say so rather than "no device paired".
+ */
+export function parseRegistryText(raw: string): PairedRegistry | null {
+  try {
+    // SAFETY: `JSON.parse` output IS a JsonValue by construction; `registryValue` checks its outer
+    // shape and `coerceRegistry` every entry.
+    return coerceRegistry(registryValue(JSON.parse(raw) as JsonValue));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Control (`Cc`), format (`Cf`: bidi overrides and isolates, zero-width characters, the soft hyphen)
+ * and the two line separators (`Zl`, `Zp`). None has a place in a name that a terminal, the audit log
+ * and the UI print: they reorder or hide text, or end a line.
+ */
+const HIDDEN_LABEL_CHAR = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
+
+/** Whether `text` holds a character a label must not hold (see {@link HIDDEN_LABEL_CHAR}). */
+export function hasHiddenLabelChar(text: string): boolean {
+  return HIDDEN_LABEL_CHAR.test(text);
+}
+
+/**
+ * `label` as safe terminal text: every control, format or separator character becomes `\u{XXXX}`.
+ * Labels stored before {@link normalizeLabel} refused these characters are not migrated, so the CLI
+ * prints through this.
+ */
+export function escapeLabelForTerminal(label: string): string {
+  return label.replace(new RegExp(HIDDEN_LABEL_CHAR.source, "gu"), (c) => `\\u{${(c.codePointAt(0) ?? 0).toString(16).toUpperCase()}}`);
+}
+
+/**
+ * Validate and bound a client-supplied label. Returns null when it is unusable — the same answer for
+ * "empty" and "1 KB of newlines", because the label is echoed into the audit log and the UI.
+ */
+export function normalizeLabel(raw: JsonValue | undefined): string | null {
+  if (typeof raw !== "string") return null;
+  const flat = raw.replace(/[\r\n\t]+/g, " ");
+  // Tab, CR and LF are flattened above; any other control, format or separator character is refused.
+  // Checked before `trim`, which would quietly drop a BOM at the edge.
+  if (hasHiddenLabelChar(flat)) return null;
+  const label = flat.trim();
+  if (label === "" || label.length > 48) return null;
+  return label;
+}
+
+/** Why a claim failed. `expired`/`exhausted` mean the pending pairing is now gone. */
+export type ClaimFailure = "no-pending" | "expired" | "exhausted" | "bad-code" | "duplicate-label";
+
+export type ClaimVerdict =
+  | { ok: true }
+  /** `pending` is the state to persist, or null when the pending pairing must be deleted. */
+  | { ok: false; reason: ClaimFailure; pending: PendingPairing | null };
+
+/**
+ * The whole of the code check, as one pure decision: is this claim good, and what should the pending
+ * file look like afterwards. The caller persists the verdict; nothing here touches a disk.
+ *
+ * An expired code is destroyed rather than left to be guessed at leisure, and the last wrong attempt
+ * destroys it too — so a code is at most 5 guesses out of 29^8 (~5e11), for 10 minutes.
+ */
+export function checkClaim(
+  pending: PendingPairing | null,
+  code: string,
+  now: number,
+): ClaimVerdict {
+  if (!pending) return { ok: false, reason: "no-pending", pending: null };
+  if (now >= pending.expiresAt) return { ok: false, reason: "expired", pending: null };
+  if (pending.attemptsLeft <= 0) return { ok: false, reason: "exhausted", pending: null };
+  if (hashesEqual(pending.codeHash, sha256Hex(normalizeCode(code)))) return { ok: true };
+  const attemptsLeft = pending.attemptsLeft - 1;
+  if (attemptsLeft <= 0) return { ok: false, reason: "exhausted", pending: null };
+  return { ok: false, reason: "bad-code", pending: { ...pending, attemptsLeft } };
+}
+
+/** The device whose token hash matches, or null. Every entry is compared, in constant time each. */
+export function findByToken(registry: PairedRegistry, token: string | null): PairedDevice | null {
+  if (token === null || token === "") return null;
+  const hash = sha256Hex(token);
+  // Not short-circuited on the first match: `find` would return early, but the loop still visits
+  // every entry before that one, so the timing signal is "how far down the list you are" — which is
+  // not a secret (labels are readable) and is unrelated to the token bytes.
+  let found: PairedDevice | null = null;
+  for (const d of registry.devices) {
+    if (hashesEqual(d.tokenHash, hash)) found = d;
+  }
+  return found;
+}
+
+/** What {@link addDevice} enrols: a label, the token's hash, the moment, and an optional expiry. */
+export type Enrolment = { label: string; tokenHash: string; now: number; expiresAt?: number };
+
+/**
+ * Add a device, or null when the label is already taken (labels are the revoke handle). `expiresAt`
+ * lands on the entry only when given.
+ */
+export function addDevice(registry: PairedRegistry, device: Enrolment): PairedRegistry | null {
+  if (registry.devices.some((d) => d.label === device.label)) return null;
+  const entry: PairedDevice = {
+    label: device.label,
+    tokenHash: device.tokenHash,
+    createdAt: device.now,
+    lastSeenAt: device.now,
+  };
+  if (device.expiresAt !== undefined) entry.expiresAt = device.expiresAt;
+  return { devices: [...registry.devices, entry] };
+}
+
+/**
+ * Enrol a device through a CLAIM: like {@link addDevice}, except that an EXPIRED device under the same
+ * label is replaced instead of refused. Null when a LIVE device holds the label.
+ *
+ * Why a claim may replace an expired entry. An expired device stays listed until it is revoked, so
+ * the phone can say "pair again" (docs/security.md). The person who pairs again types the name they
+ * used before, and `addDevice` answered "A device is already using that name" about a device whose
+ * token already authenticates as nobody. The old entry is dropped and the new one appended IN THE
+ * SAME REGISTRY VALUE, so the one write that enrols the new token also revokes the old one: there is
+ * no moment with both, and none with neither. A live device's label is still refused, because
+ * replacing it would revoke a working phone on the say-so of whoever holds the current code.
+ *
+ * `replaced` is true when an expired entry went, so the caller can audit the revoke.
+ */
+export function enrolDevice(
+  registry: PairedRegistry,
+  device: Enrolment,
+): { registry: PairedRegistry; replaced: boolean } | null {
+  const holder = registry.devices.find((d) => d.label === device.label);
+  if (holder !== undefined && !isExpired(holder, device.now)) return null;
+  const rest = holder === undefined ? registry : { devices: registry.devices.filter((d) => d.label !== device.label) };
+  const next = addDevice(rest, device);
+  return next === null ? null : { registry: next, replaced: holder !== undefined };
+}
+
+/**
+ * Set (a number) or clear (null) one device's expiry, by exact label. Null when there is no such
+ * device. Clearing REMOVES the key rather than writing `null`, so a cleared entry is shaped exactly
+ * like one that never had an expiry.
+ */
+export function setDeviceExpiry(
+  registry: PairedRegistry,
+  label: string,
+  expiresAt: number | null,
+): PairedRegistry | null {
+  if (!registry.devices.some((d) => d.label === label)) return null;
+  return {
+    devices: registry.devices.map((d) => {
+      if (d.label !== label) return d;
+      const { expiresAt: _dropped, ...rest } = d;
+      return expiresAt === null ? rest : { ...rest, expiresAt };
+    }),
+  };
+}
+
+/** Drop a device by label. Returns null when there was no such device (so a caller can 404). */
+export function removeDevice(registry: PairedRegistry, label: string): PairedRegistry | null {
+  if (!registry.devices.some((d) => d.label === label)) return null;
+  return { devices: registry.devices.filter((d) => d.label !== label) };
+}
+
+/**
+ * Stamp `lastSeenAt`, or null when the previous stamp is recent enough that a write would be noise.
+ * The throttle is the whole reason this is a function: `resolve()` runs on every request.
+ */
+export function touchDevice(
+  registry: PairedRegistry,
+  label: string,
+  now: number,
+  throttleMs = SEEN_THROTTLE_MS,
+): PairedRegistry | null {
+  const device = registry.devices.find((d) => d.label === label);
+  if (!device) return null;
+  if (now - device.lastSeenAt < throttleMs) return null;
+  return { devices: registry.devices.map((d) => (d.label === label ? { ...d, lastSeenAt: now } : d)) };
+}
+
+/** The wire shape of the registry, for `GET /api/devices`. */
+export function toDeviceWire(
+  registry: PairedRegistry,
+  current: string | null,
+  now: number = Date.now(),
+): PairedDeviceWire[] {
+  return registry.devices.map((d) => ({
+    label: d.label,
+    createdAt: d.createdAt,
+    lastSeenAt: d.lastSeenAt,
+    expiresAt: d.expiresAt ?? null,
+    expired: isExpired(d, now),
+    current: d.label === current,
+  }));
+}
+
+/**
+ * The `Authorization: Bearer <token>` value, or null. Case-insensitive on the scheme (RFC 7235) and
+ * tolerant of extra spacing, because a proxy may rewrite whitespace.
+ */
+export function bearerToken(headers: { get(name: string): string | null }): string | null {
+  const raw = headers.get("authorization");
+  if (!raw) return null;
+  const match = /^Bearer\s+(\S+)\s*$/i.exec(raw.trim());
+  return match ? match[1]! : null;
+}
+
+// ── The store ────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Every disk touch this module makes. Async everywhere except {@link PairingIo.readRegistrySync},
+ * which exists because the write gate (`guard()` in bridge/server.ts) is synchronous and must see a
+ * revocation made by `bin/issance devices revoke` in another process without a restart.
+ */
+export interface PairingIo {
+  readPending(): Promise<JsonValue | null>;
+  writePending(pending: PendingPairing): Promise<void>;
+  deletePending(): Promise<void>;
+  /**
+   * The registry file, parsed. Null ⇒ no registry file. THROWS {@link RegistryUnreadableError} when
+   * the file is there and cannot be read or parsed, so a read-modify-write never writes a torn file's
+   * "empty" reading back over the devices it held.
+   */
+  readRegistry(): Promise<JsonValue | null>;
+  writeRegistry(registry: PairedRegistry): Promise<void>;
+  /**
+   * The registry as of now, read synchronously. Null ⇒ no registry file. Throws
+   * {@link RegistryUnreadableError} on a file that is there and unreadable, as `readRegistry` does.
+   */
+  readRegistrySync(): JsonValue | null;
+}
+
+/**
+ * The real, owner-only implementation over `<stateDir>`.
+ *
+ * `readRegistrySync` stats before it reads and serves a cached parse when nothing changed, so the
+ * per-request cost of the gate is one `stat` — not a parse — while a CLI revocation still lands on
+ * the very next request.
+ */
+/** A JSON file's parsed contents, or null when it is missing or unreadable. */
+async function readJson(path: string): Promise<JsonValue | null> {
+  try {
+    // SAFETY: `JSON.parse` output IS a JsonValue by construction; every caller re-coerces it.
+    return JSON.parse(await readFile(path, "utf8")) as JsonValue;
+  } catch {
+    return null;
+  }
+}
+
+export function filePairingIo(stateDir: string): PairingIo {
+  const pendingPath = join(stateDir, PENDING_FILENAME);
+  const registryPath = join(stateDir, DEVICES_FILENAME);
+  let cache: { key: string; value: JsonValue } | null = null;
+
+  // Every temp name is unique to one write. A shared `${path}.tmp` is only atomic against a reader:
+  // two writers both create it, the first `rename` moves it away, and the second gets ENOENT (#159).
+  // The pid keeps another PROCESS off the name; the counter keeps another write in THIS one off it.
+  let writeSeq = 0;
+  const writeAtomic = async (path: string, text: string): Promise<void> => {
+    await mkdir(stateDir, { recursive: true, mode: 0o700 });
+    const tmp = `${path}.${process.pid}.${++writeSeq}.tmp`;
+    await writeFile(tmp, text, { mode: 0o600 });
+    try {
+      await rename(tmp, path);
+    } catch (err) {
+      // The temp name is ours alone, so nobody else will ever clear what a failed rename left.
+      try {
+        await unlink(tmp);
+      } catch {
+        /* gone already — nothing to clean up */
+      }
+      throw err;
+    }
+  };
+
+  return {
+    readPending: () => readJson(pendingPath),
+    writePending: (pending) => writeAtomic(pendingPath, JSON.stringify(pending, null, 2)),
+    async deletePending() {
+      try {
+        await unlink(pendingPath);
+      } catch {
+        /* already gone — deleting a spent pairing is idempotent */
+      }
+    },
+    async readRegistry() {
+      let raw: string;
+      try {
+        raw = await readFile(registryPath, "utf8");
+      } catch (err) {
+        if (err instanceof Error && isMissing(err)) return null;
+        throw new RegistryUnreadableError(`${DEVICES_FILENAME} cannot be read`, { cause: err });
+      }
+      try {
+        // SAFETY: `JSON.parse` output IS a JsonValue by construction; `coerceRegistry` re-checks it.
+        return registryValue(JSON.parse(raw) as JsonValue);
+      } catch (err) {
+        if (err instanceof RegistryUnreadableError) throw err;
+        throw new RegistryUnreadableError(`${DEVICES_FILENAME} is not valid JSON`, { cause: err });
+      }
+    },
+    async writeRegistry(registry) {
+      await writeAtomic(registryPath, JSON.stringify(registry, null, 2));
+      cache = null;
+    },
+    readRegistrySync() {
+      let key: string;
+      try {
+        const st = statSync(registryPath);
+        key = `${st.mtimeMs}:${st.size}`;
+      } catch (err) {
+        cache = null;
+        if (err instanceof Error && isMissing(err)) return null;
+        throw new RegistryUnreadableError(`${DEVICES_FILENAME} cannot be read`, { cause: err });
+      }
+      if (cache?.key === key) return cache.value;
+      // An unreadable file is NEVER cached: the cache is dropped and the error thrown, so the request
+      // after a repair (or after the writer's rename lands) reads the file again, whatever its mtime.
+      cache = null;
+      let text: string;
+      try {
+        text = readFileSync(registryPath, "utf8");
+      } catch (err) {
+        throw new RegistryUnreadableError(`${DEVICES_FILENAME} cannot be read`, { cause: err });
+      }
+      let value: JsonValue;
+      try {
+        // SAFETY: `JSON.parse` output IS a JsonValue by construction; `coerceRegistry` re-checks it.
+        value = registryValue(JSON.parse(text) as JsonValue);
+      } catch (err) {
+        if (err instanceof RegistryUnreadableError) throw err;
+        throw new RegistryUnreadableError(`${DEVICES_FILENAME} is not valid JSON`, { cause: err });
+      }
+      cache = { key, value };
+      return value;
+    },
+  };
+}
+
+/**
+ * The bridge's view of pairing: a synchronous gate for the request path, plus the async enrolment
+ * and revocation operations.
+ *
+ * Pairing is ALWAYS ON (M46 spec 03, ADR 0086). A bridge with nothing paired is not open, it is
+ * waiting for its first device: every `/api/*` route except `/api/health` and `/api/pair` refuses
+ * with `device not paired`. Revoking the last device leaves the bridge in exactly that state. The
+ * way back in is the host itself, where `issance pair` mints a code, so no state here can lock the
+ * operator out of a machine they can log in to.
+ */
+export class PairingStore {
+  constructor(
+    private readonly io: PairingIo,
+    private readonly now: () => number = Date.now,
+    private readonly random: (n: number) => Buffer = randomBytes,
+  ) {}
+
+  /**
+   * The tail of this store's registry write chain. Every read-modify-write of the registry runs
+   * through {@link serialize}, so two of them never interleave: without it, one poll tick's snapshot
+   * request and pane read both read, both decide to stamp, and both write at once (#159).
+   */
+  private writeQueue: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Run `op` after every registry write already queued on this store, and return what it returns.
+   * `op` is passed as BOTH handlers so a failed operation still lets the next one start, and the
+   * stored tail can never reject — nothing awaits it for a value, only for its turn.
+   */
+  private serialize<T>(op: () => Promise<T>): Promise<T> {
+    const next = this.writeQueue.then(op, op);
+    this.writeQueue = next.catch(() => undefined);
+    return next;
+  }
+
+  /**
+   * Resolves once every registry write this store has started has finished. The stamp in
+   * {@link resolve} is deliberately fire-and-forget, so this is the only way to observe it landing.
+   * Never awaited on the request path.
+   */
+  async idle(): Promise<void> {
+    await this.writeQueue;
+  }
+
+  /**
+   * The registry as of this instant, straight off disk (cached on mtime). No file is the empty
+   * registry. A file that is there and cannot be read THROWS {@link RegistryUnreadableError}: an
+   * unreadable store is never "nobody is paired", and every caller must decide what it means for it.
+   */
+  registry(): PairedRegistry {
+    let raw: JsonValue | null;
+    try {
+      raw = this.io.readRegistrySync();
+    } catch (err) {
+      if (err instanceof RegistryUnreadableError) throw err;
+      throw new RegistryUnreadableError(`${DEVICES_FILENAME} cannot be read`, { cause: err });
+    }
+    if (raw === null) return { devices: [] };
+    return coerceRegistry(registryValue(raw));
+  }
+
+  /**
+   * Whether a bearer token is required. Always true since M46 spec 03: an empty registry no longer
+   * switches the gate off. Kept as a method because the gate and the `/api/devices` wire still ask.
+   * It reads nothing, so it cannot fail; an unreadable registry surfaces through {@link resolve},
+   * which every gated request asks.
+   */
+  enforced(): boolean {
+    return true;
+  }
+
+  /**
+   * Whether this token belongs to a paired device whose expiry has passed — the question that turns
+   * a refusal's text from `device not paired` into `device expired`. Asked only on the refusal path,
+   * so a valid request never pays for a second hash. Throws {@link RegistryUnreadableError} as
+   * {@link registry} does.
+   */
+  expired(token: string | null): boolean {
+    const device = findByToken(this.registry(), token);
+    return device !== null && isExpired(device, this.now());
+  }
+
+  /**
+   * The device this request's bearer token belongs to, or null. Also stamps `lastSeenAt`, throttled
+   * and fire-and-forget: a failed stamp must never fail the request it was decorating.
+   *
+   * An EXPIRED device resolves to null — its token authenticates as nobody — and is not stamped,
+   * because a refused request is not the device being seen. It stays in the registry, so the
+   * device list still shows it and the phone can say "pair again" rather than "pair".
+   *
+   * THROWS {@link RegistryUnreadableError} when the registry file is there and unreadable, rather than
+   * answering null: null means "this token is nobody's", and that is not known. The gate turns the
+   * throw into `503 pairing unavailable`.
+   */
+  resolve(token: string | null): PairedDevice | null {
+    const registry = this.registry();
+    const device = findByToken(registry, token);
+    if (!device) return null;
+    if (isExpired(device, this.now())) return null;
+    const touched = touchDevice(registry, device.label, this.now());
+    if (touched) {
+      // Fire-and-forget: a failed stamp must never fail the request that triggered it.
+      void this.serialize(async () => {
+        try {
+          // ── RE-DERIVED FROM DISK, NEVER WRITTEN FROM THE SNAPSHOT ABOVE ────
+          // `touched` was computed from a registry read at the top of this synchronous call, and
+          // this write lands later. `bin/issance devices revoke` runs in ANOTHER process and writes
+          // the same file, so writing `touched` blind would put a revoked device BACK — a stamp
+          // silently undoing a revocation, which is the one thing a credential store may not do.
+          // Re-reading here costs one file read at most once per device per minute (the throttle
+          // above is what makes this path rare), and a device gone in the meantime is not stamped.
+          //
+          // The re-read and the throttle check are INSIDE the serialized section on purpose: a
+          // second stamp from the same poll tick then reads the first one's timestamp and becomes a
+          // no-op, instead of racing it to the same file.
+          const current = coerceRegistry(await this.io.readRegistry());
+          const fresh = touchDevice(current, device.label, this.now());
+          if (fresh === null) return;
+          await this.io.writeRegistry(fresh);
+        } catch (err) {
+          console.warn(
+            `[pairing] could not stamp lastSeenAt: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      });
+    }
+    return device;
+  }
+
+  /**
+   * Claim the pending code and enrol `label`. On success the token is returned ONCE — it is not
+   * stored, recoverable or re-derivable — and the pending pairing is destroyed, so a code is
+   * single-use even within its TTL.
+   *
+   * A label held by an EXPIRED device is taken over, and that device's token revoked in the same
+   * write ({@link enrolDevice}); `replacedExpired` says so, for the audit trail. A live device's label
+   * is still `duplicate-label`.
+   */
+  async claim(
+    code: string,
+    label: string,
+  ): Promise<{ ok: true; token: string; replacedExpired: boolean } | { ok: false; reason: ClaimFailure }> {
+    // The WHOLE claim runs in the write queue, the code check included. Two claims racing on one
+    // code would otherwise both read the pending pairing before either deleted it, and both enrol:
+    // one code, two devices. Two wrong guesses racing would both read the same attempt count and
+    // write it back once, and the five-tries rule would count one. In the queue the second claim
+    // reads what the first wrote: no pending pairing, or the higher count.
+    return this.serialize(() => this.claimInQueue(code, label));
+  }
+
+  /** {@link claim}'s body. Runs inside {@link serialize} only, so it must not queue anything itself. */
+  private async claimInQueue(
+    code: string,
+    label: string,
+  ): Promise<{ ok: true; token: string; replacedExpired: boolean } | { ok: false; reason: ClaimFailure }> {
+    const pending = coercePending(await this.io.readPending());
+    const verdict = checkClaim(pending, code, this.now());
+    if (!verdict.ok) {
+      if (verdict.pending === null) await this.io.deletePending();
+      else await this.io.writePending(verdict.pending);
+      return { ok: false, reason: verdict.reason };
+    }
+    const token = generateToken(this.random);
+    const now = this.now();
+    // The operator's `--expires`, carried on the pending code, counts from THIS moment.
+    const lifetime = pending?.tokenLifetimeMs;
+    const enrolment: Enrolment = {
+      label,
+      tokenHash: sha256Hex(token),
+      now,
+    };
+    if (lifetime !== undefined) enrolment.expiresAt = now + lifetime;
+    const enrolled = enrolDevice(coerceRegistry(await this.io.readRegistry()), enrolment);
+    // A duplicate label leaves the pending pairing alive: the operator retries with another name
+    // rather than re-running `issance pair`.
+    if (!enrolled) return { ok: false, reason: "duplicate-label" };
+    await this.io.writeRegistry(enrolled.registry);
+    await this.io.deletePending();
+    return { ok: true, token, replacedExpired: enrolled.replaced };
+  }
+
+  /**
+   * Adopt a lead's synced entries into this machine's own registry — **at takeover commit, and only
+   * then** (RFC §6.5, `bridge/crew/standby-devices.ts`).
+   *
+   * After the commit this machine IS the lead, so the phone must keep working against the very
+   * credential it already holds; before it, adopting would silently arm this machine's own write gate
+   * for an operator who never ran `issance pair` here. That is why this is a verb the takeover calls
+   * rather than something the sync does.
+   *
+   * Returns the colliding labels, and writes NOTHING when there are any — refuse and report, never
+   * namespace-and-merge (RFC §16, decision 6): a label is the revoke handle.
+   */
+  async adopt(
+    devices: readonly { label: string; tokenHash: string; createdAt: number; expiresAt?: number }[],
+  ): Promise<string[]> {
+    return this.serialize(async () => {
+      const own = coerceRegistry(await this.io.readRegistry());
+      const collisions = devices.filter((d) => own.devices.some((x) => x.label === d.label)).map((d) => d.label);
+      if (collisions.length > 0) return collisions;
+      await this.io.writeRegistry({
+        devices: [
+          ...own.devices,
+          // `lastSeenAt: 0` — never contacted THIS machine, and copying the lead's stamp would be this
+          // machine asserting traffic it never saw. The expiry DOES carry: it is the operator's limit
+          // on the credential, not a fact about traffic, and dropping it would un-expire a phone.
+          ...devices.map((d): PairedDevice => {
+            const entry: PairedDevice = { label: d.label, tokenHash: d.tokenHash, createdAt: d.createdAt, lastSeenAt: 0 };
+            if (d.expiresAt !== undefined) entry.expiresAt = d.expiresAt;
+            return entry;
+          }),
+        ],
+      });
+      return [];
+    });
+  }
+
+  /** Drop a device. False ⇒ no such label. */
+  async revoke(label: string): Promise<boolean> {
+    return this.serialize(async () => {
+      const next = removeDevice(coerceRegistry(await this.io.readRegistry()), label);
+      if (!next) return false;
+      await this.io.writeRegistry(next);
+      return true;
+    });
+  }
+}

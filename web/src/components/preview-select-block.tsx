@@ -1,0 +1,260 @@
+import { useEffect, useRef, useState } from "react";
+import {
+  Check,
+  ChevronRight,
+  Loader2,
+  Pencil,
+  StickyNote,
+  Trash2,
+} from "lucide-react";
+
+import { WizardStepper } from "@/components/wizard-stepper";
+import { cn } from "@/lib/utils";
+import type { PreviewOption, PreviewSelectModel, StyledLine } from "@/lib/blocks";
+import {
+  KeyBadge,
+  OptionGroupCaption,
+  optionSurface,
+  PromptPanel,
+  QuestionHeading,
+} from "@/components/option-button";
+import { NOTE_MAX_LENGTH } from "@/lib/preview-action";
+import { WIZARD_BACK_KEYS, WIZARD_NEXT_KEYS } from "@/lib/harness/wizard-model";
+import { t } from "@/lib/i18n";
+import { useLocale } from "@/hooks/use-locale";
+
+/** One tap's intent, resolved to keystrokes by the injected handler (preview-action.ts). */
+export type PreviewBlockAction =
+  | { kind: "option"; option: PreviewOption }
+  | { kind: "note"; text: string } // "" removes the note
+  | { kind: "nav"; keys: string[] };
+
+export interface PreviewSelectBlockProps {
+  /** The detected preview-variant dialog (single question or one wizard step). */
+  preview: PreviewSelectModel;
+  /** The region this block replaced — passed through to PromptPanel as its way back (ADR 0056). */
+  lines?: StyledLine[];
+  /**
+   * Injected send handler (from AgentChat). Presentational contract: this component NEVER touches
+   * the network — it maps taps to intents while the handler runs the race-guarded choreography
+   * (digit→verify→Enter for options; n→verify→type→Escape for notes). Returning/throwing simply
+   * clears the busy state.
+   */
+  onAction: (action: PreviewBlockAction) => void | Promise<void>;
+  /** Read-only device or a gone pane: everything renders (for context) but can't be pressed. */
+  disabled?: boolean;
+}
+
+// Native, tappable rendering of Claude's preview-variant AskUserQuestion (options + a preview pane
+// + the per-question note; grammar/NOTES_NOTES.md). Mirrors what the TUI shows — the preview pane
+// belongs to the POINTED option, and the note belongs to the QUESTION — because the terminal is
+// the single source of truth. Every visible string (labels, preview text, note text) is a React
+// text node — the XSS boundary is unchanged. One control can be in flight at a time.
+//
+// While the TUI's own note input is focused (note.state === "editing" — someone is typing in the
+// terminal) EVERY control locks: any keystroke we sent would be typed into their note instead of
+// driving the dialog. A banner says so; polling clears it when the input blurs.
+export function PreviewSelectBlock({ preview, lines, onAction, disabled }: PreviewSelectBlockProps) {
+  useLocale();
+  const [sending, setSending] = useState<string | null>(null);
+  const [editorOpen, setEditorOpen] = useState(false);
+  // Focused from an effect rather than with `autoFocus`: the attribute only acts on the very first
+  // mount of the element, so re-opening the editor after a cancel would leave the field unfocused —
+  // and it gives assistive tech no chance to announce the surrounding panel first.
+  const editorRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    if (editorOpen) editorRef.current?.focus();
+  }, [editorOpen]);
+
+  const [draft, setDraft] = useState("");
+  const terminalEditing = preview.note.state === "editing";
+  const locked = disabled || sending !== null || terminalEditing;
+
+  async function press(id: string, action: PreviewBlockAction) {
+    if (locked) return;
+    setSending(id);
+    try {
+      await onAction(action);
+    } finally {
+      setSending(null);
+    }
+  }
+
+  async function saveNote() {
+    const text = draft.trim();
+    if (text.length === 0) return;
+    await press("note-save", { kind: "note", text });
+    setEditorOpen(false);
+  }
+
+  const wizard = preview.steps !== null;
+  const pointedLabel = preview.options.find((o) => o.pointed)?.label;
+  const busyIcon = (
+    <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" aria-label={t("dialog.sendingAria")} />
+  );
+
+  return (
+    <PromptPanel ariaLabel={preview.question} raw={lines}>
+      {/* Wizard form only: the stepper chips + Left/Right navigation, exactly as in WizardBlock —
+          a preview question is just one step of the same dialog. Single-question dialogs keep
+          their question/chip line in the raw mirror above, so neither renders here. */}
+      {wizard && (
+        <WizardStepper
+          steps={preview.steps!}
+          locked={locked}
+          busyBack={sending === "nav-back"}
+          busyNext={sending === "nav-next"}
+          busyIcon={busyIcon}
+          onBack={() => press("nav-back", { kind: "nav", keys: WIZARD_BACK_KEYS })}
+          onNext={() => press("nav-next", { kind: "nav", keys: WIZARD_NEXT_KEYS })}
+        />
+      )}
+      {wizard && <QuestionHeading>{preview.question}</QuestionHeading>}
+      {!wizard && <OptionGroupCaption>{t("dialog.chooseOption")}</OptionGroupCaption>}
+
+      {/* Options. Tapping one selects it outright (the handler drives digit → verify → Enter). Each
+          row leads with the pointer chevron (whose preview shows below) then its terminal-menu digit
+          (KeyBadge), on the shared elevated option surface. */}
+      <div className="flex flex-col gap-1">
+        {preview.options.map((option, i) => {
+          const id = `opt-${i}`;
+          const busy = sending === id;
+          const tone = busy ? "busy" : option.chosen ? "selected" : "default";
+          return (
+            <button
+              key={i}
+              type="button"
+              disabled={locked}
+              onClick={() => press(id, { kind: "option", option })}
+              className={optionSurface(tone)}
+            >
+              <ChevronRight
+                className={cn(
+                  "mt-[3px] size-3.5 shrink-0",
+                  option.pointed ? "text-primary" : "text-transparent",
+                )}
+                aria-label={option.pointed ? t("dialog.preview.previewedBelowAria") : undefined}
+              />
+              <KeyBadge tone={tone}>{option.n}</KeyBadge>
+              <span className="min-w-0 flex-1 text-sm font-medium text-foreground">
+                {option.label}
+              </span>
+              {busy ? (
+                <Loader2
+                  className="mt-0.5 size-4 shrink-0 animate-spin text-muted-foreground"
+                  aria-label={t("dialog.sendingAria")}
+                />
+              ) : option.chosen ? (
+                <Check className="mt-0.5 size-4 shrink-0 text-primary" aria-label={t("dialog.preview.currentAnswerAria")} />
+              ) : null}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* The pointed option's preview pane, verbatim (mono text nodes — never markup). */}
+      {preview.preview.length > 0 && (
+        <div className="rounded-lg border border-border bg-muted/20 px-2 py-1.5">
+          {pointedLabel && (
+            <div className="mb-1 text-[10px] font-medium label-caps text-muted-foreground">
+              {t("dialog.preview.previewLabel", { label: pointedLabel })}
+            </div>
+          )}
+          <pre className="m-0 min-w-0 w-full max-w-full overflow-x-auto font-mono text-[10px] leading-[1.3] text-foreground/80">
+            {preview.preview.join("\n")}
+          </pre>
+        </div>
+      )}
+
+      {/* The question's note. Three surfaces: the terminal-editing banner (everything locked), the
+          attached-note card with edit/remove, or the add-note affordance — plus our own editor. */}
+      {terminalEditing ? (
+        <div className="rounded-lg border border-dashed border-status-working/50 px-3 py-2 text-xs text-status-working">
+          {t("dialog.preview.editingBanner")}
+          {preview.note.text ? (
+            <span className="font-content text-muted-foreground"> ({preview.note.text})</span>
+          ) : null}
+        </div>
+      ) : editorOpen ? (
+        <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-muted/30 px-3 py-2">
+          <label
+            htmlFor="preview-note-text"
+            className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"
+          >
+            <StickyNote className="size-3.5 shrink-0" />
+            {t("dialog.preview.noteForQuestion")}
+          </label>
+          <textarea
+            id="preview-note-text"
+            ref={editorRef}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            maxLength={NOTE_MAX_LENGTH}
+            rows={2}
+            aria-label={t("dialog.preview.noteTextAria")}
+            placeholder={t("dialog.preview.notePlaceholder")}
+            className="w-full resize-none rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground focus:border-primary/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+          />
+          <div className="flex items-center justify-end gap-1.5">
+            <button
+              type="button"
+              disabled={sending !== null}
+              onClick={() => setEditorOpen(false)}
+              className="rounded-md px-2.5 py-1.5 text-xs text-muted-foreground transition-colors active:bg-muted disabled:opacity-60"
+            >
+              {t("dialog.cancel")}
+            </button>
+            <button
+              type="button"
+              disabled={locked || draft.trim().length === 0}
+              onClick={() => void saveNote()}
+              className="flex items-center gap-1.5 rounded-md border border-primary/60 bg-primary/15 px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors active:bg-primary/25 disabled:opacity-60"
+            >
+              {sending === "note-save" ? busyIcon : null}
+              {t("dialog.preview.saveNote")}
+            </button>
+          </div>
+        </div>
+      ) : preview.note.state === "attached" ? (
+        <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2">
+          <StickyNote className="mt-0.5 size-3.5 shrink-0 text-primary" aria-label={t("dialog.preview.noteAria")} />
+          <span className="font-content min-w-0 flex-1 text-xs text-foreground/90">{preview.note.text}</span>
+          <button
+            type="button"
+            aria-label={t("dialog.preview.editNoteAria")}
+            disabled={locked}
+            onClick={() => {
+              setDraft(preview.note.text);
+              setEditorOpen(true);
+            }}
+            className="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors active:bg-muted disabled:opacity-50"
+          >
+            <Pencil className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            aria-label={t("dialog.preview.removeNoteAria")}
+            disabled={locked}
+            onClick={() => void press("note-remove", { kind: "note", text: "" })}
+            className="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors active:bg-muted disabled:opacity-50"
+          >
+            {sending === "note-remove" ? busyIcon : <Trash2 className="size-3.5" />}
+          </button>
+        </div>
+      ) : (
+        <button
+          type="button"
+          disabled={locked}
+          onClick={() => {
+            setDraft("");
+            setEditorOpen(true);
+          }}
+          className="flex w-full items-center gap-2 rounded-lg border border-dashed border-border px-3 py-1.5 text-left text-xs text-muted-foreground transition-colors active:bg-muted disabled:opacity-60"
+        >
+          <StickyNote className="size-3.5 shrink-0" />
+          {t("dialog.preview.addNote")}
+        </button>
+      )}
+    </PromptPanel>
+  );
+}

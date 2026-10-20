@@ -1,0 +1,678 @@
+import { act, render, renderHook, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { http, HttpResponse } from "msw";
+
+import { server } from "@/test/setup";
+import { clearStatus, useStatus } from "@/lib/status";
+import { currentPins, pinMatcher, setPinned } from "@/lib/pins";
+import { __resetOperatorCommands } from "@/lib/operator-config";
+import type { AgentView, MuxConfig, ServerSummary } from "@/lib/types";
+import { CrewProvider } from "./crew-provider";
+import { PaneActionsSheet } from "./pane-actions-sheet";
+
+// The long-press pane actions sheet: an action-list first view (Rename / Close pane), with rename
+// tucked behind its own tap so opening the sheet never shoves a keyboard-triggering input at you.
+// Both actions are wired straight to the bridge via lib/api (exercised through MSW here); the parent
+// gets onRenamed / onClosed callbacks for the revalidate/navigate side-effects.
+
+beforeEach(() => clearStatus());
+
+const agent: AgentView = {
+  paneId: "w1:p1",
+  workspaceId: "w1",
+  workspaceLabel: "webapp",
+  workspaceNumber: 1,
+  tabId: "w1:t1",
+  agent: "claude",
+  status: "idle",
+  cwd: "/home/you/webapp",
+  focused: false,
+};
+
+/** The sheet's props, so a case that needs its own wrapper can render it itself. */
+function renderProps(
+  overrides: Partial<React.ComponentProps<typeof PaneActionsSheet>> = {},
+): React.ComponentProps<typeof PaneActionsSheet> {
+  return {
+    open: true,
+    onClose: vi.fn(),
+    pane: agent,
+    onRenamed: vi.fn(),
+    onClosed: vi.fn(),
+    ...overrides,
+  };
+}
+
+function renderSheet(overrides: Partial<React.ComponentProps<typeof PaneActionsSheet>> = {}) {
+  const props = renderProps(overrides);
+  render(<PaneActionsSheet {...props} />);
+  return props;
+}
+
+describe("PaneActionsSheet — action list", () => {
+  it("opens on the action list, not the rename input", () => {
+    renderSheet();
+    expect(screen.getByRole("button", { name: "Rename" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close pane" })).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("name this pane")).toBeNull();
+  });
+
+  it("color-codes the Close pane row as destructive from the first tap, not just once armed", () => {
+    renderSheet();
+    expect(screen.getByRole("button", { name: "Close pane" })).toHaveClass("text-destructive");
+  });
+});
+
+describe("PaneActionsSheet — rename", () => {
+  it("stays on the action list until Rename is tapped, then shows the prefilled input", async () => {
+    const user = userEvent.setup();
+    renderSheet({ pane: { ...agent, paneLabel: "deploy" } });
+    expect(screen.queryByPlaceholderText("name this pane")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Rename" }));
+    expect(screen.getByPlaceholderText("name this pane")).toHaveValue("deploy");
+  });
+
+  it("autofocuses the input once rename mode opens", async () => {
+    const user = userEvent.setup();
+    renderSheet();
+    await user.click(screen.getByRole("button", { name: "Rename" }));
+    await waitFor(() => expect(screen.getByPlaceholderText("name this pane")).toHaveFocus());
+  });
+
+  it("Back returns to the action list without saving", async () => {
+    const user = userEvent.setup();
+    renderSheet();
+    await user.click(screen.getByRole("button", { name: "Rename" }));
+    await user.click(screen.getByRole("button", { name: "Back" }));
+
+    expect(screen.queryByPlaceholderText("name this pane")).toBeNull();
+    expect(screen.getByRole("button", { name: "Rename" })).toBeInTheDocument();
+  });
+
+  it("posts the trimmed label, then calls onRenamed and closes", async () => {
+    const user = userEvent.setup();
+    let body: unknown;
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/rename$/, async ({ request }) => {
+        body = await request.json();
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+    const props = renderSheet();
+    await user.click(screen.getByRole("button", { name: "Rename" }));
+    const input = screen.getByPlaceholderText("name this pane");
+    await user.type(input, "  deploy  ");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(props.onRenamed).toHaveBeenCalledTimes(1));
+    expect(body).toEqual({ label: "deploy" });
+    expect(props.onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the label by saving an empty field (sends an empty label)", async () => {
+    const user = userEvent.setup();
+    let body: unknown;
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/rename$/, async ({ request }) => {
+        body = await request.json();
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+    const props = renderSheet({ pane: { ...agent, paneLabel: "deploy" } });
+    await user.click(screen.getByRole("button", { name: "Rename" }));
+    await user.clear(screen.getByPlaceholderText("name this pane"));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(props.onRenamed).toHaveBeenCalledTimes(1));
+    expect(body).toEqual({ label: "" });
+  });
+
+  it("does NOT revalidate or close when the rename fails (error goes to the status channel)", async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/rename$/, () => HttpResponse.json({ ok: false, error: "pane not found" })),
+    );
+    const props = renderSheet();
+    await user.click(screen.getByRole("button", { name: "Rename" }));
+    await user.type(screen.getByPlaceholderText("name this pane"), "x");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    // The sheet stays open (Save still enabled) and neither side-effect fires.
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).not.toBeDisabled());
+    expect(props.onRenamed).not.toHaveBeenCalled();
+    expect(props.onClose).not.toHaveBeenCalled();
+  });
+
+  it("resets back to the action list when the sheet reopens, even mid-rename", async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(<PaneActionsSheet open={true} onClose={vi.fn()} pane={agent} onRenamed={vi.fn()} onClosed={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Rename" }));
+    expect(screen.getByPlaceholderText("name this pane")).toBeInTheDocument();
+
+    rerender(<PaneActionsSheet open={false} onClose={vi.fn()} pane={agent} onRenamed={vi.fn()} onClosed={vi.fn()} />);
+    rerender(<PaneActionsSheet open={true} onClose={vi.fn()} pane={agent} onRenamed={vi.fn()} onClosed={vi.fn()} />);
+
+    expect(screen.queryByPlaceholderText("name this pane")).toBeNull();
+    expect(screen.getByRole("button", { name: "Rename" })).toBeInTheDocument();
+  });
+
+  it("resets back to the action list when the target pane changes, even mid-rename", async () => {
+    const user = userEvent.setup();
+    const other: AgentView = { ...agent, paneId: "w1:p2" };
+    const { rerender } = render(<PaneActionsSheet open={true} onClose={vi.fn()} pane={agent} onRenamed={vi.fn()} onClosed={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Rename" }));
+    expect(screen.getByPlaceholderText("name this pane")).toBeInTheDocument();
+
+    rerender(<PaneActionsSheet open={true} onClose={vi.fn()} pane={other} onRenamed={vi.fn()} onClosed={vi.fn()} />);
+
+    expect(screen.queryByPlaceholderText("name this pane")).toBeNull();
+    expect(screen.getByRole("button", { name: "Rename" })).toBeInTheDocument();
+  });
+});
+
+describe("PaneActionsSheet — close", () => {
+  it("closes only after a two-tap confirm, then calls onClosed and closes the sheet", async () => {
+    const user = userEvent.setup();
+    const props = renderSheet();
+
+    await user.click(screen.getByRole("button", { name: "Close pane" }));
+    expect(props.onClosed).not.toHaveBeenCalled(); // first tap only arms
+
+    await user.click(screen.getByRole("button", { name: "Tap again to close" }));
+    await waitFor(() => expect(props.onClosed).toHaveBeenCalledExactlyOnceWith("w1:p1"));
+    expect(props.onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("PaneActionsSheet — locale", () => {
+  it("translates its action labels once the German bundle lands", async () => {
+    // Same recipe as theme-control.test.tsx: `vi.resetModules()` gives this test its own copy of
+    // `@/lib/i18n`, so the locale store driven here is the same one the freshly re-imported
+    // component reads from.
+    vi.resetModules();
+    const [{ PaneActionsSheet: FreshSheet }, { __resetLocale, setLocale, whenLocaleReady }] =
+      await Promise.all([import("./pane-actions-sheet"), import("@/lib/i18n")]);
+    __resetLocale();
+
+    render(
+      <FreshSheet
+        open={true}
+        onClose={vi.fn()}
+        pane={agent}
+        onRenamed={vi.fn()}
+        onClosed={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      setLocale("de");
+      await whenLocaleReady("de");
+    });
+
+    expect(screen.getByRole("button", { name: "Umbenennen" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Pane schließen" })).toBeInTheDocument();
+  });
+});
+
+describe("PaneActionsSheet — read-only", () => {
+  it("shows a note and no write actions when the device isn't authorised", () => {
+    renderSheet({ readOnly: true });
+    expect(screen.getByText(/read-only/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
+    expect(screen.queryByPlaceholderText("name this pane")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Close pane" })).toBeNull();
+  });
+});
+
+// Close and rename are §10.3 writes to one specific machine — the pane's own. On a crew member the
+// lead can't reach they are refused BEFORE anything is attempted: there is no queue and no retry, and
+// a half-known "did the close land?" on a real terminal is the worst outcome to hand somebody.
+describe("PaneActionsSheet — a pane on an unreachable machine", () => {
+  const roster: ServerSummary[] = [
+    { id: "bluefin", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 9_000 },
+    { id: "workshop", name: "workshop", isLead: false, reachable: false, protocol: "ok", lastSeenAt: 1_000 },
+  ];
+  const crew = ({ children }: { children: React.ReactNode }) => (
+    <CrewProvider servers={roster} ts={20_000} pollMs={1500}>
+      {children}
+    </CrewProvider>
+  );
+
+  it("replaces both actions with the machine's name and its last-seen age", () => {
+    render(<PaneActionsSheet {...renderProps({ pane: { ...agent, host: "workshop" } })} />, {
+      wrapper: crew,
+    });
+    expect(screen.getByText(/workshop is unreachable/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /rename/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /close pane/i })).not.toBeInTheDocument();
+  });
+
+  it("leaves a pane on a reachable member of the same crew exactly as it was", () => {
+    render(<PaneActionsSheet {...renderProps({ pane: { ...agent, host: "bluefin" } })} />, {
+      wrapper: crew,
+    });
+    expect(screen.getByRole("button", { name: /rename/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /close pane/i })).toBeInTheDocument();
+  });
+});
+
+// The two READ rows the pane header hands this sheet when the ⋮ opens it. The pane STRIP passes
+// neither, and that asymmetry is the design: find searches the buffer the open pane already fetched,
+// and a strip pill can open this sheet on a pane whose output was never loaded.
+describe("PaneActionsSheet — the read rows", () => {
+  it("shows neither row when the caller offers neither (the pane strip's case)", () => {
+    renderSheet();
+    expect(screen.queryByRole("button", { name: "Find in output" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Conversation history" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Copy output" })).toBeNull();
+  });
+
+  it("shows only the row it was given a callback for", () => {
+    renderSheet({ onFind: vi.fn() });
+    expect(screen.getByRole("button", { name: "Find in output" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Conversation history" })).toBeNull();
+  });
+
+  it("closes the sheet BEFORE it acts, so the surface the row leads to arrives alone", async () => {
+    const user = userEvent.setup();
+    const onFind = vi.fn();
+    const props = renderSheet({ onFind });
+    await user.click(screen.getByRole("button", { name: "Find in output" }));
+    expect(props.onClose).toHaveBeenCalledTimes(1);
+    expect(onFind).toHaveBeenCalledTimes(1);
+    // Order matters: the find bar takes over the header row, and the sheet must not still be over it.
+    expect(vi.mocked(props.onClose).mock.invocationCallOrder[0]!).toBeLessThan(
+      onFind.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("shows the Copy output row only when given onCopyOutput", () => {
+    const { rerender } = render(<PaneActionsSheet {...renderProps()} />);
+    expect(screen.queryByRole("button", { name: "Copy output" })).toBeNull();
+    rerender(<PaneActionsSheet {...renderProps({ onCopyOutput: vi.fn() })} />);
+    expect(screen.getByRole("button", { name: "Copy output" })).toBeInTheDocument();
+  });
+
+  it("closes the sheet BEFORE it copies, so the copy fires as the sheet unmounts", async () => {
+    const user = userEvent.setup();
+    const onCopyOutput = vi.fn();
+    const props = renderSheet({ onCopyOutput });
+    await user.click(screen.getByRole("button", { name: "Copy output" }));
+    expect(props.onClose).toHaveBeenCalledTimes(1);
+    expect(onCopyOutput).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(props.onClose).mock.invocationCallOrder[0]!).toBeLessThan(
+      onCopyOutput.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("leads the list — reads come before the writes you arrive at deliberately", () => {
+    renderSheet({ onFind: vi.fn(), onHistory: vi.fn() });
+    const find = screen.getByRole("button", { name: "Find in output" });
+    const rename = screen.getByRole("button", { name: "Rename" });
+    expect(find.compareDocumentPosition(rename) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  // Neither read is a write, so neither refusal is about them. A device that may not write can still
+  // search the output it already has; a machine that has stopped answering is exactly when you want
+  // to read the last thing it said.
+  it("survives read-only, which takes only the writes", () => {
+    renderSheet({ readOnly: true, onFind: vi.fn(), onHistory: vi.fn() });
+    expect(screen.getByText(/read-only/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Find in output" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Conversation history" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
+  });
+
+  it("goes away in rename mode — that view is a sub-screen, not a section", async () => {
+    const user = userEvent.setup();
+    renderSheet({ onFind: vi.fn() });
+    await user.click(screen.getByRole("button", { name: "Rename" }));
+    expect(screen.queryByRole("button", { name: "Find in output" })).toBeNull();
+  });
+
+  // DESIGN.md §6: 44px is the floor for anything tappable, and a sheet row is a thumb target that
+  // slides up under the finger. Every row in here states the floor — `min-h-11` around a 20px
+  // `text-sm` line, because `px-3 py-2.5` alone drew 40.
+  it("gives every row a 44px hit box", () => {
+    renderSheet({ onFind: vi.fn(), onHistory: vi.fn(), onCopyOutput: vi.fn() });
+    for (const name of ["Find in output", "Conversation history", "Copy output", "Rename", "Close pane"]) {
+      expect(screen.getByRole("button", { name })).toHaveClass("min-h-11");
+    }
+  });
+});
+
+// The host chip moved INTO the title row (beside the pane name) so every row in the sheet — not
+// just Close — reads as acting on a specific machine. Queries are scoped by `data-slot` because a
+// bare text/role query is ambiguous once the title row can hold two name-shaped things.
+//
+// jsdom does no layout, so "the title row's height never changes" and "the pane name truncates
+// before the host does" are pinned here as the CSS/structure that PRODUCES those facts (the
+// `min-w-0`/`truncate` split, the chip's `shrink-0`/fixed `max-w-[8rem]`), not as measured pixels.
+// The pixels were measured over CDP in a real browser (Chrome, via agent-browser) against the exact
+// markup this component renders, at 402px (the phone frame's 390px + its 6px bezel) and at 320px,
+// both themes:
+//   - title row height: 44px in every one of solo / crew-short-name / crew-long-name — unchanged,
+//     because the 32px (`size-8`) close button, not the title's content, is what's tallest in the
+//     row; the row's own height was never coupled to whether a chip renders.
+//   - a long pane name ("deploy-frontend-webapp-production-release-candidate") truncates
+//     (`scrollWidth > clientWidth`, computed `text-overflow: ellipsis`) while the host chip keeps
+//     its full reserved width (128px = 8rem, unshrunk) at both 402px and 320px.
+//   - the dialog's computed accessible name (Chrome's own accessibility tree, not a hand-rolled
+//     string): solo — `"webapp"` (the sample pane name used for that measurement, byte-identical to
+//     before this change); crew — `"webapp Sends to host: workshop"` (the pane name, then the
+//     chip's own `aria-label`, space-joined by the browser's accname algorithm — nothing
+//     hand-authored produces that join).
+describe("PaneActionsSheet — title row names the machine", () => {
+  const roster: ServerSummary[] = [
+    { id: "bluefin", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 9_000 },
+    { id: "workshop", name: "workshop", isLead: false, reachable: true, protocol: "ok", lastSeenAt: 9_000 },
+  ];
+  const crew = ({ children }: { children: React.ReactNode }) => (
+    <CrewProvider servers={roster} ts={20_000} pollMs={1500}>
+      {children}
+    </CrewProvider>
+  );
+
+  it("renders nothing extra in the title row on a solo install", () => {
+    renderSheet();
+    const row = document.querySelector('[data-slot="sheet-title-row"]')!;
+    expect(row.querySelector('[aria-label^="Sends to host"]')).toBeNull();
+    expect(document.querySelector('[data-slot="pane-actions-title-name"]')).toHaveTextContent("claude");
+  });
+
+  it("puts the host chip in the title row, beside the pane name, on a crew", () => {
+    render(<PaneActionsSheet {...renderProps({ pane: { ...agent, host: "workshop" } })} />, { wrapper: crew });
+    const row = document.querySelector('[data-slot="sheet-title-row"]')!;
+    const chip = row.querySelector('[aria-label^="Sends to host"]');
+    expect(chip).not.toBeNull();
+    expect(chip).toHaveAttribute("aria-label", "Sends to host: workshop");
+    // Same row as the name, not a second line below it.
+    expect(row.querySelector('[data-slot="pane-actions-title-name"]')?.compareDocumentPosition(chip!)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("gives the pane name the shrinkable box and the host the protected one", () => {
+    render(<PaneActionsSheet {...renderProps({ pane: { ...agent, host: "workshop" } })} />, { wrapper: crew });
+    const name = document.querySelector('[data-slot="pane-actions-title-name"]')!;
+    const chip = document.querySelector('[aria-label^="Sends to host"]')!;
+    // The name's box may shrink below its content size and ellipsize; the chip's may not — it
+    // carries a fixed cap (`max-w-[8rem]`) and refuses to shrink (`shrink-0`) so a long pane name
+    // never eats into the machine name's budget.
+    expect(name.className).toContain("truncate");
+    expect(name.className).toContain("min-w-0");
+    expect(chip.className).toContain("shrink-0");
+    expect(chip.className).toContain("max-w-[8rem]");
+  });
+
+  it("the whole dialog's accessible name still says which machine — screen-reader value pinned above", () => {
+    render(<PaneActionsSheet {...renderProps({ pane: { ...agent, host: "workshop" } })} />, { wrapper: crew });
+    // aria-labelledby points at data-slot="sheet-title", whose subtree is the name plus the chip's
+    // own aria-label — the accname algorithm (verified over CDP, see the block comment above) joins
+    // them with a space: "webapp Sends to host: workshop".
+    expect(screen.getByRole("dialog")).toHaveAttribute(
+      "aria-labelledby",
+      document.querySelector('[data-slot="sheet-title"]')!.id,
+    );
+  });
+});
+
+// PIN TO TOP / UNPIN (ADR 0070): the last of the read rows, so it leads the two doors that pass no
+// reads (a dashboard row's hold, the pane pill's hold) and trails find/history/settings/zen on the ⋮.
+// A pin changes this device and types into no terminal, so it sits outside both write gates.
+describe("PaneActionsSheet — pin", () => {
+  const pinned = () => pinMatcher(currentPins())(agent);
+
+  it("leads the list on a door with no read rows, above Rename", () => {
+    renderSheet();
+    const pin = screen.getByRole("button", { name: "Pin to top" });
+    const rename = screen.getByRole("button", { name: "Rename" });
+    expect(pin.compareDocumentPosition(rename) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(pin).toHaveClass("min-h-11");
+  });
+
+  it("trails the read rows on the ⋮, so no row the operator knows moves", () => {
+    renderSheet({ onFind: vi.fn(), onHistory: vi.fn(), onSettings: vi.fn(), onZen: vi.fn() });
+    const zen = screen.getByRole("button", { name: "Zen mode" });
+    const pin = screen.getByRole("button", { name: "Pin to top" });
+    const rename = screen.getByRole("button", { name: "Rename" });
+    expect(zen.compareDocumentPosition(pin) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(pin.compareDocumentPosition(rename) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("pins, closes the sheet first, and hands the caller the new state", async () => {
+    const user = userEvent.setup();
+    const onPinChange = vi.fn();
+    const props = renderSheet({ onPinChange, herd: [agent] });
+    await user.click(screen.getByRole("button", { name: "Pin to top" }));
+    expect(pinned()).toBe(true);
+    expect(onPinChange).toHaveBeenCalledExactlyOnceWith(agent, true);
+    expect(vi.mocked(props.onClose).mock.invocationCallOrder[0]!).toBeLessThan(
+      onPinChange.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("reads Unpin on a pinned pane, and unpins it", async () => {
+    const user = userEvent.setup();
+    setPinned(agent, true, [agent]);
+    const onPinChange = vi.fn();
+    renderSheet({ onPinChange });
+    await user.click(screen.getByRole("button", { name: "Unpin" }));
+    expect(pinned()).toBe(false);
+    expect(onPinChange).toHaveBeenCalledExactlyOnceWith(agent, false);
+  });
+
+  it("says it in a toast when the caller shows no row (the pane view's two doors)", async () => {
+    const user = userEvent.setup();
+    const status = renderHook(() => useStatus());
+    renderSheet();
+    await user.click(screen.getByRole("button", { name: "Pin to top" }));
+    expect(status.result.current).toMatchObject({ text: "Pinned to the top", tone: "success" });
+    await user.click(screen.getByRole("button", { name: "Unpin" }));
+    expect(status.result.current).toMatchObject({ text: "Unpinned", tone: "success" });
+  });
+
+  it("survives read-only: a device that may not write can still pin", async () => {
+    const user = userEvent.setup();
+    renderSheet({ readOnly: true });
+    expect(screen.getByText(/read-only/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Pin to top" }));
+    expect(pinned()).toBe(true);
+  });
+
+  it("survives an unreachable machine: a pane on a quiet peer can still be pinned", async () => {
+    const user = userEvent.setup();
+    const roster: ServerSummary[] = [
+      { id: "bluefin", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 9_000 },
+      { id: "workshop", name: "workshop", isLead: false, reachable: false, protocol: "ok", lastSeenAt: 1_000 },
+    ];
+    const quiet = { ...agent, host: "workshop" };
+    render(<PaneActionsSheet {...renderProps({ pane: quiet })} />, {
+      wrapper: ({ children }) => (
+        <CrewProvider servers={roster} ts={20_000} pollMs={1500}>
+          {children}
+        </CrewProvider>
+      ),
+    });
+    expect(screen.getByText(/workshop is unreachable/i)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Pin to top" }));
+    expect(pinMatcher(currentPins())(quiet)).toBe(true);
+  });
+
+  it("drops the pin when Close succeeds", async () => {
+    const user = userEvent.setup();
+    setPinned(agent, true, [agent]);
+    const props = renderSheet();
+    await user.click(screen.getByRole("button", { name: "Close pane" }));
+    await user.click(screen.getByRole("button", { name: "Tap again to close" }));
+    await waitFor(() => expect(props.onClosed).toHaveBeenCalledOnce());
+    expect(pinned()).toBe(false);
+  });
+
+  it("keeps the pin when Close fails: the pane is still there", async () => {
+    const user = userEvent.setup();
+    server.use(http.post(/\/api\/pane\/[^/]+\/close$/, () => HttpResponse.json({ ok: false, error: "nope" }, { status: 500 })));
+    setPinned(agent, true, [agent]);
+    const props = renderSheet();
+    await user.click(screen.getByRole("button", { name: "Close pane" }));
+    await user.click(screen.getByRole("button", { name: "Tap again to close" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Close pane" })).toBeEnabled());
+    expect(props.onClosed).not.toHaveBeenCalled();
+    expect(pinned()).toBe(true);
+  });
+});
+
+// ── THE BODY SWITCH (M41/11) ────────────────────────────────────────────────────────────────────
+//
+// The row is a ROW IN THIS SHEET, not the header and not the belt (ADR 0009: a generic menu is
+// where a pane's actions live, and Find and History are already here). It is gated by absence, the
+// way every read row here is, and it EXPLAINS rather than hides when the pane cannot honour it.
+describe("PaneActionsSheet — which body the pane draws", () => {
+  it("shows no switch when the caller passes no body", () => {
+    renderSheet();
+    expect(screen.queryByRole("button", { name: /view$/ })).toBeNull();
+  });
+
+  it("offers the chat while the standing body is the terminal", () => {
+    renderSheet({ paneView: "terminal", onPaneViewChange: vi.fn() });
+    expect(screen.getByRole("button", { name: "Chat view" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Terminal view" })).toBeNull();
+  });
+
+  it("offers the terminal while the standing body is the chat", () => {
+    renderSheet({ paneView: "chat", onPaneViewChange: vi.fn() });
+    expect(screen.getByRole("button", { name: "Terminal view" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Chat view" })).toBeNull();
+  });
+
+  it("writes the other body and closes, so the pane is the only thing on screen when it lands", async () => {
+    const user = userEvent.setup();
+    const onPaneViewChange = vi.fn();
+    const props = renderSheet({ paneView: "terminal", onPaneViewChange });
+    await user.click(screen.getByRole("button", { name: "Chat view" }));
+    expect(onPaneViewChange).toHaveBeenCalledWith("chat");
+    expect(props.onClose).toHaveBeenCalledOnce();
+  });
+
+  // A control that disappears on some panes and not others is how an operator concludes the app is
+  // broken, and it would be worst for exactly the person whose standing mode is Chat.
+  it("keeps the row and carries the reason on a pane that cannot draw a chat", () => {
+    renderSheet({
+      paneView: "chat",
+      onPaneViewChange: vi.fn(),
+      paneViewNote: "This pane keeps the terminal: no session.",
+    });
+    expect(screen.getByRole("button", { name: /Terminal view/ })).toBeInTheDocument();
+    expect(screen.getByText("This pane keeps the terminal: no session.")).toBeInTheDocument();
+  });
+});
+
+// "New agent in a worktree" (ADR 0089). Three gates: the caller passes `onBranchOff` (only for a pane
+// in a Git repo), the multiplexer declares `createWorktree`, and the scope is the lead.
+describe("PaneActionsSheet — New agent in a worktree", () => {
+  afterEach(() => __resetOperatorCommands());
+
+  /** Serve an `/api/config` whose mux block says `createWorktree` is `capable`. */
+  function worktreeCapable(capable: boolean) {
+    const mux: MuxConfig = { name: "reference", capabilities: { createWorktree: capable }, unsupportedKeys: [], notes: {} };
+    server.use(http.get("/api/config", () => HttpResponse.json({ push: false, vapidPublicKey: "", mux })));
+  }
+  const row = () => screen.queryByRole("button", { name: "New agent in a worktree" });
+
+  it("is offered on the lead when the multiplexer can create a worktree", async () => {
+    worktreeCapable(true);
+    renderSheet({ onBranchOff: vi.fn() });
+    expect(await screen.findByRole("button", { name: "New agent in a worktree" })).toBeInTheDocument();
+  });
+
+  it("is withdrawn when the multiplexer declares no worktrees (tmux, zellij)", async () => {
+    worktreeCapable(false);
+    renderSheet({ onBranchOff: vi.fn() });
+    await waitFor(() => expect(row()).toBeNull());
+    // The other writes are untouched by it.
+    expect(screen.getByRole("button", { name: "Rename" })).toBeInTheDocument();
+  });
+
+  it("is withdrawn on a crew member's pane: the route is lead-local", async () => {
+    worktreeCapable(true);
+    renderSheet({ onBranchOff: vi.fn(), scope: { host: "laptop" } });
+    await screen.findByRole("button", { name: "Rename" });
+    expect(row()).toBeNull();
+  });
+
+  it("is withdrawn when the caller passes nothing (a pane outside a repo)", async () => {
+    worktreeCapable(true);
+    renderSheet();
+    await screen.findByRole("button", { name: "Rename" });
+    expect(row()).toBeNull();
+  });
+
+  it("is withdrawn on a read-only device, like every write", async () => {
+    worktreeCapable(true);
+    renderSheet({ onBranchOff: vi.fn(), readOnly: true });
+    expect(row()).toBeNull();
+  });
+
+  it("closes the sheet first, then goes to the New page", async () => {
+    worktreeCapable(true);
+    const user = userEvent.setup();
+    const order: string[] = [];
+    renderSheet({ onClose: () => order.push("close"), onBranchOff: () => order.push("branchOff") });
+    await user.click(await screen.findByRole("button", { name: "New agent in a worktree" }));
+    expect(order).toEqual(["close", "branchOff"]);
+  });
+
+  it("sits above Close pane, so the destructive row stays last", async () => {
+    worktreeCapable(true);
+    renderSheet({ onBranchOff: vi.fn() });
+    const branch = await screen.findByRole("button", { name: "New agent in a worktree" });
+    const close = screen.getByRole("button", { name: "Close pane" });
+    expect(branch.compareDocumentPosition(close) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+describe("PaneActionsSheet — a saved copy", () => {
+  it("replaces Rename, Focus, Close and the branch-off with a note, and keeps Pin", () => {
+    renderSheet({ savedCopy: true, onBranchOff: vi.fn() });
+    expect(screen.getByText("Saved copy. Reconnect to make changes.")).toBeInTheDocument();
+    for (const name of ["Rename", "Close pane"]) expect(screen.queryByRole("button", { name })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Focus|Show in|New agent in a worktree/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Pin to top/ })).toBeInTheDocument();
+  });
+
+  it("sends no write", async () => {
+    const calls: string[] = [];
+    server.use(
+      http.post(/\/api\/pane\/.*/, ({ request }) => {
+        calls.push(request.url);
+        return HttpResponse.json({ ok: true });
+      }),
+      http.delete(/\/api\/pane\/.*/, ({ request }) => {
+        calls.push(request.url);
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+    renderSheet({ savedCopy: true });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("PaneActionsSheet — Messages (M62)", () => {
+  it("shows no Messages row on a door that passes no callback", () => {
+    renderSheet();
+    expect(screen.queryByRole("button", { name: "Messages" })).toBeNull();
+  });
+
+  it("closes the sheet first, then opens the Messages sheet, and stays a read row on a read-only device", async () => {
+    const user = userEvent.setup();
+    const onMessages = vi.fn();
+    const props = renderSheet({ onMessages, readOnly: true });
+    await user.click(screen.getByRole("button", { name: "Messages" }));
+    expect(onMessages).toHaveBeenCalledOnce();
+    expect(vi.mocked(props.onClose).mock.invocationCallOrder[0]!).toBeLessThan(onMessages.mock.invocationCallOrder[0]!);
+  });
+});

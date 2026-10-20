@@ -1,0 +1,101 @@
+import { useState } from "react";
+import { Loader2, RefreshCw } from "lucide-react";
+import { useRevalidator } from "react-router";
+
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { useLocale } from "@/hooks/use-locale";
+import { t } from "@/lib/i18n";
+import { checkForUpdates } from "@/lib/api";
+import { timeAgo } from "@/lib/format";
+import type { UpdateInfo } from "@/lib/types";
+import { useOptionalRootData } from "@/lib/route-data";
+
+// "Check for updates" — a manual, on-demand upstream check, and the first thing on
+// `/settings/updates`. The bridge only polls upstream every few hours, so this forces a fresh look
+// (which can take ~10s). It reads the current version + last-checked time from the snapshot's
+// `update` (via the root loader), then after a check revalidates so the UpdateCard directly beneath
+// it reflects the new state. This control is the QUESTION and that card is the ANSWER: every
+// actionable line — the version available, the preflight, the peers, the one button — lives there,
+// and here we only confirm an up-to-date result or surface a check failure.
+
+function describe(update: UpdateInfo | undefined): string {
+  if (!update) return t("settings.update.check.prompt");
+  if (update.checkedAt) {
+    return t("settings.update.check.runningChecked", {
+      current: update.current,
+      checked: timeAgo(update.checkedAt),
+    });
+  }
+  return t("settings.update.check.running", { current: update.current });
+}
+
+export function UpdateCheckControl() {
+  useLocale();
+  const data = useOptionalRootData();
+  const update = data?.update;
+  const revalidator = useRevalidator();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(false);
+
+  async function check() {
+    setBusy(true);
+    setError(false);
+    const priorCheckedAt = update?.checkedAt ?? null;
+    try {
+      const result = await checkForUpdates();
+      // The bridge is fail-soft: a GitHub fetch error keeps prior state and STILL returns 200. If
+      // `checkedAt` didn't advance (or never ran), the check silently failed — surface that rather
+      // than let the stale state read as an authoritative "Up to date".
+      if (result.checkedAt === null || result.checkedAt === priorCheckedAt) {
+        setError(true);
+        return;
+      }
+      revalidator.revalidate(); // pull the fresh snapshot so the UpdateCard below reflects it
+    } catch {
+      setError(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // A pending MAJOR is not "up to date" either — it is the one thing the routine update won't take
+  // (ADR 0020), so the banner's consent line must not be contradicted three inches above it.
+  const upToDate = Boolean(
+    update && !update.releaseAvailable && !update.bridgeStale && !update.majorAvailable,
+  );
+
+  return (
+    <Card className="gap-0 py-0">
+      <div className="flex items-center justify-between gap-4 p-4">
+        <div className="flex min-w-0 items-start gap-3">
+          <RefreshCw className="mt-0.5 size-5 shrink-0 text-muted-foreground" />
+          <div className="min-w-0">
+            <div className="font-medium">{t("settings.update.title")}</div>
+            <p className="text-sm text-muted-foreground">{describe(update)}</p>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-3 border-t border-border p-3">
+        <Button variant="outline" size="sm" disabled={busy} onClick={check}>
+          {busy ? (
+            <>
+              <Loader2 className="size-4 animate-spin" />
+              {t("settings.update.checking")}
+            </>
+          ) : (
+            t("settings.update.action")
+          )}
+        </Button>
+        {/* Lightweight result — the actionable "available"/"restart" case is left to the UpdateCard. */}
+        {!busy && error && (
+          <span className="text-xs text-status-blocked">{t("settings.update.error")}</span>
+        )}
+        {!busy && !error && upToDate && (
+          <span className="text-xs text-muted-foreground">{t("settings.update.upToDate")}</span>
+        )}
+      </div>
+    </Card>
+  );
+}

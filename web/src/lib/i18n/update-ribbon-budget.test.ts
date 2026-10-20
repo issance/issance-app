@@ -1,0 +1,148 @@
+import { describe, expect, it } from "vitest";
+
+import { de } from "./messages/de";
+import { en, type Dictionary, type MessageKey } from "./messages/en";
+import { es } from "./messages/es";
+import { fr } from "./messages/fr";
+import { it as itIT } from "./messages/it";
+import { ja } from "./messages/ja";
+import { ko } from "./messages/ko";
+import { pt } from "./messages/pt";
+import { ru } from "./messages/ru";
+import { tr } from "./messages/tr";
+import { zh } from "./messages/zh";
+import { zhTW } from "./messages/zh-TW";
+
+// ── THE BAND'S 40-CHARACTER BUDGET ──────────────────────────────────────────────────────────────
+//
+// The update band is ONE truncating row at the top of a phone, which is about forty characters wide.
+// A string that overflows it in German or Japanese is a string nobody can read — so the budget is
+// enforced here rather than recommended in a comment, over ALL TWELVE dictionaries, and it is why the
+// English strings are as terse as they are.
+//
+// The budget is measured with the SLOTS FILLED, because a slot is not what reaches the screen: the
+// template `issance {version} available.` is 27 characters and the line it prints is 23. Each slot
+// gets one representative value, and they are deliberately generous — a five-part version and an
+// eight-letter machine name.
+//
+// `{reason}` is the exception, and it is filled EMPTY: a peer's rollback reason is that machine's own
+// prose of unbounded length, so it can never be budgeted as a fixed string. It is cut on a word
+// boundary to `REASON_BUDGET` before it reaches a message (`lib/update-ribbon.ts`), and the Updates
+// page carries it whole.
+//
+// `pwa.updateAvailable` is NOT in this block and is NOT held to the budget. The band renders it in
+// the one state where no issance update is involved, and M16/02's rule there is that the existing
+// self-updater's behaviour AND ITS WORDS are unchanged.
+
+const LOCALES: readonly (readonly [string, Dictionary])[] = [
+  ["en", en],
+  ["de", de],
+  ["es", es],
+  ["ja", ja],
+  ["ko", ko],
+  ["zh", zh],
+  ["zh-TW", zhTW],
+  ["ru", ru],
+  ["it", itIT],
+  ["fr", fr],
+  ["pt", pt],
+  ["tr", tr],
+];
+
+/** Every key the band can print, plus the aria-label on its dismiss.
+ *
+ *  `updateScreen.badge.` joined the list on 2026-09-20, when the collapsed update badge stopped
+ *  being a bar pinned over the composer and became a strip in this band. It prints in the same
+ *  truncating row and is held to the same budget; the REST of `updateScreen.` is the sheet's, which
+ *  is a full screen and wraps, so it is deliberately not here. */
+const BAND_PREFIXES = ["updateRibbon.", "updateScreen.badge."] as const;
+
+/** One representative value per slot. See the header for why `reason` is empty. */
+const SAMPLE = {
+  version: "1.5.0",
+  // The longest manager name the band can print today: pacman, nix and brew are the three
+  // `cli/package-command.ts` resolves.
+  manager: "pacman",
+  count: "1",
+  name: "minibuch",
+  names: "minibuch",
+  reason: "",
+  // The longest duration the band prints in practice: a run past this is a run the wall clock has
+  // already failed (`bridge/crew/follow.ts`, LEG_WALL_CLOCK_MS = 20 minutes).
+  elapsed: "20 min",
+} as const;
+
+const BUDGET = 40;
+
+function fill(template: string): string {
+  let out = template;
+  for (const [slot, value] of Object.entries(SAMPLE)) out = out.split(`{${slot}}`).join(value);
+  return out;
+}
+
+function bandKeys(): MessageKey[] {
+  // SAFETY: `MessageKey` is `keyof typeof en` by construction, so every own key of `en` is one.
+  const keys = Object.keys(en) as MessageKey[];
+  return keys.filter((key) => BAND_PREFIXES.some((prefix) => key.startsWith(prefix)));
+}
+
+/**
+ * The `{word}` the badge prints, taken PER LOCALE as that locale's longest state word.
+ *
+ * The other slots take one representative value because their content is a name or a number and
+ * does not translate. This one is a translated string picked from `updateScreen.state.*` at render
+ * time, so a fixed English sample would measure the budget against text that never reaches a German
+ * screen. Measuring the worst word each dictionary actually holds is the honest reading.
+ */
+function longestStateWord(dictionary: Dictionary): string {
+  // SAFETY: same construction as `bandKeys` — every own key of `en` is a `MessageKey`.
+  const keys = (Object.keys(en) as MessageKey[]).filter((key) => key.startsWith("updateScreen.state."));
+  let longest = "";
+  for (const key of keys) {
+    const value = fill(dictionary[key]);
+    if (value.length > longest.length) longest = value;
+  }
+  return longest;
+}
+
+describe("i18n — the update band", () => {
+  it("holds every band string to the 40 character budget in all twelve locales", () => {
+    const keys = bandKeys();
+    expect(keys.length).toBeGreaterThan(0); // the assertion must never pass by finding nothing
+
+    const over: string[] = [];
+    for (const [locale, dictionary] of LOCALES) {
+      const word = longestStateWord(dictionary);
+      for (const key of keys) {
+        const line = fill(dictionary[key]).split("{word}").join(word);
+        if (line.length > BUDGET) over.push(`${locale} ${key}: ${line.length} — "${line}"`);
+      }
+    }
+    expect(over, `over the ${BUDGET}-character band budget`).toEqual([]);
+  });
+
+  it("carries every band key in all twelve locales", () => {
+    // `Dictionary` already makes a missing key a compile error; this is the runtime half, so a
+    // hand-edited bundle that lost a line fails a test rather than printing `undefined`.
+    const keys = bandKeys();
+    for (const [locale, dictionary] of LOCALES) {
+      for (const key of keys) {
+        expect(dictionary[key], `${locale} is missing ${key}`).toMatch(/\S/);
+      }
+    }
+  });
+
+  it("leaves no slot unfilled — every {slot} a band string uses has a sample above", () => {
+    const unknown = new Set<string>();
+    for (const [, dictionary] of LOCALES) {
+      for (const key of bandKeys()) {
+        for (const slot of dictionary[key].matchAll(/\{(\w+)\}/g)) {
+          // `word` is filled per locale by `longestStateWord`, not from the table above.
+          if (slot[1] === "word") continue;
+          if (!Object.hasOwn(SAMPLE, slot[1])) unknown.add(slot[1]);
+        }
+      }
+    }
+    expect([...unknown], "add a sample value, or the budget is measured against a placeholder").toEqual([]);
+  });
+});

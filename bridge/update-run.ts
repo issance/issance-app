@@ -1,0 +1,392 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+// The update RUN record: `<state dir>/update.json`, written by the detached updater and read by
+// everybody else (M15/04).
+//
+// ── WHY THE SHAPE LIVES IN `bridge/` ─────────────────────────────────────────
+// The writer is `cli/update-run.ts` and the readers are the bridge's update snapshot and the standby
+// door. `cli/` may import from `bridge/`; nothing in `bridge/` may import from `cli/`. So the record,
+// its parser and the staleness rule live here — the same reason `bridge/version.ts` owns the version
+// string both sides print. One definition, never two that agree today.
+//
+// ── WHY THERE IS A FILE AT ALL ───────────────────────────────────────────────
+// An update restarts the bridge, so the process that reports on it cannot be the process being
+// restarted. The runner writes; the bridge reads at startup and reports what it finds, instead of
+// coming up `idle` and telling the phone nothing happened. That symptom — tap update, the app goes
+// blank, comes back claiming there was no update — is the whole reason this file is on disk.
+
+/**
+ * The record's schema, as this build WRITES it. Bumped when a field changes meaning.
+ *
+ * `2` added {@link UpdateRun.runId} (M16/04) — additively, so a `1` record is still a record this
+ * build reads whole. {@link READABLE_UPDATE_RUN_SCHEMAS} is the set a reader accepts, and a document
+ * carrying anything outside it is declined rather than half-read, exactly as before.
+ */
+export const UPDATE_RUN_SCHEMA = 2;
+
+/**
+ * The schemas a reader accepts. A `1` record simply has **no run id**, which is the closed reading:
+ * a run nobody can name is a run no peer will ever match a rollback against.
+ */
+export const READABLE_UPDATE_RUN_SCHEMAS: ReadonlySet<number> = new Set([1, UPDATE_RUN_SCHEMA]);
+
+/** `<state dir>/update.json` — the record. */
+export const UPDATE_RUN_FILENAME = "update.json";
+/** `<state dir>/update.lock` — the pid-and-timestamp lock. One run at a time. */
+export const UPDATE_LOCK_FILENAME = "update.lock";
+
+export const updateRunPath = (stateDir: string): string => join(stateDir, UPDATE_RUN_FILENAME);
+export const updateLockPath = (stateDir: string): string => join(stateDir, UPDATE_LOCK_FILENAME);
+
+/**
+ * Where a run is.
+ *
+ * `done`, `rolled-back`, `stuck` and `interrupted` are terminal. `idle` is both the start and where
+ * an aborted preflight or staging returns to — nothing had moved yet, so there is nothing to report
+ * beyond the reason.
+ */
+export type UpdateRunState =
+  | "idle"
+  | "preflight"
+  | "staging"
+  | "restarting"
+  | "verifying"
+  | "done"
+  | "rolled-back"
+  | "stuck"
+  | "interrupted";
+
+const STATES: ReadonlySet<string> = new Set<UpdateRunState>([
+  "idle",
+  "preflight",
+  "staging",
+  "restarting",
+  "verifying",
+  "done",
+  "rolled-back",
+  "stuck",
+  "interrupted",
+]);
+
+/** The states in which a run is still being driven by somebody. Only these can go stale. */
+const IN_FLIGHT: ReadonlySet<UpdateRunState> = new Set<UpdateRunState>([
+  "preflight",
+  "staging",
+  "restarting",
+  "verifying",
+]);
+
+/** Is `state` one somebody is supposed to still be driving? */
+export const inFlight = (state: UpdateRunState): boolean => IN_FLIGHT.has(state);
+
+/**
+ * How long an in-flight record may sit untouched before a dead updater's marker stops meaning
+ * anything. Ten minutes covers a slow build on slow hardware with room to spare; past it, with no
+ * live updater pid, the run is over and nobody is driving it.
+ */
+export const STALE_AFTER_MS = 10 * 60 * 1000;
+
+/**
+ * The longest a lock may hold, even when its pid is alive. A build runs for minutes, so a lock an
+ * hour old whose pid answers is a pid the machine handed to some other process after a crash or a
+ * reboot, not an update.
+ */
+export const LOCK_MAX_HOLD_MS = 60 * 60 * 1000;
+
+/** The record, exactly as it is on disk. */
+export interface UpdateRun {
+  readonly schema: number;
+  readonly state: UpdateRunState;
+  /** The version directory the run started from, or null when there was none to name. */
+  readonly from: string | null;
+  /** The version directory the run is going to. */
+  readonly to: string | null;
+  readonly startedAt: number;
+  readonly updatedAt: number;
+  /** The updater's pid — what the lock and the staleness rule ask the process table about. */
+  readonly pid: number;
+  /** How many rollbacks this run has made. `0` on the way forward, `1` after the one rollback. */
+  readonly attempt: number;
+  /**
+   * The run's own id — **opaque**, minted once when the operator confirms (M16/04). Never a
+   * timestamp and never a version: two confirms inside one millisecond would collide, and an id that
+   * reads as a clock claim on the wire is an id somebody will compare.
+   *
+   * Absent on a schema-1 record and on every run this machine started for itself before the crew
+   * learned to follow. Absent means "no run to key on", which is what makes a peer's rollback memory
+   * refuse rather than match (`bridge/crew/follow.ts`).
+   */
+  readonly runId?: string;
+  /** Why the run is where it is, when that needs a sentence. */
+  readonly reason?: string;
+  /**
+   * A bounded tail of what the run has to show for itself.
+   *
+   * Two sources, never both at once. On a FAILURE it is the credential-scrubbed service log, written
+   * into the record by the runner. While STAGING it is the fetch-and-build progress the staging
+   * process wrote beside this file, folded in by the bridge on read (M20/10,
+   * `bridge/staging-log.ts`) — never written to disk here, and never shown once a failure has a tail
+   * of its own to show, because the service log is the more useful document at that point.
+   */
+  readonly logTail?: string;
+  /** The command the operator runs by hand — carried only by `stuck`. */
+  readonly recovery?: string;
+  /**
+   * `rollback` when this run goes BACK to a build already on disk (M60 spec 01, the phone's "Roll
+   * back"): `to` is then the older version and `from` the one being left. Absent on every update.
+   *
+   * Additive within schema 2: a reader older than the field drops it and reads the run as an update
+   * to `to`, which is still a true sentence about where the machine went. The one reader that must
+   * know is {@link crewTurnStart}: a rollback levels the crew DOWN, to the build the lead went back
+   * to (ADR 0110), where an update levels it up.
+   *
+   * `switch` when the operator moved this machine from Edge back to Stable with "Go back now" (M60
+   * spec 01): `to` is the latest Stable release, below the Edge build being left. It levels the crew
+   * down the same way.
+   */
+  readonly action?: RunAction;
+}
+
+/** The two runs that go DOWN a version: a rollback, and the person-started switch back to Stable. */
+export type RunAction = "rollback" | "switch";
+
+/** The lock file's contents: who holds it and since when. */
+export interface UpdateLock {
+  readonly pid: number;
+  readonly at: number;
+}
+
+const finite = (value: number | undefined, fallback: number): number =>
+  Number.isFinite(Number(value)) ? Number(value) : fallback;
+
+/**
+ * `value` when the document really carried a non-empty string there, else null.
+ *
+ * {@link finite}'s sibling, and it has to be one: the field is declared `string` for this file's own
+ * readers, but the document is foreign and may hold a number, an object or nothing at all. `String(v)
+ * === v` is true for a string and for nothing else, so the round trip IS the check.
+ */
+const nonEmptyString = (value: string | undefined): string | null =>
+  value === undefined || value === null || String(value) !== value || value === "" ? null : value;
+
+/**
+ * The record in `text`, or null when there is none this build can read as one.
+ *
+ * A malformed record reads the same as a missing one, on purpose: both mean "no evidence of a run",
+ * and a reader that guessed at half a document would report a state nobody was ever in. A record
+ * from a schema this build does not know is declined for the same reason.
+ */
+export function parseUpdateRun(text: string | null): UpdateRun | null {
+  if (text === null) return null;
+  let doc: {
+    schema?: number;
+    state?: string;
+    from?: string | null;
+    to?: string | null;
+    startedAt?: number;
+    updatedAt?: number;
+    pid?: number;
+    attempt?: number;
+    runId?: string;
+    reason?: string;
+    logTail?: string;
+    recovery?: string;
+    action?: string;
+  };
+  try {
+    // SAFETY: `JSON.parse` answers a JSON value, and every field read off it below is either
+    // validated (`state` against the closed set, the numbers through `Number.isFinite`) or only ever
+    // printed. Nothing here becomes a path, a command or a credential.
+    doc = JSON.parse(text) as { schema?: number };
+  } catch {
+    return null;
+  }
+  const schema = finite(doc.schema, 0);
+  if (!READABLE_UPDATE_RUN_SCHEMAS.has(schema)) return null;
+  const state = doc.state ?? "";
+  if (!STATES.has(state)) return null;
+  // Assigned, never conditionally spread: a record without a reason must carry NO such key rather
+  // than one whose value is `undefined`.
+  const run: DraftRun = {
+    // The schema the DOCUMENT claims, not this build's — a record read as `1` and handed back as `2`
+    // would be a reader inventing a field the writer never wrote.
+    schema,
+    // SAFETY: `STATES` holds exactly the members of `UpdateRunState`, and the guard above returned
+    // for every string that is not one of them.
+    state: state as UpdateRunState,
+    from: doc.from ?? null,
+    to: doc.to ?? null,
+    startedAt: finite(doc.startedAt, 0),
+    updatedAt: finite(doc.updatedAt, 0),
+    pid: finite(doc.pid, 0),
+    attempt: finite(doc.attempt, 0),
+  };
+  // Assigned only when it is a non-empty string: an id nobody can name is no id at all, and an empty
+  // one would match another empty one. `text` is `finite`'s sibling — a foreign document may carry
+  // any JSON value here, and only a real string is one.
+  const id = nonEmptyString(doc.runId);
+  if (id !== null) run.runId = id;
+  if (doc.reason !== undefined) run.reason = doc.reason;
+  if (doc.logTail !== undefined) run.logTail = doc.logTail;
+  if (doc.recovery !== undefined) run.recovery = doc.recovery;
+  // Only the two words this build knows. Anything else reads as no action, which is an update.
+  if (doc.action === "rollback" || doc.action === "switch") run.action = doc.action;
+  return run;
+}
+
+/**
+ * {@link UpdateRun} while it is being BUILT field by field — the one place the record is not
+ * readonly. A named contract rather than a mapped type, so the optional fields are declared here
+ * where the parser assigns them.
+ */
+interface DraftRun {
+  schema: number;
+  state: UpdateRunState;
+  from: string | null;
+  to: string | null;
+  startedAt: number;
+  updatedAt: number;
+  pid: number;
+  attempt: number;
+  runId?: string;
+  reason?: string;
+  logTail?: string;
+  recovery?: string;
+  action?: RunAction;
+}
+
+/** The lock in `text`, or null. Same posture as {@link parseUpdateRun}: half a lock is no lock. */
+export function parseUpdateLock(text: string | null): UpdateLock | null {
+  if (text === null) return null;
+  let doc: { pid?: number; at?: number };
+  try {
+    // SAFETY: as above — a parsed JSON document whose two numeric fields are both range-checked
+    // before use, and neither ever leaves this module as anything but a number.
+    doc = JSON.parse(text) as { pid?: number; at?: number };
+  } catch {
+    return null;
+  }
+  const pid = finite(doc.pid, 0);
+  if (pid <= 0) return null;
+  return { pid, at: finite(doc.at, 0) };
+}
+
+/**
+ * **The one staleness rule**, and it covers the killed updater, the rebooted host and the lock left
+ * behind by a crash in a single sentence: an in-flight record older than ten minutes whose updater
+ * pid is not alive is `interrupted`.
+ *
+ * Both halves are required. A live pid means the run is simply slow — a big build on a small
+ * machine — and killing it off after ten minutes would be inventing a failure. A young record with a
+ * dead pid means the updater has only just gone, and a reader that raced the writer's own rename
+ * would report an interruption that never happened.
+ */
+export function readsAsInterrupted(run: UpdateRun, now: number, pidAlive: boolean): boolean {
+  if (!inFlight(run.state)) return false;
+  if (pidAlive) return false;
+  return now - run.updatedAt >= STALE_AFTER_MS;
+}
+
+/**
+ * `run` as of `now` — the record itself, or the `interrupted` reading of it. Every reader goes
+ * through this, so the bridge, the standby door and `issance update --status` can never disagree
+ * about whether a stale marker is still a run.
+ */
+export function resolveUpdateRun(run: UpdateRun, now: number, pidAlive: boolean): UpdateRun {
+  if (!readsAsInterrupted(run, now, pidAlive)) return run;
+  return {
+    ...run,
+    state: "interrupted",
+    updatedAt: now,
+    reason: `the updater (pid ${run.pid}) is gone and the run has not moved since ${new Date(run.updatedAt).toISOString()}`,
+  };
+}
+
+/** Is there a live process under `pid`? Signal 0 asks without delivering anything. */
+export function pidIsAlive(pid: number): boolean {
+  if (pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    // EPERM (somebody else's process) is a live pid too, but it cannot be OUR updater — a run this
+    // machine started is owned by this user — so treating it as gone is the honest answer here.
+    return false;
+  }
+}
+
+/**
+ * Whether the updater's lock is held by a process that is still alive.
+ *
+ * The bridge's half of spec 04's lock, and the whole of what `POST /api/update` needs from it: not
+ * who holds it or since when, only whether starting a second updater would be starting a second
+ * updater. A lock file left behind by a dead process is NOT held — the same reading
+ * {@link readsAsInterrupted} takes of the record beside it, so the two can never disagree about
+ * whether a run is still a run.
+ */
+export function updateLockHeld(
+  stateDir: string,
+  alive: (pid: number) => boolean = pidIsAlive,
+  now: () => number = Date.now,
+): boolean {
+  let text: string | null;
+  try {
+    text = readFileSync(updateLockPath(stateDir), "utf8");
+  } catch {
+    return false;
+  }
+  const lock = parseUpdateLock(text);
+  // Alive AND young: past {@link LOCK_MAX_HOLD_MS} a live pid is a reused one.
+  return lock !== null && now() - lock.at < LOCK_MAX_HOLD_MS && alive(lock.pid);
+}
+
+/**
+ * The `(runId, to)` a finished run hands the crew's turn queue, or null when this record starts no
+ * turns. The lead's own health gate settling is what calls it (`settleUpdateGate` in
+ * `bridge/index.ts`), on every poll tick, because the queue is in memory and the update restarted
+ * the process that held it — this record is the only thing that crossed the restart.
+ *
+ * A function rather than four conditions inline at the one call site, because the WRITER is in
+ * another tree: `cli/update.ts` decides what a finished run looks like on disk, and the two halves
+ * agreeing is the whole of the crew levelling. A test can hold a real written record against this
+ * and fail when either side moves; four conditions in `index.ts` could only be read, never run,
+ * because importing that module boots a bridge.
+ *
+ * All four are load-bearing. `done` because a run still in flight has nothing to level to yet.
+ * `runId` because the queue is keyed on it, and a run with none was started from a terminal by
+ * someone who never asked for a crew. `to` because that is the version the peers are levelling to.
+ */
+export function crewTurnStart(
+  run: UpdateRun | null,
+): { readonly runId: string; readonly to: string; readonly at: number; readonly down: boolean } | null {
+  if (run === null || run.state !== "done") return null;
+  if (run.runId === undefined || run.to === null) return null;
+  // `updatedAt` is the moment this machine finished, which is the moment the levelling could have
+  // begun. A caller that re-derives the queue after a restart ages the run against it, so a record
+  // left behind by a crash days ago cannot start a levelling run today (M20/01).
+  //
+  // A ROLLBACK AND A SWITCH BACK TO STABLE LEVEL THE CREW DOWN (ADR 0110). Their `to` is the OLDER
+  // build, and those two runs are the only ones a member steps down for (`crew/follow.ts` reads the
+  // step from `X-Crew-Lead-Line`). Every other run levels up, as it always did.
+  return { runId: run.runId, to: run.to, at: run.updatedAt, down: run.action !== undefined };
+}
+
+/**
+ * The record on disk as of now, resolved — for the bridge, which reads it at startup and on every
+ * update snapshot. Synchronous and tiny: one small file, read at most once per snapshot poll.
+ */
+export function readUpdateRun(
+  stateDir: string,
+  now: () => number = Date.now,
+  alive: (pid: number) => boolean = pidIsAlive,
+): UpdateRun | null {
+  let text: string | null;
+  try {
+    text = readFileSync(updateRunPath(stateDir), "utf8");
+  } catch {
+    return null;
+  }
+  const run = parseUpdateRun(text);
+  return run === null ? null : resolveUpdateRun(run, now(), alive(run.pid));
+}

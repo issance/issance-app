@@ -1,0 +1,339 @@
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+
+import { parseAnsi } from "../ansi";
+import { splitLines } from "../blocks";
+import { claudeAdapter } from "./claude";
+import { describeAdapterConformance, isValidHerdrKey } from "./conformance";
+import { registeredAgents } from "./registry";
+import { WALK_GAPS, WALK_PAIRS } from "./walk-pairs";
+
+// The Claude adapter is the reference implementation the conformance suite gates. The fixture
+// cohorts are derived from the byte-faithful corpus (web/src/fixtures/panes/claude--*.txt) by
+// GLOBBING it, so a newly-captured dialog is covered the moment it lands — including the multiSelect
+// captures whose block may still be wiring up (a not-yet-detecting own fixture is tolerated by the
+// suite, see conformance.ts).
+//
+// The FOREIGN cohort is the other adapters' corpora (omp + codex + grok). Until a second corpus
+// existed this leg was vacuous (`foreignFixtures: []`), so "an adapter must stay raw on another
+// harness's screens" was a documented promise nothing checked. The mirror-image assertions live in
+// harness/omp.test.ts, harness/codex.test.ts and harness/grok.test.ts.
+
+const PANES_DIR = join(import.meta.dirname, "..", "..", "fixtures", "panes");
+
+// The neutral (no-dialog) Claude states: they must never lift an interactive block. Includes the
+// in-flight-send captures — a `❯ …` input box (with or without a slash-autocomplete menu above it) is
+// composer chrome, not a dialog, so it must stay raw. The wrapped-draft capture is the same: a
+// (multi-line) input box, stripped as chrome, never lifted.
+// `claude--working.txt` left this set on 2026-10-19: the rating survey over its box is a notice now
+// (ADR 0109), and lifts its card.
+const NEUTRAL = new Set([
+  // The default footer's own hints ("esc to interrupt", "↓ to manage") sit under a live box.
+  "claude--working-esc-to-interrupt.txt",
+  "claude--idle-background-shell.txt",
+  "claude--fresh-idle.txt",
+  "claude--done.txt",
+  "claude--send-inflight.txt",
+  "claude--rename-resolved.txt",
+  "claude--draft-wrapped.txt",
+  // A long send that Claude collapsed into `[Pasted text #3 +3 lines]`: still an input box holding a
+  // draft, never a dialog. Pinned below (.adr/0010) — the token must not read as a modal.
+  "claude--draft-paste-placeholder.txt",
+  // The SPLIT shape of the same thing — token + the literal tail a chunk boundary left uncollapsed —
+  // captured complete and half-arrived. Still an input box with a draft in it; pinned below (#110).
+  "claude--draft-paste-split-tail.txt",
+  "claude--draft-paste-split-partial.txt",
+  // Input boxes with the background-agents footer below them — still composer chrome (stripped), not a
+  // dialog, so they must stay raw / lift no interactive block.
+  "claude--draft-footer-empty.txt",
+  "claude--draft-footer-single.txt",
+  "claude--draft-footer-wrapped.txt",
+  // The same footer with Claude Code 2.1.293's active-agent pointer (`❯ ◯ …`) on its last row — still
+  // composer chrome below a live box, never a dialog.
+  "claude--footer-pointed-agent.txt",
+  // The /model picker DISMISSED: the input box is back, so this is an ordinary idle screen. It is the
+  // negative control for the generic menu grammar — its statusline is `·`-separated like a key-hint
+  // footer, and the input-box gate is the only thing that keeps it raw.
+  "claude--menu-model-picker-dismissed.txt",
+  // The dynamic-workflow view (ADR 0072). A read-only SCREEN, not a dialog: its footer is a row of
+  // key hints (`↑↓ select · p resume · f filter · esc back · s save`), which is the shape the generic
+  // menu grammar keys on, and it must still decline. There is nothing here to answer. `p` pauses a
+  // run, and offering that from the phone is a feature with its own decision to take, not something
+  // to fall out of a footer that happens to look like a menu.
+  "claude--workflow-view.txt",
+  // GHOST TEXT: an input box holding the generated "suggested next prompt" Claude paints when the box
+  // is empty, and the same box after typing over it. Both are ordinary idle screens — composer chrome,
+  // never a dialog. They exist to pin how the suggestion is PAINTED (faint, SGR 2), which is the only
+  // thing separating it from a draft; see harness/claude/chrome.ts.
+  "claude--ghost-suggestion.txt",
+  "claude--ghost-typed-over.txt",
+  // `/model sonnet` answered with one acknowledgement row above an empty input box: the evidence that
+  // the harness bar's alias options are a real command form, and an ordinary idle screen to this
+  // adapter. Nothing on it is a dialog — the alias needs no picker, which is the point of the row.
+  "claude--model-alias.txt",
+  // The `/effort` slider at 40 columns with `low` selected: a genuine dialog, but not one this
+  // adapter's own grammars can read — at 40 columns with the marker leftmost Claude draws no `▲` at
+  // all, marking `low` by colour alone, so every specific detector and the generic menu decline it.
+  // `adapter.buildBlocks` is therefore raw-only here exactly as it is on a true no-dialog screen; the
+  // unread-dialog post-pass (outside the adapter, harness/index.ts) is what offers Cancel over it,
+  // and that card is pinned separately in unread-dialog.test.ts, not by this suite.
+  "claude--menu-effort-slider--w40-low.txt",
+  // Claude Code 2.1.283 input boxes whose multi-line draft holds a pasted `────` rule or a pasted
+  // `❯ ls -la` shell prompt. Idle screens with a draft, never a dialog: the indented rows are draft
+  // text (ADR 0048 addendum 2026-09-26).
+  "claude--v2283-draft-prompt.txt",
+  "claude--v2283-draft-rule.txt",
+  // The shell prompt under a Claude that is starting or exiting (herdr already, or still, reports the
+  // agent): no dialog at all, and since the 2026-09-26 addendum to ADR 0053 no unread card either.
+  "claude--v2283-shell-before-first-frame.txt",
+  "claude--v2283-shell-after-exit.txt",
+  // Claude Code 2.1.283 after the `/plugin` Marketplaces tab applied an update: the menu is closed
+  // and "✔ Updated 1 marketplace" sits in the chat above an ordinary box. Idle, never a dialog.
+  "claude--v2283-plugin-marketplaces-updated--w40.txt",
+  "claude--v2283-plugin-marketplaces-updated--w82.txt",
+  "claude--v2283-plugin-marketplaces-updated--w120.txt",
+  "claude--v2283-fullscreen-plugin-marketplaces-updated--w40.txt",
+  "claude--v2283-fullscreen-plugin-marketplaces-updated--w82.txt",
+  "claude--v2283-fullscreen-plugin-marketplaces-updated--w120.txt",
+  // A marketplace's detail screen in the full-screen renderer, taller than the 40-row pane: Claude
+  // clips it at the bottom, so its footer is not on screen and it names no key. A real dialog that
+  // no grammar may read (ADR 0009), and with no key-hint row in its tail, no unread card either.
+  "claude--v2283-fullscreen-plugin-marketplace-detail--w40.txt",
+  "claude--v2283-fullscreen-plugin-marketplace-detail--w82.txt",
+  // The `/plugin` "Add Marketplace" source field: a text field no grammar reads. The unread card
+  // covers it (unread-dialog.test.ts).
+  "claude--v2283-plugin-marketplaces-add-form--w82.txt",
+  // Claude Code 2.1.296's box table with a `⚠️` cell, cut to the reply's rows: a table that pans
+  // (table-run.test.ts), never a dialog.
+  "claude--box-table-vs16-emoji.txt",
+  // Claude Code 2.1.301: a fresh idle box, and the box a PermissionRequest hook leaves on screen while a
+  // background subagent waits for its approval (no dialog is drawn on the main screen at all).
+  "claude--v2301-idle.txt",
+  "claude--v2301-hold-subagent.txt",
+  // Claude Code 2.1.301 around a running turn (the send-queue lab, 2026-10-16): a live spinner, a
+  // finished turn's row, a draft and a queued message above the box. An ordinary box, no dialog.
+  "claude--v2301-done-shell-running--w100.txt",
+  "claude--v2301-idle-after-turn--w100.txt",
+  "claude--v2301-queued-taken--w100.txt",
+  "claude--v2301-spinner-no-timer--w100.txt",
+  // The /cost and /usage panel over a live box: a read-only panel with nothing to answer. The Surface
+  // reads it as a modal (M56 spec 15 review), but the chat view lifts no buttons for it.
+  "claude--v2301-usage-panel-over-box--w40.txt",
+  "claude--v2301-usage-panel-over-box--w82.txt",
+  "claude--v2301-working-draft--w100.txt",
+  "claude--v2301-working-queued-message--w100.txt",
+  "claude--v2301-working-quiet--w100.txt",
+  // Claude Code 2.1.302 turns with a list, a menu and a "(y/n)" line in the answer above the box (the
+  // 2026-10-17 field case): the answer streaming with no spinner, and a running turn over the agents
+  // panel. An ordinary box, no dialog: the list is the agent's text, not a picker.
+  "claude--v2302-working-agents-panel--w119.txt",
+  "claude--v2302-working-list-echo--w119.txt",
+  // Claude Code 2.1.303 with a session name in the box's top edge (lane 8788, 2026-10-19): a running
+  // turn, the idle box and a draft. An ordinary box. (The survey file of the set lifts the notice card.)
+  "claude--v2303-titled-edge-draft--w160.txt",
+  "claude--v2303-titled-edge-idle--w160.txt",
+  "claude--v2303-titled-edge-working--w160.txt",
+  // Claude Code 2.1.302's slash list drawn OVER the box on a tall pane (lane 8788, 2026-10-17): the box
+  // holds `/model` and its statusline stands under it. The autocomplete reader looks under the box only,
+  // so nothing lifts; the Surface reads the list as the command's own typeahead, not a dialog.
+  "claude--v2302-slash-model-list-above--w119.txt",
+  // The last two reads of a turn whose answer ends in a menu and "Confirm (y/n)" (round 3 of the same
+  // field case): the agent's text above an ordinary box, no dialog.
+  "claude--v2302-turn-ending-stop-hooks--w119.txt",
+  "claude--v2302-turn-ended-yn--w119.txt",
+  // A screen whose rows reach the bottom, an empty box under the transcript (the fix rig, 2026-10-17):
+  // the read before a slash command whose list scrolls the whole screen up. An ordinary box, no dialog.
+  "claude--v2302-idle-full-screen--w120--h36.txt",
+  // Claude Code 2.1.301's agents panel under a free box while a fork runs (the 2026-10-16 incident
+  // on lane 8788): an ordinary box with a footer, no dialog.
+  "claude--v2301-fork-running-main-idle.txt",
+  "claude--v2301-synth-agents-panel.txt",
+  "claude--v2301-synth-agents-panel-walk-fails.txt",
+  "claude--v2301-lab-agents-panel-empty.txt",
+  "claude--v2301-lab-agents-panel-draft.txt",
+  "claude--v2301-lab-agents-panel-more.txt",
+  "claude--v2301-lab-agents-panel-tasks-pill.txt",
+  "claude--v2301-lab-agents-panel-focused.txt",
+]);
+
+const allClaudeFixtures = readdirSync(PANES_DIR)
+  .filter((f) => f.startsWith("claude--") && f.endsWith(".txt"))
+  .toSorted();
+const allOmpFixtures = readdirSync(PANES_DIR)
+  .filter((f) => f.startsWith("omp--") && f.endsWith(".txt"))
+  .toSorted();
+const allCodexFixtures = readdirSync(PANES_DIR)
+  .filter((f) => f.startsWith("codex--") && f.endsWith(".txt"))
+  .toSorted();
+const allGrokFixtures = readdirSync(PANES_DIR)
+  .filter((f) => f.startsWith("grok--") && f.endsWith(".txt"))
+  .toSorted();
+// Every opencode capture must stay raw under the claude adapter too — the cross-adapter leg.
+const allOpencodeFixtures = readdirSync(PANES_DIR)
+  .filter((f) => f.startsWith("oc--") && f.endsWith(".txt"))
+  .toSorted();
+
+const ownFixtures = allClaudeFixtures.filter((f) => !NEUTRAL.has(f));
+const neutralFixtures = allClaudeFixtures.filter((f) => NEUTRAL.has(f));
+
+describeAdapterConformance(claudeAdapter, {
+  ownFixtures,
+  foreignFixtures: [...allOmpFixtures, ...allCodexFixtures, ...allGrokFixtures, ...allOpencodeFixtures], // the other adapters' captures — cross-adapter fail-closed
+  neutralFixtures,
+});
+
+// The paste-placeholder screen (.adr/0010). The fail-closed cohort above already pins "no dialog is
+// lifted from it"; what this adds is the POSITIVE half the reply guard depends on — the token screen
+// is an ordinary input box with a draft in it, so the pre-flight lets a send through and the draft the
+// guard polls is the token. If any of this drifted, a long send would go back to being un-sendable.
+describe("claude--draft-paste-placeholder.txt — a collapsed long send is composer chrome", () => {
+  const lines = splitLines(
+    parseAnsi(readFileSync(join(PANES_DIR, "claude--draft-paste-placeholder.txt"), "utf8")),
+  );
+
+  it("reads the placeholder off the ❯ line as the draft", () => {
+    expect(claudeAdapter.extractInputDraft(lines)).toBe("[Pasted text #3 +3 lines]");
+  });
+
+  it("is composer-ready (the pre-flight must not mistake the token for a modal)", () => {
+    expect(claudeAdapter.composerReady!(lines)).toBe(true);
+  });
+
+  it("lifts no interactive block, and the draft it shows is send evidence for a matching send", () => {
+    expect(claudeAdapter.buildBlocks(lines).every((b) => b.kind === "raw")).toBe(true);
+    const draft = claudeAdapter.extractInputDraft(lines)!;
+    expect(claudeAdapter.draftCarriesSend!("one\ntwo\nthree\nfour", draft)).toBe(true);
+    expect(claudeAdapter.draftIsOpaque!(draft)).toBe(true);
+  });
+});
+
+// The SPLIT shape (#110), both halves captured live on 2026-08-17 in the issance-demo sandbox (pane
+// `w6:p1`, 200-col PTY, Claude Code current): a long multi-line head collapsed into one token, then
+// two short tails typed after a pause so they stayed literal beside it. The COMPLETE capture has the
+// third tail as well; the PARTIAL one is the same screen with that last chunk never arriving.
+//
+// This pair is the whole point of the fix: before it, `draftCarriesSend` said TRUE to both, so the
+// guard pressed Enter on a message that was still missing its last chunk and issance reported success.
+// The complete capture is the positive control — the tightening must not turn a real send into a
+// permanent "didn't reach the input box" stall, which is the worse failure of the two.
+describe("claude--draft-paste-split-*.txt — a token + literal tail, complete vs half-arrived", () => {
+  const head = Array.from({ length: 6 }, (_, i) => `line ${String(i).padStart(2, "0")} ${"abcdefghij".repeat(14)}`).join("\n");
+  const sent = `${head} TAIL-ONE-alpha-bravo TAIL-TWO-charlie-delta TAIL-THREE-echo-foxtrot`;
+  const draftOf = (fixture: string) =>
+    claudeAdapter.extractInputDraft(
+      splitLines(parseAnsi(readFileSync(join(PANES_DIR, fixture), "utf8"))),
+    )!;
+
+  it("reads the token AND the literal tail off the ❯ line", () => {
+    expect(draftOf("claude--draft-paste-split-tail.txt")).toBe(
+      "[Pasted text #3 +5 lines] TAIL-ONE-alpha-bravo TAIL-TWO-charlie-delta TAIL-THREE-echo-foxtrot",
+    );
+    expect(draftOf("claude--draft-paste-split-partial.txt")).toBe(
+      "[Pasted text #3 +5 lines] TAIL-ONE-alpha-bravo TAIL-TWO-charlie-delta",
+    );
+  });
+
+  it("accepts the COMPLETE arrival as send evidence", () => {
+    expect(claudeAdapter.draftCarriesSend!(sent, draftOf("claude--draft-paste-split-tail.txt"))).toBe(
+      true,
+    );
+  });
+
+  it("REFUSES the partial arrival — the visible tail is not the end of what we sent", () => {
+    expect(
+      claudeAdapter.draftCarriesSend!(sent, draftOf("claude--draft-paste-split-partial.txt")),
+    ).toBe(false);
+  });
+});
+
+// A focused unit test of the grammar validator itself — the load-bearing helper the suite leans on.
+describe("isValidHerdrKey", () => {
+  it("accepts single literal chars, bare special keys, and modifier chords", () => {
+    for (const key of [
+      "0",
+      "9",
+      "n",
+      "y",
+      "Enter",
+      "Escape",
+      "Tab",
+      "Backspace",
+      "Up",
+      "Down",
+      "Left",
+      "Right",
+      "Space",
+      "shift+tab",
+      "ctrl+c",
+      "ctrl+k",
+      "ctrl+left",
+      "F5",
+    ]) {
+      expect(isValidHerdrKey(key), key).toBe(true);
+    }
+  });
+
+  it("rejects multi-char digit runs and the unsupported paging/edit keys", () => {
+    for (const key of ["10", "42", "PageUp", "PageDown", "Home", "End", "Insert", "Delete", "", "C-c"]) {
+      expect(isValidHerdrKey(key), key).toBe(false);
+    }
+  });
+});
+
+// The walk-pair table (harness/walk-pairs.ts) is read per adapter by `describeAdapterConformance`, so a
+// row naming an agent no adapter claims would never be checked. Pin the table's own hygiene here.
+describe("the walk-pair table", () => {
+  const agents = registeredAgents();
+
+  it("names only registered agents, in pairs and in gaps", () => {
+    for (const [agent] of WALK_PAIRS) expect(agents, `pair agent ${agent}`).toContain(agent);
+    for (const key of Object.keys(WALK_GAPS)) expect(agents, `gap ${key}`).toContain(key.split(" | ")[0]);
+  });
+
+  it("holds each pair once, and no fixture against itself", () => {
+    const seen = new Set<string>();
+    for (const [agent, a, b] of WALK_PAIRS) {
+      expect(a, `${agent}: ${a} paired with itself`).not.toBe(b);
+      const id = [agent, ...[a, b].toSorted()].join("|");
+      expect(seen.has(id), `${a} <> ${b} is declared twice`).toBe(false);
+      seen.add(id);
+    }
+  });
+
+  it("gives every gap a reason", () => {
+    for (const [key, gap] of Object.entries(WALK_GAPS)) expect(gap.reason.length, key).toBeGreaterThan(10);
+  });
+
+  it("dates every gap", () => {
+    for (const [key, gap] of Object.entries(WALK_GAPS)) {
+      expect(gap.since, `${key}: since must be an ISO date`).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    }
+  });
+
+  // THE RATCHET: gaps only shrink. The set of gap keys is pinned as a literal list. A new grammar
+  // group that lifts a walked list must arrive with a second capture (a walk pair), not with a new
+  // gap. Adding a key below is a reviewed decision, not a convenience: it says nothing proves that
+  // grammar blanks what follows its pointer (ADR 0080 point 5). Removing a key is always fine, and
+  // the stale-gap checks in describeAdapterConformance already demand it when a pair lands.
+  it("pins the exact set of gap keys: a new gap needs a second capture first", () => {
+    expect(
+      Object.keys(WALK_GAPS).toSorted(),
+      "WALK_GAPS changed. A new grammar group needs a second capture of the same dialog with the " +
+        "pointer on another row (add it to WALK_PAIRS), not a new gap. Adding a key to the literal list " +
+        "in this test is a reviewed decision. Removing one is expected when a pair lands.",
+    ).toEqual(
+      [
+        "claude | trust | Quick safety check",
+        "codex | trust | Trust this folder?",
+        "omp | select | Pick a colour",
+        "pi | select | 1",
+        "pi | select | Auth",
+        "pi | select | Which package manager do you want to use?",
+        "opencode | permission | % WebFetch https",
+        "opencode | permission | $ echo narrow-width-probe",
+        "opencode | permission | This will allow edit until OpenCode is restarted.",
+      ].toSorted(),
+    );
+  });
+});

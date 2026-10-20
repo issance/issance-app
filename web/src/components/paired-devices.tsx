@@ -1,0 +1,431 @@
+import { type RefObject, useEffect, useRef, useState } from "react";
+import { KeyRound, Loader2, Smartphone } from "lucide-react";
+import { useLocation, useRevalidator, useSearchParams } from "react-router";
+
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { useLocale } from "@/hooks/use-locale";
+import { t } from "@/lib/i18n";
+import { pairDevice, revokeDevice } from "@/lib/api";
+import { dateTime, timeAgo } from "@/lib/format";
+import { PAIRED_DEVICES_HASH } from "@/lib/nav";
+import { setDeviceToken, usePairing } from "@/lib/pairing";
+import { clearLastWipe, lastWipeReason, type PairingEndReason, wipeDevice } from "@/lib/wipe";
+import type { DevicesData } from "@/lib/loaders";
+import type { PairFailure } from "@/lib/types";
+
+// Splits a translated sentence around ONE already-known substring (a name, a device id, a CLI
+// command) so that substring can carry its own styling — a `<span>`/`<code>` — instead of the whole
+// sentence losing its font. The split happens on the INTERPOLATED value, after `t()` has placed it,
+// so a translator is free to reorder the sentence around it; this only locates where the slot
+// landed, it never assembles the sentence itself.
+function splitAroundValue(message: string, value: string): [string, string] {
+  const idx = message.indexOf(value);
+  if (idx === -1) return [message, ""];
+  return [message.slice(0, idx), message.slice(idx + value.length)];
+}
+
+// The Settings surface for the bridge's second write gate (bridge/pairing.ts): who is paired, and
+// the card that pairs THIS phone. State comes from the settings route's loader (lib/loaders.ts
+// devicesLoader) and every mutation is an api call followed by `revalidator.revalidate()` — the same
+// shape as every other write in the app.
+//
+// Enrolment is deliberately out-of-band: the operator runs `bin/issance pair` in a terminal on the
+// host and types the 8-character code in here, or scans the QR that verb prints and arrives with
+// `?pair=<code>` already filled in. Nothing on this screen can mint a code, which is the whole
+// point — a phone that could ask for one would be a phone that could pair itself.
+
+export function PairedDevices({ data }: { data: DevicesData }) {
+  useLocale();
+  const revalidator = useRevalidator();
+  const { token, refused, expired } = usePairing();
+
+  // THE CARD ANSWERS TO ITS OWN FRAGMENT. `read-only-banner.tsx` links to
+  // `/settings/system#paired-devices` (lib/nav.ts owns the spelling), and the fragment still earns
+  // its keep after the page split: System holds four cards and this is not the first of them. The
+  // browser cannot do this itself — React Router navigates without a document load, so no fragment
+  // is ever resolved.
+  //
+  // Focus moves too, and that is the half that is not decoration: a screen reader follows focus, not
+  // scroll, so scrolling alone would leave it reading the page from the top. `tabIndex={-1}` makes
+  // the card focusable programmatically without putting it in the tab order.
+  //
+  // `?pair=` IS A SECOND WAY IN, AND IT CARRIES NO FRAGMENT ON PURPOSE. The QR `issance pair` prints
+  // spells `/settings?pair=<code>` and stops there. A fragment would undo the thing it is for: HTML
+  // runs the focusing steps on a fragment target as part of scrolling to it, after the page's own
+  // scripts, so the browser would put focus on this card — which is focusable, `tabIndex={-1}` — and
+  // take it off the name field the phone arrived to fill. No effect can outrun that, so the URL does
+  // not ask for it. This effect covers both arrivals: it scrolls either way, and the destination for
+  // focus is the difference. A tap on the read-only strip lands on the card; a scan lands on the
+  // field, because the code above it is already filled in and that is the only thing left to do.
+  const cardRef = useRef<HTMLDivElement>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
+  const { hash } = useLocation();
+  const [cardSearchParams] = useSearchParams();
+  const fromQr = cardSearchParams.get("pair") !== null;
+  useEffect(() => {
+    if (hash !== `#${PAIRED_DEVICES_HASH}` && !fromQr) return;
+    const card = cardRef.current;
+    if (!card) return;
+    card.scrollIntoView({ block: "start", behavior: "smooth" });
+    // preventScroll: the smooth scroll above owns the movement; focus() would otherwise jump to it
+    // instantly and cancel it. On the scan path the name field may not be mounted at all — this
+    // phone is already paired, so the form is not shown — and then nothing takes focus.
+    const target = fromQr ? nameRef.current : card;
+    target?.focus({ preventScroll: true });
+  }, [hash, fromQr]);
+
+  // Show the pairing form when this device has no credential the bridge would accept: it holds no
+  // token, its token was rejected by a write, or the registry itself says it authenticated as
+  // nobody while pairing is on. Deliberately NOT shown on a failed load — an unreachable bridge is
+  // not evidence that this device is unpaired.
+  // A failed load (`data.error`, which is also the no-loader placeholder's shape) says nothing
+  // about pairing, so it offers no form either (#512): the load-error line above is the whole
+  // answer until the bridge replies, never an empty registry read as "nothing is paired".
+  const unpaired =
+    !data.error && (!token || refused || (data.enforced && data.current === null));
+
+  const pairedAsMessage = data.current
+    ? t("settings.devices.pairedAs", { device: data.current })
+    : null;
+  const [pairedAsBefore, pairedAsAfter] =
+    pairedAsMessage && data.current ? splitAroundValue(pairedAsMessage, data.current) : ["", ""];
+
+  return (
+    <Card id={PAIRED_DEVICES_HASH} ref={cardRef} tabIndex={-1} className="gap-0 py-0 outline-none">
+      <div className="flex items-start gap-3 p-4 pb-3">
+        <KeyRound className="mt-0.5 size-5 shrink-0 text-muted-foreground" />
+        <div className="min-w-0">
+          <div className="font-medium">{t("settings.devices.title")}</div>
+          {/* Pairing is always on (ADR 0086): there is no "open" bridge left to describe. */}
+          <p className="text-sm text-muted-foreground">{t("settings.devices.description.enforced")}</p>
+        </div>
+      </div>
+
+      {data.current && (
+        <p className="border-t border-border px-4 py-2.5 text-sm">
+          {pairedAsBefore}
+          <span className="text-[13px] font-medium text-status-done">{data.current}</span>
+          {pairedAsAfter}
+        </p>
+      )}
+
+      {data.error && (
+        <p className="border-t border-border px-4 py-2.5 text-xs text-muted-foreground">
+          {t("settings.devices.loadError")}
+        </p>
+      )}
+
+      {data.devices.length > 0 && (
+        <ul data-slot="list-group" className="border-t border-border">
+          {data.devices.map((d) => (
+            <DeviceRow
+              key={d.label}
+              label={d.label}
+              createdAt={d.createdAt}
+              lastSeenAt={d.lastSeenAt}
+              expiresAt={d.expiresAt ?? null}
+              expired={d.expired === true}
+              current={d.current}
+              onRevoked={() => {
+                // Revoking yourself is allowed and self-unpairs: the token we still hold now
+                // authenticates as nobody, and the pairing it stood for is over. The one wipe
+                // routine drops the token and everything stored under it (M46 spec 02), only after
+                // the bridge took the revoke, so a failed revoke leaves this phone as it was.
+                if (d.current) void wipeDevice("unpair");
+                revalidator.revalidate();
+              }}
+            />
+          ))}
+        </ul>
+      )}
+
+      {unpaired && (
+        <PairForm
+          nameRef={nameRef}
+          expired={expired}
+          heldToken={token !== null}
+          onPaired={() => revalidator.revalidate()}
+        />
+      )}
+    </Card>
+  );
+}
+
+/** One row's expiry, in words: none, a date ahead, or the date it passed (M46 spec 01). */
+function expiryText(expiresAt: number | null, expired: boolean): string {
+  if (expiresAt === null) return t("settings.devices.row.noExpiry");
+  return expired
+    ? t("settings.devices.row.expiredOn", { date: dateTime(expiresAt) })
+    : t("settings.devices.row.expires", { date: dateTime(expiresAt) });
+}
+
+function DeviceRow({
+  label,
+  createdAt,
+  lastSeenAt,
+  expiresAt,
+  expired,
+  current,
+  onRevoked,
+}: {
+  label: string;
+  createdAt: number;
+  lastSeenAt: number;
+  /** Epoch ms the token stops working, or null for no expiry. */
+  expiresAt: number | null;
+  /** The bridge's verdict that `expiresAt` has passed — not re-derived from this phone's clock. */
+  expired: boolean;
+  current: boolean;
+  onRevoked: () => void;
+}) {
+  useLocale();
+  // Two-tap confirm rather than a dialog: revoking is irreversible (the token can't be re-issued,
+  // only re-paired from a fresh `bin/issance pair`), and revoking THIS device locks the phone you're
+  // holding out of every write — so the second tap names that consequence instead of asking "sure?".
+  // While it is armed, one sentence under the row names the device and says what happens, and for
+  // this phone what the wipe clears and what it keeps (M46 spec 02).
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function revoke() {
+    setBusy(true);
+    setError(null);
+    try {
+      await revokeDevice(label);
+      onRevoked();
+    } catch {
+      setError(t("settings.devices.revokeError"));
+    } finally {
+      setBusy(false);
+      setConfirming(false);
+    }
+  }
+
+  return (
+    <li className="flex items-center justify-between gap-3 px-4 py-2.5">
+      <div className="min-w-0">
+        <div className="flex items-center gap-2">
+          <Smartphone className="size-4 shrink-0 text-muted-foreground" />
+          {/* A device name the operator typed, in the app's own face — the same face the field
+              that captures it uses below. Only the pairing CODE is monospaced, because that one is
+              eight characters you compare against a terminal. */}
+          <span className="truncate text-[13px] font-medium">{label}</span>
+          {current && (
+            <span className="shrink-0 rounded bg-status-done/15 px-1.5 py-0.5 text-[11px] font-medium text-status-done">
+              {t("settings.devices.thisDevice")}
+            </span>
+          )}
+          {expired && (
+            <span className="shrink-0 rounded bg-status-blocked/15 px-1.5 py-0.5 text-[11px] font-medium text-status-blocked">
+              {t("settings.devices.row.expired")}
+            </span>
+          )}
+        </div>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          {t("settings.devices.row.meta", {
+            paired: timeAgo(createdAt),
+            lastSeen: timeAgo(lastSeenAt),
+          })}
+        </p>
+        <p className={`mt-0.5 text-xs ${expired ? "text-status-blocked" : "text-muted-foreground"}`}>
+          {expiryText(expiresAt, expired)}
+        </p>
+        {confirming && (
+          <p className="mt-1 text-xs text-foreground">
+            {current ? t("settings.devices.confirm.self") : t("settings.devices.confirm.other", { label })}
+          </p>
+        )}
+        {error && <p className="mt-0.5 text-xs text-status-blocked">{error}</p>}
+      </div>
+      {confirming ? (
+        <div className="flex shrink-0 items-center gap-2">
+          <Button variant="ghost" size="sm" disabled={busy} onClick={() => setConfirming(false)}>
+            {t("settings.devices.cancel")}
+          </Button>
+          <Button variant="destructive" size="sm" disabled={busy} onClick={revoke}>
+            {busy && <Loader2 className="size-3.5 animate-spin" />}
+            {current ? t("settings.devices.unpairSelf") : t("settings.devices.revoke")}
+          </Button>
+        </div>
+      ) : (
+        <Button
+          variant="outline"
+          size="sm"
+          className="shrink-0"
+          onClick={() => setConfirming(true)}
+          aria-label={t("settings.devices.revokeAria", { label })}
+        >
+          {t("settings.devices.revoke")}
+        </Button>
+      )}
+    </li>
+  );
+}
+
+function PairForm({
+  nameRef,
+  expired,
+  heldToken,
+  onPaired,
+}: {
+  /** Owned by the card above, which decides where focus lands on each way in. */
+  nameRef: RefObject<HTMLInputElement | null>;
+  /**
+   * The bridge refused this phone's token as EXPIRED (M46 spec 01). The form is the same — a fresh
+   * code from `issance pair` is the only way back — but it is titled "Pair again" and says why, so
+   * the operator does not wonder whether someone revoked the phone.
+   */
+  expired: boolean;
+  /** This browser holds a token right now. With none and no wipe to name, it was never paired here. */
+  heldToken: boolean;
+  onPaired: () => void;
+}) {
+  useLocale();
+  // The cause of the last wipe, shown once (lib/wipe.ts writes it): read on mount, then taken, so the
+  // next visit to this screen does not repeat a sentence about the past.
+  const [wipeCause] = useState(lastWipeReason);
+  useEffect(() => {
+    if (wipeCause !== null) clearLastWipe();
+  }, [wipeCause]);
+  // `?pair=` is what the QR `issance pair` prints carries — the phone arrives with the code already
+  // spelled, so the only thing left to type is the device name, and that is where focus goes.
+  // Read once, as the initial state: after this the field is the operator's, and a re-render must
+  // not put a spent or edited code back.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [prefilled] = useState(() => (searchParams.get("pair") ?? "").trim().toUpperCase());
+  const [code, setCode] = useState(prefilled);
+  const [label, setLabel] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const ready = code.trim() !== "" && label.trim() !== "" && !busy;
+
+  async function submit() {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await pairDevice(code.trim(), label.trim());
+      if (!res.ok) {
+        setError(failureText(res.reason));
+        return;
+      }
+      // The token comes back exactly once and is not recoverable — store it before anything else.
+      setDeviceToken(res.token);
+      setCode("");
+      setLabel("");
+      // The code is spent, so drop it from the URL before a reload can re-offer it — replace, so
+      // Back does not walk into the dead code either.
+      if (searchParams.has("pair")) {
+        const next = new URLSearchParams(searchParams);
+        next.delete("pair");
+        setSearchParams(next, { replace: true });
+      }
+      onPaired();
+    } catch {
+      setError(t("settings.devices.pair.networkError"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // The CLI command itself is never translated (rule: CLI commands stay literal); the surrounding
+  // sentence is, so the command is placed via the same "locate the interpolated value" split as the
+  // paired-as sentence above, letting it keep its own <code> styling.
+  //
+  // A browser that never held a token gets its own sentence, which says plainly that it is not paired
+  // and names the verb as the operator types it on a binary install, `issance pair`.
+  const neverPaired = !expired && !heldToken && wipeCause === null;
+  const command = neverPaired ? "issance pair" : "bin/issance pair";
+  const hintMessage = expired
+    ? t("settings.devices.pair.expired", { command })
+    : neverPaired
+      ? t("settings.devices.pair.never", { command })
+      : t("settings.devices.pair.hint", { command });
+  const [hintBefore, hintAfter] = splitAroundValue(hintMessage, command);
+  const title = expired ? t("settings.devices.pair.againTitle") : t("settings.devices.pair.title");
+
+  return (
+    <div className="flex flex-col gap-3 border-t border-border p-4">
+      <div>
+        <div className="font-medium">{title}</div>
+        {wipeCause !== null && <p className="text-sm">{wipeCauseText(wipeCause)}</p>}
+        <p className="text-sm text-muted-foreground">
+          {hintBefore}
+          <code className="font-mono text-[13px]">{command}</code>
+          {hintAfter}
+        </p>
+      </div>
+      <label className="flex flex-col gap-1">
+        <span className="text-xs font-medium text-muted-foreground">
+          {t("settings.devices.pair.codeLabel")}
+        </span>
+        <input
+          value={code}
+          onChange={(e) => setCode(e.target.value.toUpperCase())}
+          placeholder={t("settings.devices.pair.codePlaceholder")}
+          autoCapitalize="characters"
+          autoCorrect="off"
+          autoComplete="off"
+          spellCheck={false}
+          aria-label={t("settings.devices.pair.codeLabel")}
+          className="h-11 rounded-lg border border-border bg-background px-3 font-mono text-sm tracking-widest focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+        />
+      </label>
+      <label className="flex flex-col gap-1">
+        <span className="text-xs font-medium text-muted-foreground">
+          {t("settings.devices.pair.nameLabel")}
+        </span>
+        <input
+          value={label}
+          onChange={(e) => setLabel(e.target.value)}
+          ref={nameRef}
+          placeholder={t("settings.devices.pair.namePlaceholder")}
+          autoCorrect="off"
+          autoComplete="off"
+          aria-label={t("settings.devices.pair.nameLabel")}
+          className="h-11 rounded-lg border border-border bg-background px-3 text-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+        />
+      </label>
+      {error && <p className="text-xs text-status-blocked">{error}</p>}
+      <Button className="h-11" disabled={!ready} onClick={submit}>
+        {busy && <Loader2 className="size-4 animate-spin" />}
+        {title}
+      </Button>
+    </div>
+  );
+}
+
+/** The one line that names why this phone's saved data was cleared. */
+function wipeCauseText(reason: PairingEndReason): string {
+  switch (reason) {
+    case "unpair":
+      return t("settings.devices.pair.cleared.unpair");
+    case "expired":
+      return t("settings.devices.pair.cleared.expired");
+    case "revoked":
+      return t("settings.devices.pair.cleared.revoked");
+  }
+}
+
+// One actionable sentence per refusal the bridge names. Each says what happened AND what to do next
+// — "invalid code" would be true and useless, since three of these are only fixable at the host.
+function failureText(reason: PairFailure): string {
+  switch (reason) {
+    case "no-pending":
+      return t("settings.devices.pair.failure.noPending");
+    case "expired":
+      return t("settings.devices.pair.failure.expired");
+    case "exhausted":
+      return t("settings.devices.pair.failure.exhausted");
+    case "bad-code":
+      return t("settings.devices.pair.failure.badCode");
+    case "duplicate-label":
+      return t("settings.devices.pair.failure.duplicateLabel");
+    case "bad-request":
+      return t("settings.devices.pair.failure.badRequest");
+    case "identity-required":
+      return t("settings.devices.pair.failure.identityRequired");
+  }
+}

@@ -1,0 +1,291 @@
+// What a multiplexer adapter DECLARES it can do — the vocabulary a route asks in, so that no route
+// ever asks "is this Hangar".
+//
+// EVERY NAME BELOW WAS DERIVED FROM A ROUTE, NOT IMAGINED. The trace is in
+// {@link MUX_CAPABILITY_ROUTES} and it is part of the contract: a capability with no route behind it
+// is a capability nothing can consume, and a route whose only backing is "Hangar has always done it"
+// is the bug this seam exists to prevent. When a new route needs something a multiplexer might not
+// have, the capability is added here WITH its route — see MUX_CONTRACT.md for the matrix.
+//
+// Two things are deliberately NOT capabilities:
+//
+//  • **The floor.** Listing panes/spaces/tabs and answering "are you reachable" are not declarable.
+//    An adapter that cannot do those is not an adapter — there is nothing for issance to render.
+//  • **Image upload** (`POST /api/pane/:id/upload`). Read the route: it takes `cfg` and never the
+//    multiplexer (bridge/server.ts `uploadPane`). It writes a file to the bridge host's disk and
+//    hands back a path the operator pastes; the multiplexer is not involved, so it cannot decline it.
+//    It is host-local for every adapter because a mux adapter is host-local by rule (ADR 0011).
+
+import { formatMuxKey, parseMuxKey } from "./keys.ts";
+
+/**
+ * Every capability an adapter may declare, in issance's words.
+ *
+ * The order is the order the matrix in MUX_CONTRACT.md reads: what you can learn about a pane,
+ * what you can do to a pane, what you can do to the structure around it, and how you learn that
+ * any of it changed.
+ */
+export const MUX_CAPABILITIES = [
+  "paneGrid",
+  "gridScrollback",
+  "agentDetection",
+  "agentSessionRef",
+  "typeText",
+  "sendKeys",
+  "renamePane",
+  "closePane",
+  "setFocus",
+  "createTab",
+  "renameTab",
+  "renameSpace",
+  "closeTab",
+  "createSpace",
+  "listWorktrees",
+  "createWorktree",
+  "openWorktree",
+  "pushTopologyEvents",
+  "pushPaneEvents",
+  "listSessions",
+  "steerTurn",
+  "abortTurn",
+  "starters",
+  "programActions",
+  "programHistory",
+  "reopenConversation",
+] as const;
+
+/** One declarable capability. */
+export type MuxCapability = (typeof MUX_CAPABILITIES)[number];
+
+/**
+ * How soon issance learns about a topology change nobody told it about — a pane opened, a tab renamed
+ * or a window killed **in the multiplexer's own UI**.
+ *
+ * NOT a capability, for the same reason `unsupportedKeys` is not: it answers "how fast", never
+ * "whether". Every adapter keeps `watch()`'s promise; this says what the bound behind that promise
+ * actually is, so a caller can stop guessing it from `pushTopologyEvents`.
+ *
+ *  • `push` — the multiplexer announces it, so the bound is the transport's own latency and there is
+ *    no number to state.
+ *  • `bounded` — the adapter censuses, and `ms` is the LONGEST a change can sit unseen. It is the
+ *    ceiling, never the floor: an adaptive census (zellij's) states the slowest it ever runs.
+ *
+ * It is DECLARED rather than discovered because the only alternative is the phone timing the bridge,
+ * and a number derived that way is indistinguishable from a slow network (ADR 0031). `/api/config`
+ * publishes it, and it is the whole reason the home screen can honestly say "synced 4s ago" under one
+ * multiplexer and stay silent under another.
+ */
+export type MuxTopologyLatency =
+  | { readonly kind: "push" }
+  | { readonly kind: "bounded"; readonly ms: number };
+
+/**
+ * The route that consumes each capability — the evidence the set was derived rather than invented.
+ *
+ * Read as: "if this capability is absent, THAT is what degrades." Spec M10/06 turns each entry into
+ * a UI rule (hide the meaningless, explain the expected), so keep the wording operator-legible.
+ */
+export const MUX_CAPABILITY_ROUTES = {
+  paneGrid: "GET /api/pane/:id — the live mirror. Colour only; a rendered grid, never an emulator (ADR 0008).",
+  gridScrollback:
+    "GET /api/pane/:id?lines=N — a read that reaches behind the viewport, which is what makes the mirror's 'Load older' meaningful (see MuxPane.readableLines).",
+  agentDetection:
+    "GET /api/snapshot — the split into `agents` and `shellPanes` and every status mark (needs you, working) both need the mux to say which agent a pane holds and how it is doing.",
+  agentSessionRef:
+    "GET /api/pane/:id/history — the journal keys an on-disk log off the session an agent named. Without this, history is absent, not empty (bridge/journal/registry.ts).",
+  typeText: "POST /api/pane/:id/reply — step one, the literal text.",
+  sendKeys: "POST /api/pane/:id/reply (step two, the submit key) and POST /api/pane/:id/keys (the Keys tray).",
+  renamePane: "POST /api/pane/:id/rename — set or clear a pane's operator-chosen label.",
+  closePane: "POST /api/pane/:id/close — kill the pane and the agent in it.",
+  setFocus:
+    "POST /api/pane/:id/focus — the pane action sheet's \"Show in terminal\" row, the one act by which the phone moves the operator's own screen. Absent ⇒ the row is not there (hide the meaningless), and the phone can still SEE which pane the terminal shows, because `MuxPane.focused` is on the floor.",
+  createTab: "POST /api/tab — a new tab in a space, opening a fresh shell.",
+  renameTab:
+    "POST /api/tab/:id/rename. A durable agent declares it from its own `caps.rename` (WIRE.md section 7.8); every other adapter declares it from its multiplexer's tab rename.",
+  renameSpace:
+    "POST /api/space/:id/rename: set a space's name. Only a durable agent declares it today, from its own `caps.rename` (WIRE.md section 7.8); the phone draws the Rename row of the space sheet when it is declared. Absent ⇒ no Rename row, and the space chip opens no sheet.",
+  closeTab: "POST /api/tab/:id/close — a bulk pane-close.",
+  createSpace: "POST /api/workspace — a new space, opening a fresh shell.",
+  listWorktrees:
+    "No route asks it since 1.20.0: the space-scoped list (GET /api/workspace/:id/worktrees) lost its last caller when the New sheet moved to GET /api/worktree/plan (ADR 0093), and was removed. Kept on the port for the conformance set.",
+  createWorktree:
+    "POST /api/worktree — a new branch in a new worktree, from the folder the New sheet names, opened as its own space (ADR 0093). Absent ⇒ no branch row on the New page or in the pane sheet.",
+  openWorktree:
+    "No route asks it since 1.20.0 (POST /api/workspace/:id/worktree/open had no caller and was removed). Kept on the port: show a worktree that already exists on disk, idempotently, as the conformance set checks.",
+  pushTopologyEvents:
+    "bridge/event-poker.ts — panes/tabs/spaces appearing, closing or being renamed arrive as a push, so the snapshot poll can idle. Absent ⇒ the adapter polls to keep the same promise, and the poker learns nothing.",
+  pushPaneEvents:
+    "bridge/event-poker.ts — one pane's content or status changing arrives as a push. Same fallback, same promise.",
+  listSessions:
+    "bridge/sessions.ts `SessionRegistry.refresh()`, the OTHER instances of this multiplexer on this machine, each with the endpoint to dial it, so one bridge can front them all. It fills the snapshot's `sessions` list and what `?session=<name>` can select. ABSENT IS THE DEFAULT AND IT IS THE HARMLESS DIRECTION: the registry pins to the primary, the phone sees the one session it saw before this capability existed, and nothing scans anything. Stated here rather than left implicit, because the absence of this key decides whether a filesystem or a process listing is walked at all (M22 counsel).",
+  steerTurn:
+    "POST /api/pane/:id/send with `steer: true` (ADR 0101): text for the turn that is running. Only a durable agent can declare it, from its own `caps.steer` (WIRE.md section 4); the phone draws the Steer button in the belt when it is declared. Absent ⇒ no Steer button.",
+  abortTurn:
+    "POST /api/pane/:id/abort (ADR 0101): stop the running turn. Only a durable agent can declare it, from its own `caps.abort`; the phone draws the Stop button in the belt when it is declared. Absent ⇒ no Stop button.",
+  programActions:
+    "POST /api/pane/:id/action (M53 spec 07): run one of the buttons the durable agent lists for a pane (`actions` on the pane, up to four, each with a label and an icon). Only a durable agent can declare it, from its own `caps.actions` (WIRE.md section 4); the phone draws the durable agent's buttons in its section of the belt when it is declared. Absent ⇒ no durable agent buttons.",
+  programHistory:
+    "GET /api/durable/conversations and GET /api/durable/conversation/:id/items (M53 spec 11): the durable agent's own list of its conversations, open and closed, and the items of one, served by the durable agent and not by the bridge's log. Only a durable agent can declare it, from its own `caps.history` (WIRE.md 7.16); the phone draws the History row in the space sheet and leads the pane sheet's History row to the list when it is declared. Absent ⇒ no list, and History stays per pane.",
+  reopenConversation:
+    "POST /api/durable/conversation/:id/reopen (M53 spec 11): show a closed conversation again, under the same pane id. Only a durable agent can declare it, from its own `caps.reopen` (WIRE.md 7.16); the read-only view of a closed conversation draws a Reopen button when it is declared. Absent ⇒ no Reopen button.",
+  starters:
+    "GET /api/launchers rows of `source: \"program\"` and POST /api/launch with a `starter` (ADR 0102). Only a durable agent can declare it, from its own `caps.starters`; the phone then draws the new-tab and new-space buttons and sends them to the New page. Absent ⇒ those buttons stay hidden where `createTab` and `createSpace` are absent.",
+} satisfies Record<MuxCapability, string>;
+
+/**
+ * An adapter's declaration.
+ *
+ * `supports` is TOTAL over {@link MUX_CAPABILITIES} — every capability is answered yes or no, so a
+ * capability added later cannot read as "supported" by omission on an adapter nobody revisited.
+ */
+export interface MuxCapabilityDeclaration {
+  readonly supports: Readonly<Record<MuxCapability, boolean>>;
+  /**
+   * Neutral key spellings (bridge/mux/keys.ts) this multiplexer refuses, canonicalised.
+   *
+   * A key is not a capability: `sendKeys` is one door, and behind it every multiplexer has its own
+   * holes. Hangar's are documented and enumerated (HERDR_API.md § key grammar — the paging and edit
+   * keys), so the Keys tray can grey exactly those buttons instead of discovering them by failing.
+   */
+  readonly unsupportedKeys: readonly string[];
+  /** Per-capability operator-facing reason, shown where a control is explained rather than hidden. */
+  readonly notes: Readonly<Partial<Record<MuxCapability, string>>>;
+  /**
+   * How many spaces this multiplexer can hold. A FACT, declared — never a capability.
+   *
+   * `"one"` is not "has one space right now"; it is "one is all it can ever have, by construction",
+   * which is true of zellij (every one of its verbs is scoped to a single session) and of nothing
+   * else here. It is not a capability because nothing degrades: there is no verb to decline and no
+   * control to grey out — the space level simply is not a level on that multiplexer, so the UI drops
+   * a strip that could only ever show one chip and the tab strip becomes the top level.
+   *
+   * Published in `/api/config` under `mux`. The phone reads an ABSENT value as `"many"`, which is
+   * both the fail-open direction and the harmless one: a space strip over one space is a strip
+   * nobody needed, while a hidden strip over three spaces is navigation the operator cannot reach.
+   */
+  readonly spaces: MuxSpaceCapacity;
+  /**
+   * How soon an out-of-band topology change is seen. See {@link MuxTopologyLatency}.
+   *
+   * REQUIRED, and there is no default: a missing answer would read as `push` to anything that
+   * defaulted optimistically and as `bounded` to anything that defaulted safely, and those two are
+   * different promises to the operator.
+   *
+   * The opposite rule to {@link spaces} one line up, and the two disagree for a reason. An
+   * unanswered SHAPE has a harmless answer (`"many"` leaves every level reachable), so it may
+   * default. An unanswered BOUND has none: both directions promise the operator something the
+   * adapter never said.
+   */
+  readonly topologyLatency: MuxTopologyLatency;
+}
+
+/**
+ * How many spaces a multiplexer can hold — declared, because the UI reacts to it.
+ *
+ * Two values and no number: the question the UI asks is "is there a level above the tab strip?", and
+ * a count would invite reading a momentary snapshot as a permanent shape.
+ */
+export type MuxSpaceCapacity = "one" | "many";
+
+/** What an adapter passes to {@link declareCapabilities}. Anything omitted is declared ABSENT. */
+export interface MuxCapabilityInput {
+  readonly supports: readonly MuxCapability[];
+  readonly unsupportedKeys?: readonly string[];
+  readonly notes?: Readonly<Partial<Record<MuxCapability, string>>>;
+  /**
+   * How many spaces this multiplexer can hold. Omitted reads as `"many"`.
+   *
+   * The opposite default to a capability's, on purpose: an unanswered CAPABILITY must degrade the UI
+   * (fail-closed), while an unanswered SHAPE must leave every level reachable (fail-open). The same
+   * rule the phone applies to an absent `mux` block, applied here so the two ends cannot disagree.
+   */
+  readonly spaces?: MuxSpaceCapacity;
+  /** Required — see {@link MuxCapabilityDeclaration.topologyLatency} for why there is no default. */
+  readonly topologyLatency: MuxTopologyLatency;
+}
+
+/**
+ * Build a total declaration from the list an adapter claims.
+ *
+ * Fail-closed on purpose: the default for a capability is `false`, so adding one to
+ * {@link MUX_CAPABILITIES} degrades every existing adapter's UI rather than silently promising
+ * behaviour none of them implement.
+ */
+export function declareCapabilities(input: MuxCapabilityInput): MuxCapabilityDeclaration {
+  const claimed = new Set<MuxCapability>(input.supports);
+  // Spelled out rather than mapped over MUX_CAPABILITIES, and that is the point: the compiler now
+  // demands an answer for every capability, so adding one to the list above fails the build here
+  // until someone decides what it means. A `fromEntries` map would have silently produced `false`.
+  const supports = {
+    paneGrid: claimed.has("paneGrid"),
+    gridScrollback: claimed.has("gridScrollback"),
+    agentDetection: claimed.has("agentDetection"),
+    agentSessionRef: claimed.has("agentSessionRef"),
+    typeText: claimed.has("typeText"),
+    sendKeys: claimed.has("sendKeys"),
+    renamePane: claimed.has("renamePane"),
+    closePane: claimed.has("closePane"),
+    setFocus: claimed.has("setFocus"),
+    createTab: claimed.has("createTab"),
+    renameTab: claimed.has("renameTab"),
+    renameSpace: claimed.has("renameSpace"),
+    closeTab: claimed.has("closeTab"),
+    createSpace: claimed.has("createSpace"),
+    listWorktrees: claimed.has("listWorktrees"),
+    createWorktree: claimed.has("createWorktree"),
+    openWorktree: claimed.has("openWorktree"),
+    pushTopologyEvents: claimed.has("pushTopologyEvents"),
+    pushPaneEvents: claimed.has("pushPaneEvents"),
+    listSessions: claimed.has("listSessions"),
+    steerTurn: claimed.has("steerTurn"),
+    abortTurn: claimed.has("abortTurn"),
+    starters: claimed.has("starters"),
+    programActions: claimed.has("programActions"),
+    programHistory: claimed.has("programHistory"),
+    reopenConversation: claimed.has("reopenConversation"),
+  } satisfies Record<MuxCapability, boolean>;
+  return {
+    supports,
+    unsupportedKeys: input.unsupportedKeys ?? [],
+    notes: input.notes ?? {},
+    spaces: input.spaces ?? "many",
+    topologyLatency: input.topologyLatency,
+  };
+}
+
+/** Whether `capability` is declared. The one question a route may ask about an adapter. */
+export function supportsCapability(
+  declaration: MuxCapabilityDeclaration,
+  capability: MuxCapability,
+): boolean {
+  return declaration.supports[capability];
+}
+
+/**
+ * Whether this multiplexer can deliver EVERY key of a sequence, as the keys it names.
+ *
+ * False when `sendKeys` is not declared at all, when a key is not a neutral spelling, or when a key
+ * is declared unsupported — as the whole chord (`ctrl+Enter`) or as its base key (Hangar's `PageUp`
+ * refuses `shift+PageUp` too, keys.ts there). One undeliverable key makes the whole sequence
+ * undeliverable: the keys of a sequence mean something together, and its front half alone is a
+ * different action.
+ *
+ * This is how a surface that offers a key as a button (the chat answer's `sendQueuedNow`) asks the
+ * pane's multiplexer, as a capability fact rather than by its name.
+ */
+export function keysDeliverable(
+  declaration: Pick<MuxCapabilityDeclaration, "supports" | "unsupportedKeys">,
+  keys: readonly string[],
+): boolean {
+  if (!declaration.supports.sendKeys) return false;
+  const refused = new Set(declaration.unsupportedKeys);
+  return keys.every((spelling) => {
+    const parsed = parseMuxKey(spelling);
+    return parsed !== null && !refused.has(formatMuxKey(parsed)) && !refused.has(parsed.key);
+  });
+}
+
+/** The declared capabilities, sorted — for the config surface (M10/06), the matrix and tests. */
+export function declaredCapabilities(declaration: MuxCapabilityDeclaration): MuxCapability[] {
+  return MUX_CAPABILITIES.filter((cap) => declaration.supports[cap]).toSorted();
+}

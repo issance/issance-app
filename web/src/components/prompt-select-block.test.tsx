@@ -1,0 +1,828 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// The whole prompt-select feature end to end: the presentational component, the shared race guard
+// (submitPromptOption), and the wired tap (component → injected handler → api). The api layer is
+// mocked so we can drive fresh-fetch revision/menu outcomes precisely; the detector and status
+// channel are the real thing.
+vi.mock("@/lib/api", () => ({
+  fetchPane: vi.fn(),
+  sendKeys: vi.fn(),
+  sendReply: vi.fn(),
+}));
+
+import { fetchPane, sendKeys, sendReply } from "@/lib/api";
+import { parseAnsi } from "@/lib/ansi";
+import { splitLines, type PromptModel } from "@/lib/blocks";
+import { buildBlocks } from "@/lib/harness";
+import { detectPromptSelect } from "@/lib/harness/claude/prompt-select";
+import { submitPromptFeedback, submitPromptOption } from "@/lib/prompt-action";
+import { act } from "@testing-library/react";
+import { markLive, resetLiveness } from "@/lib/liveness";
+import { clearStatus, setStatus, useStatus } from "@/lib/status";
+import { isHeaderRow, keyBadgeFallback, PromptSelectBlock, type PromptBlockAction } from "./prompt-select-block";
+
+const mockFetchPane = vi.mocked(fetchPane);
+const mockSendKeys = vi.mocked(sendKeys);
+const mockSendReply = vi.mocked(sendReply);
+
+// Anchored on this file's directory (not `new URL(import.meta.url)`, which Vite rewrites to an asset).
+const PANES_DIR = join(import.meta.dirname, "..", "fixtures", "panes");
+const fixtureText = (name: string) => readFileSync(join(PANES_DIR, name), "utf8");
+function fixtureModel(name: string): PromptModel {
+  const model = detectPromptSelect(splitLines(parseAnsi(fixtureText(name))));
+  if (!model) throw new Error(`fixture ${name} did not detect a prompt`);
+  return model;
+}
+
+beforeEach(() => {
+  clearStatus();
+  mockFetchPane.mockReset();
+  mockSendKeys.mockReset();
+  mockSendKeys.mockResolvedValue({ ok: true });
+  mockSendReply.mockReset();
+  mockSendReply.mockResolvedValue({ ok: true });
+});
+
+const selectModel: PromptModel = {
+  question: "Which color theme should the dashboard use?",
+  family: "select",
+  options: [
+    { label: "Red", description: "A warm, high-energy theme", keys: ["1", "Enter"] },
+    { label: "Green", keys: ["2", "Enter"] },
+  ],
+  signature: "which-color-theme-region",
+  coreSignature: "which-color-theme-core",
+};
+
+describe("PromptSelectBlock — presentation", () => {
+  it("renders each option as a focusable button, labelled by the question", () => {
+    render(<PromptSelectBlock prompt={selectModel} onAction={vi.fn()} />);
+    expect(
+      screen.getByRole("group", { name: "Which color theme should the dashboard use?" }),
+    ).toBeInTheDocument();
+    const buttons = screen.getAllByRole("button");
+    expect(buttons).toHaveLength(2);
+    expect(screen.getByRole("button", { name: /Red/ })).toBeInTheDocument();
+    // Description renders as a secondary text node (not markup).
+    expect(screen.getByText("A warm, high-energy theme")).toBeInTheDocument();
+    // Each row leads with its terminal-menu digit (the KeyBadge affordance).
+    expect(within(screen.getByRole("button", { name: /Red/ })).getByText("1")).toBeInTheDocument();
+    expect(within(screen.getByRole("button", { name: /Green/ })).getByText("2")).toBeInTheDocument();
+    buttons[0]!.focus();
+    expect(buttons[0]).toHaveFocus();
+  });
+
+  it("calls onAction with the tapped option", async () => {
+    const onAction = vi.fn();
+    const user = userEvent.setup();
+    render(<PromptSelectBlock prompt={selectModel} onAction={onAction} />);
+    await user.click(screen.getByRole("button", { name: /Green/ }));
+    expect(onAction).toHaveBeenCalledWith({ kind: "option", option: selectModel.options[1] });
+  });
+
+  it("disables every button when disabled (read-only device / gone pane)", () => {
+    render(<PromptSelectBlock prompt={selectModel} onAction={vi.fn()} disabled />);
+    for (const button of screen.getAllByRole("button")) expect(button).toBeDisabled();
+  });
+
+  // Without `lines` (a hand-built model, as above) the card carries no way back — the control is
+  // opt-in on the data, not the block kind.
+  it("renders no Terminal control when lines is absent", () => {
+    render(<PromptSelectBlock prompt={selectModel} onAction={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /terminal/i })).toBeNull();
+  });
+});
+
+// ADR 0056, driven off a real capture through the real pipeline: a lifted card carries the way
+// back to the region it replaced.
+// The card carries what the dialog asks about and the question itself. It used to show the family
+// caption and the buttons only, trusting the raw scrollback above it for the rest; docked above the
+// belt (ADR 0059) and in the Chat view that scrollback is not on screen, so a subagent's permission
+// read "PERMISSION REQUIRED / 1 Yes / 2 No" and nothing else (Claude Code 2.1.291, 2026-10-06).
+describe("PromptSelectBlock — the subject and the question are on the card", () => {
+  it("shows the question as text on a card with no subject, and keeps it as the group's name", () => {
+    const { container } = render(<PromptSelectBlock prompt={selectModel} onAction={vi.fn()} />);
+    const question = container.querySelector('[data-slot="prompt-question"]');
+    expect(question?.textContent).toBe("Which color theme should the dashboard use?");
+    expect(within(container).getByRole("group", { name: "Which color theme should the dashboard use?" })).toBeInTheDocument();
+    expect(container.querySelector('[data-slot="prompt-subject"]')).toBeNull();
+  });
+
+  it("2.1.291 subagent Bash permission: header as title, command and warning, then the question", () => {
+    const model = fixtureModel("claude--v2291-permission-bash-subagent.txt");
+    const { container } = render(<PromptSelectBlock prompt={model} onAction={vi.fn()} />);
+    const card = within(container);
+
+    const title = container.querySelector('[data-slot="prompt-subject-title"]')!;
+    expect(title.textContent).toBe("Bash command · from the general-purpose agent");
+    // A title in the card's text face, not a mono terminal row.
+    expect(title.closest("pre")).toBeNull();
+
+    const subject = container.querySelector('[data-slot="prompt-subject"] pre')!;
+    expect(subject.textContent).toContain("Restore committed pane route in copy and build");
+    expect(subject.textContent).toContain("set -e; R=/var/home/devel/apps/sample-forge;");
+    expect(subject.textContent).toContain(
+      "Dangerous rm operation on statically-unresolvable target: /var/home/devel/projects/sample-workspace/*",
+    );
+    expect(subject.textContent).not.toMatch(/[╌│]/);
+    // Wraps at phone width instead of panning, and scrolls on its own past its cap, so a long diff
+    // never pushes the buttons out of the dock.
+    expect(subject.className).toContain("whitespace-pre-wrap");
+    expect(subject.className).toContain("max-h-[22dvh]");
+    expect(subject.className).toContain("overflow-y-auto");
+
+    expect(container.querySelector('[data-slot="prompt-question"]')!.textContent).toBe("Do you want to proceed?");
+    expect(card.getAllByRole("button").map((b) => b.textContent)).toEqual(["1Yes", "2No"]);
+
+    // Reading order: caption, title, subject, question, options.
+    const order = [title, subject, container.querySelector('[data-slot="prompt-question"]')!, card.getAllByRole("button")[0]!];
+    for (let i = 1; i < order.length; i++) {
+      expect(order[i - 1]!.compareDocumentPosition(order[i]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+  });
+
+  // jsdom lays nothing out, so the measurements the fade reads (`scrollHeight`, `clientHeight`,
+  // `scrollTop` on the scrolling <pre>) are stubbed, and this pins the structure only: whether the
+  // fade element exists for each measured state. How it looks is for a real browser.
+  describe("the fade below a subject that continues", () => {
+    const measure = (heights: { scroll: number; client: number }) => {
+      vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(heights.scroll);
+      vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(heights.client);
+    };
+    const renderSubject = () => {
+      const model = fixtureModel("claude--v2291-permission-bash-subagent.txt");
+      const { container } = render(<PromptSelectBlock prompt={model} onAction={vi.fn()} />);
+      return { container, pre: container.querySelector<HTMLElement>('[data-slot="prompt-subject"] pre')! };
+    };
+    const fade = (container: HTMLElement) => container.querySelector('[data-slot="prompt-subject-more"]');
+
+    afterEach(() => vi.restoreAllMocks());
+
+    it("shows while the box overflows and is not scrolled to the bottom", () => {
+      measure({ scroll: 500, client: 150 });
+      const { container } = renderSubject();
+      const more = fade(container)!;
+      expect(more).not.toBeNull();
+      // Inside the subject box, drawn over it, and out of the way of taps and of the accessibility tree.
+      expect(more.parentElement).toBe(container.querySelector('[data-slot="prompt-subject"]'));
+      expect(more.getAttribute("aria-hidden")).toBe("true");
+      expect(more.className).toContain("pointer-events-none");
+    });
+
+    it("goes once the box is scrolled to the bottom, and returns when it is scrolled back up", () => {
+      measure({ scroll: 500, client: 150 });
+      const { container, pre } = renderSubject();
+      expect(fade(container)).not.toBeNull();
+      Object.defineProperty(pre, "scrollTop", { configurable: true, value: 350 });
+      fireEvent.scroll(pre);
+      expect(fade(container)).toBeNull();
+      Object.defineProperty(pre, "scrollTop", { configurable: true, value: 100 });
+      fireEvent.scroll(pre);
+      expect(fade(container)).not.toBeNull();
+    });
+
+    it("is absent when the content fits the box", () => {
+      measure({ scroll: 150, client: 150 });
+      const { container } = renderSubject();
+      expect(container.querySelector('[data-slot="prompt-subject"]')).not.toBeNull();
+      expect(fade(container)).toBeNull();
+    });
+  });
+
+  it("an Edit permission shows the file and its diff under the title", () => {
+    const model = fixtureModel("claude--permission-edit.txt");
+    const { container } = render(<PromptSelectBlock prompt={model} onAction={vi.fn()} />);
+    expect(container.querySelector('[data-slot="prompt-subject-title"]')!.textContent).toBe("Create file");
+    expect(container.querySelector('[data-slot="prompt-subject"] pre')!.textContent).toBe("hello.txt\n 1 hello");
+    expect(container.querySelector('[data-slot="prompt-question"]')!.textContent).toBe("Do you want to create hello.txt?");
+  });
+
+  it("does not repeat a question the caption already says", () => {
+    const { container } = render(
+      <PromptSelectBlock prompt={{ ...selectModel, question: "Resume session", caption: "Resume session" }} onAction={vi.fn()} />,
+    );
+    expect(container.querySelector('[data-slot="prompt-question"]')).toBeNull();
+    expect(within(container).getAllByText("Resume session")).toHaveLength(1);
+  });
+
+  it("isHeaderRow: a row whose first painted run is bold", () => {
+    const seg = (text: string, bold = false) => ({ text, bold, style: {}, muted: false });
+    expect(isHeaderRow({ segments: [seg(" "), seg("Bash command", true), seg(" · from x")] })).toBe(true);
+    expect(isHeaderRow({ segments: [seg("touch a.txt")] })).toBe(false);
+    expect(isHeaderRow(undefined)).toBe(false);
+  });
+});
+
+describe("PromptSelectBlock — the way back to the terminal (ADR 0056)", () => {
+  it("shows the Terminal control, and puts the card down to the raw rows on a tap", async () => {
+    const user = userEvent.setup();
+    const capture = "claude--select-menu.txt";
+    const block = buildBlocks(splitLines(parseAnsi(fixtureText(capture))), { agent: "claude" }).find(
+      (b) => b.kind === "prompt-select",
+    );
+    if (!block || block.kind !== "prompt-select") throw new Error(`fixture ${capture} lifted no card`);
+
+    const { container } = render(
+      <PromptSelectBlock prompt={block.prompt} lines={block.lines} onAction={vi.fn()} />,
+    );
+
+    const optionButtons = block.prompt.options.map((o) => screen.getByRole("button", { name: new RegExp(o.label) }));
+    expect(optionButtons.length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "Show the terminal instead of this card" }));
+
+    for (const button of optionButtons) expect(button).not.toBeInTheDocument();
+    const pre = container.querySelector("pre")!;
+    expect(pre).toBeInTheDocument();
+    const rawLine = block.lines.find((l) => l.segments.some((s) => s.text.trim() !== ""));
+    if (rawLine) {
+      const text = rawLine.segments.map((s) => s.text).join("").trim();
+      expect(pre.textContent).toContain(text);
+    }
+    expect(screen.getByRole("button", { name: "Back to the card" })).toBeInTheDocument();
+  });
+});
+
+describe("keyBadgeFallback", () => {
+  it("maps navigation and commit keys to the terminal's own glyphs, and passes a digit through", () => {
+    expect(keyBadgeFallback("Down")).toBe("↓");
+    expect(keyBadgeFallback("Up")).toBe("↑");
+    expect(keyBadgeFallback("Left")).toBe("←");
+    expect(keyBadgeFallback("Right")).toBe("→");
+    expect(keyBadgeFallback("Enter")).toBe("⏎");
+    expect(keyBadgeFallback("Escape")).toBe("Esc");
+    expect(keyBadgeFallback("Tab")).toBe("Tab");
+    expect(keyBadgeFallback("3")).toBe("3");
+  });
+});
+
+// The `/resume` session picker (ADR 0058): the pointed row's badge is the terminal's own `❯`, every
+// other session row carries none, and the card names itself instead of the generic "select" caption.
+describe("PromptSelectBlock — the /resume card names itself, never a raw key name (ADR 0058)", () => {
+  it("badges only the pointed row, reserves the same slot for the rest, and captions with the dialog's own title", () => {
+    const capture = "claude--menu-resume-picker--w120-first.txt";
+    const block = buildBlocks(splitLines(parseAnsi(fixtureText(capture))), { agent: "claude" }).find(
+      (b) => b.kind === "prompt-select",
+    );
+    if (!block || block.kind !== "prompt-select") throw new Error(`fixture ${capture} lifted no card`);
+
+    render(<PromptSelectBlock prompt={block.prompt} onAction={vi.fn()} />);
+
+    expect(screen.getByRole("group", { name: "Resume session" })).toBeInTheDocument();
+    expect(screen.getByText("Resume session")).toBeInTheDocument();
+    expect(screen.queryByText("Choose an option")).toBeNull();
+    expect(screen.getByText("❯")).toBeInTheDocument();
+    expect(screen.getByText("Esc")).toBeInTheDocument();
+    expect(screen.queryByText("Down")).toBeNull();
+    expect(screen.queryByText("Up")).toBeNull();
+  });
+});
+
+// The folder-trust prompt (ADR 0055) has the same unpointed-row shape, but its footer never names
+// Down/Up either — the fallback mapping is what turns its unset `keyLabel` into an arrow.
+describe("PromptSelectBlock — the folder-trust prompt's unpointed row (ADR 0055)", () => {
+  it("badges the non-pointed row with the arrow it walks, never the raw key name", () => {
+    const model = fixtureModel("claude--trust-prompt-unnumbered.txt");
+    render(<PromptSelectBlock prompt={model} onAction={vi.fn()} />);
+    expect(
+      within(screen.getByRole("button", { name: /Yes, I trust this folder/ })).getByText("↓"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Down")).toBeNull();
+  });
+});
+
+describe("submitPromptOption — race guard + per-family keystroke recipe", () => {
+  it("select family: sends digit THEN Enter when the fresh menu matches", async () => {
+    const model = fixtureModel("claude--select-menu.txt");
+    mockFetchPane.mockResolvedValue({
+      paneId: "w1:p1",
+      text: fixtureText("claude--select-menu.txt"),
+      truncated: false,
+      revision: 7,
+    });
+    const res = await submitPromptOption({
+      paneId: "w1:p1",
+      requestedLines: 600,
+      detectedRevision: 7,
+      agent: "claude",
+      prompt: model,
+      option: model.options[0]!,
+    });
+    expect(res).toEqual({ status: "sent" });
+    expect(mockSendKeys).toHaveBeenCalledWith(
+      "w1:p1",
+      ["1", "Enter"],
+      undefined,
+      model.signature,
+    );
+  });
+
+  it("permission family: sends the digit ALONE (a trailing Enter would leak)", async () => {
+    const model = fixtureModel("claude--permission-edit.txt");
+    mockFetchPane.mockResolvedValue({
+      paneId: "w1:p1",
+      text: fixtureText("claude--permission-edit.txt"),
+      truncated: false,
+      revision: 3,
+    });
+    const res = await submitPromptOption({
+      paneId: "w1:p1",
+      requestedLines: 600,
+      detectedRevision: 3,
+      agent: "claude",
+      prompt: model,
+      option: model.options[0]!,
+    });
+    expect(res).toEqual({ status: "sent" });
+    expect(mockSendKeys).toHaveBeenCalledWith("w1:p1", ["1"], undefined, model.signature);
+  });
+
+  it("rejects (no send) when the fresh revision differs", async () => {
+    const model = fixtureModel("claude--select-menu.txt");
+    mockFetchPane.mockResolvedValue({
+      paneId: "w1:p1",
+      text: fixtureText("claude--select-menu.txt"),
+      truncated: false,
+      revision: 99, // moved on since the menu was detected against revision 7
+    });
+    const res = await submitPromptOption({
+      paneId: "w1:p1",
+      requestedLines: 600,
+      detectedRevision: 7,
+      agent: "claude",
+      prompt: model,
+      option: model.options[0]!,
+    });
+    expect(res).toEqual({ status: "changed" });
+    expect(mockSendKeys).not.toHaveBeenCalled();
+  });
+
+  it("rejects (no send) when the fresh buffer resolves to a different menu", async () => {
+    const model = fixtureModel("claude--select-menu.txt");
+    mockFetchPane.mockResolvedValue({
+      paneId: "w1:p1",
+      text: fixtureText("claude--permission-edit.txt"), // same revision, different dialog
+      truncated: false,
+      revision: 7,
+    });
+    const res = await submitPromptOption({
+      paneId: "w1:p1",
+      requestedLines: 600,
+      detectedRevision: 7,
+      agent: "claude",
+      prompt: model,
+      option: model.options[0]!,
+    });
+    expect(res).toEqual({ status: "changed" });
+    expect(mockSendKeys).not.toHaveBeenCalled();
+  });
+
+  it("passes on a 304 whose revision matches AND whose cached text re-derives the same menu", async () => {
+    // fetchPane's 304 path returns the cached body (text included), so the re-derivation — which
+    // now runs on EVERY path because Hangar 0.7.x's revision is a stub — sees the full buffer.
+    const model = fixtureModel("claude--permission-bash.txt");
+    mockFetchPane.mockResolvedValue({
+      paneId: "w1:p1",
+      text: fixtureText("claude--permission-bash.txt"),
+      truncated: false,
+      revision: 42, // the cached body's revision — matches what the menu was detected against
+      notModified: true,
+    });
+    const res = await submitPromptOption({
+      paneId: "w1:p1",
+      requestedLines: 600,
+      detectedRevision: 42,
+      agent: "claude",
+      prompt: model,
+      option: model.options[1]!,
+    });
+    expect(res).toEqual({ status: "sent" });
+    expect(mockSendKeys).toHaveBeenCalledWith("w1:p1", ["2"], undefined, model.signature);
+  });
+
+  it("rejects a 304 with MATCHING (stub) revisions when the cached text no longer shows the menu", async () => {
+    // The live hole found on 2026-07-05: Hangar 0.7.x returns revision 0 for every read, so the
+    // revision gate is inert — a frozen tap whose confirm-fetch 304s against an advanced cache
+    // must still be caught by re-deriving the menu from the cached (= latest) text.
+    const model = fixtureModel("claude--permission-bash.txt");
+    mockFetchPane.mockResolvedValue({
+      paneId: "w1:p1",
+      text: fixtureText("claude--done.txt"), // menu is long gone; agent moved on
+      truncated: false,
+      revision: 0, // stub revision — matches detectedRevision, provides no protection
+      notModified: true,
+    });
+    const res = await submitPromptOption({
+      paneId: "w1:p1",
+      requestedLines: 600,
+      detectedRevision: 0,
+      agent: "claude",
+      prompt: model,
+      option: model.options[1]!,
+    });
+    expect(res).toEqual({ status: "changed" });
+    expect(mockSendKeys).not.toHaveBeenCalled();
+  });
+
+  it("rejects a 304 whose revision differs — 'not modified' only means unchanged since the LAST POLL", async () => {
+    // Background polling advances the ETag cache while a frozen mirror stands still, so a 304 must
+    // NOT bypass the revision check: the tap was made against an older (frozen) snapshot.
+    const model = fixtureModel("claude--permission-bash.txt");
+    mockFetchPane.mockResolvedValue({
+      paneId: "w1:p1",
+      text: "",
+      truncated: false,
+      revision: 43, // the cache moved on; the user tapped the menu detected at revision 42
+      notModified: true,
+    });
+    const res = await submitPromptOption({
+      paneId: "w1:p1",
+      requestedLines: 600,
+      detectedRevision: 42,
+      agent: "claude",
+      prompt: model,
+      option: model.options[1]!,
+    });
+    expect(res).toEqual({ status: "changed" });
+    expect(mockSendKeys).not.toHaveBeenCalled();
+  });
+
+  it("surfaces the bridge error when sendKeys fails", async () => {
+    const model = fixtureModel("claude--select-menu.txt");
+    mockFetchPane.mockResolvedValue({
+      paneId: "w1:p1",
+      text: fixtureText("claude--select-menu.txt"),
+      truncated: false,
+      revision: 5,
+    });
+    mockSendKeys.mockResolvedValue({ ok: false, error: "agent busy" });
+    const res = await submitPromptOption({
+      paneId: "w1:p1",
+      requestedLines: 600,
+      detectedRevision: 5,
+      agent: "claude",
+      prompt: model,
+      option: model.options[0]!,
+    });
+    expect(res).toEqual({ status: "error", error: "agent busy" });
+  });
+
+  it("maps a bridge prompt_changed conflict to changed", async () => {
+    const model = fixtureModel("claude--select-menu.txt");
+    mockFetchPane.mockResolvedValue({
+      paneId: "w1:p1",
+      text: fixtureText("claude--select-menu.txt"),
+      truncated: false,
+      revision: 5,
+    });
+    mockSendKeys.mockResolvedValue({
+      ok: false,
+      error: "prompt changed",
+      code: "prompt_changed",
+    });
+    const res = await submitPromptOption({
+      paneId: "w1:p1",
+      requestedLines: 600,
+      detectedRevision: 5,
+      agent: "claude",
+      prompt: model,
+      option: model.options[0]!,
+    });
+    expect(res).toEqual({ status: "changed" });
+  });
+});
+
+// A miniature of AgentChat's handler + status surface, so the wired tap is exercised through the
+// real component and the "menu changed" notice pattern the app uses.
+function StatusSentinel() {
+  const status = useStatus();
+  return <div data-testid="status">{status?.text ?? ""}</div>;
+}
+
+function Harness({ prompt, detectedRevision }: { prompt: PromptModel; detectedRevision: number }) {
+  async function onAction(action: PromptBlockAction) {
+    const result =
+      action.kind === "option"
+        ? await submitPromptOption({
+            paneId: "w1:p1",
+            requestedLines: 600,
+            detectedRevision,
+            agent: "claude",
+            prompt,
+            option: action.option,
+          })
+        : await submitPromptFeedback({
+            paneId: "w1:p1",
+            requestedLines: 600,
+            detectedRevision,
+            agent: "claude",
+            prompt,
+            text: action.text,
+          });
+    if (result.status === "sent") setStatus("Sent", "success");
+    else if (result.status === "changed") setStatus("Menu changed — refreshing", "warn");
+    else setStatus(result.error, "error");
+  }
+  return (
+    <>
+      <PromptSelectBlock prompt={prompt} onAction={onAction} />
+      <StatusSentinel />
+    </>
+  );
+}
+
+describe("PromptSelectBlock — wired tap (component → handler → api)", () => {
+  it("tapping an option runs the guard, sends its keys, and confirms", async () => {
+    const model = fixtureModel("claude--select-menu.txt");
+    mockFetchPane.mockResolvedValue({
+      paneId: "w1:p1",
+      text: fixtureText("claude--select-menu.txt"),
+      truncated: false,
+      revision: 4,
+    });
+    const user = userEvent.setup();
+    render(<Harness prompt={model} detectedRevision={4} />);
+
+    await user.click(screen.getByRole("button", { name: /Red/ }));
+
+    await waitFor(() => expect(screen.getByTestId("status")).toHaveTextContent("Sent"));
+    expect(mockSendKeys).toHaveBeenCalledWith(
+      "w1:p1",
+      ["1", "Enter"],
+      undefined,
+      model.signature,
+    );
+  });
+
+  it("a stale tap surfaces a 'menu changed' notice and sends nothing", async () => {
+    const model = fixtureModel("claude--select-menu.txt");
+    mockFetchPane.mockResolvedValue({
+      paneId: "w1:p1",
+      text: fixtureText("claude--permission-edit.txt"), // the pane moved to a different dialog
+      truncated: false,
+      revision: 4,
+    });
+    const user = userEvent.setup();
+    render(<Harness prompt={model} detectedRevision={4} />);
+
+    await user.click(screen.getByRole("button", { name: /Green/ }));
+
+    await waitFor(() => expect(screen.getByTestId("status")).toHaveTextContent("Menu changed"));
+    expect(mockSendKeys).not.toHaveBeenCalled();
+  });
+});
+
+// H1 regression (pre-release review): promptsEqual used to compare only family/question/labels, so
+// two edit-permission prompts with the same shape but a DIFFERENT subject (a second edit to the same
+// file) were "equal" — a frozen tap on prompt A could approve prompt B the user never saw. The region
+// `signature` (which folds in the subject above the options) now distinguishes them.
+describe("submitPromptOption — same-shaped successor prompt (H1)", () => {
+  const RULE = "─".repeat(30);
+  const promptFor = (subject: string) =>
+    [RULE, `  ${subject}`, RULE, " Do you want to proceed?", " ❯ 1. Yes", "   2. No", "", " Esc to cancel · Tab to amend"].join("\n");
+  const modelFor = (subject: string) => {
+    const m = detectPromptSelect(splitLines(parseAnsi(promptFor(subject))));
+    if (!m) throw new Error("synthetic permission prompt did not detect");
+    return m;
+  };
+
+  it("rejects the tap when only the subject changed (identical question + labels)", async () => {
+    const promptA = modelFor("write hello.txt");
+    // The pane advanced: A was answered elsewhere and a same-shaped B is now on screen (stub rev 0).
+    mockFetchPane.mockResolvedValue({
+      paneId: "w1:p1",
+      text: promptFor("delete production.db"),
+      truncated: false,
+      revision: 0,
+    });
+    const res = await submitPromptOption({
+      paneId: "w1:p1",
+      requestedLines: 600,
+      detectedRevision: 0,
+      agent: "claude",
+      prompt: promptA,
+      option: promptA.options[0]!,
+    });
+    expect(res).toEqual({ status: "changed" });
+    expect(mockSendKeys).not.toHaveBeenCalled();
+  });
+
+  it("still sends when the whole region (subject included) is unchanged", async () => {
+    const same = promptFor("write hello.txt");
+    const promptA = modelFor("write hello.txt");
+    mockFetchPane.mockResolvedValue({ paneId: "w1:p1", text: same, truncated: false, revision: 0 });
+    const res = await submitPromptOption({
+      paneId: "w1:p1",
+      requestedLines: 600,
+      detectedRevision: 0,
+      agent: "claude",
+      prompt: promptA,
+      option: promptA.options[0]!,
+    });
+    expect(res).toEqual({ status: "sent" });
+    expect(mockSendKeys).toHaveBeenCalledWith("w1:p1", ["1"], undefined, promptA.signature);
+  });
+});
+
+// The plan dialog's inline input row (issue #95). Three surfaces, and the state that decides which
+// one shows also decides whether the ANSWER buttons work at all — so this block is where the phone
+// stops lying about a screen it cannot drive. Fixtures are real captures; PLAN_FEEDBACK_NOTES.md is
+// the ground truth for what each state does in the terminal.
+describe("PromptSelectBlock — the feedback input row", () => {
+  const OFFER = "Tell Claude what to change";
+
+  it("offers the composer when the box is empty and the pointer is elsewhere", () => {
+    const model = fixtureModel("claude--plan-approval.txt");
+    render(<PromptSelectBlock prompt={model} onAction={vi.fn()} />);
+    // The three answers are live buttons, and the row itself is an affordance — never a fourth
+    // answer button, because pressing its digit answers nothing.
+    expect(screen.getByRole("button", { name: new RegExp(OFFER) })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /Yes, and use auto mode/ })).toBeEnabled();
+  });
+
+  it("locks every button behind a banner while the terminal's input has FOCUS", async () => {
+    // The heart of #95: in this state the answer rows still parse as an ordinary menu, and tapping
+    // one types its digit into the box instead of answering. Nothing may be pressable.
+    const model = fixtureModel("claude--plan-approval--feedback-focused.txt");
+    const onAction = vi.fn();
+    const user = userEvent.setup();
+    render(<PromptSelectBlock prompt={model} onAction={onAction} />);
+    expect(screen.getByText(/has the keyboard in the terminal/)).toBeInTheDocument();
+    for (const button of screen.getAllByRole("button")) expect(button).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: /Yes, manually approve edits/ }));
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("shows what is in the box instead of offering to type, once it holds text", async () => {
+    // Answers still work here (verified live), but issance must not type: the caret resets to position
+    // 0 on re-entry, so our words would be prepended to the sentence already there.
+    const model = fixtureModel("claude--plan-approval--feedback-typed.txt");
+    const onAction = vi.fn();
+    const user = userEvent.setup();
+    render(<PromptSelectBlock prompt={model} onAction={onAction} />);
+    expect(screen.getByText(/use a guard clause instead/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: new RegExp(OFFER) })).toBeNull();
+    await user.click(screen.getByRole("button", { name: /Yes, manually approve edits/ }));
+    expect(onAction).toHaveBeenCalledWith({ kind: "option", option: model.options[2] });
+  });
+
+  it("the composer sends a feedback action carrying the typed text", async () => {
+    const model = fixtureModel("claude--plan-approval.txt");
+    const onAction = vi.fn();
+    const user = userEvent.setup();
+    render(<PromptSelectBlock prompt={model} onAction={onAction} />);
+    await user.click(screen.getByRole("button", { name: new RegExp(OFFER) }));
+    // The wording has to say what actually happens: this DENIES the plan and hands over the text.
+    expect(screen.getByText(/Claude keeps planning instead of starting work/)).toBeInTheDocument();
+    await user.type(screen.getByRole("textbox", { name: "Feedback text" }), "use a switch");
+    await user.click(screen.getByRole("button", { name: "Send feedback" }));
+    expect(onAction).toHaveBeenCalledWith({ kind: "feedback", text: "use a switch" });
+  });
+
+  it("keeps the draft on screen when a send is refused", async () => {
+    // Up to FEEDBACK_MAX_LENGTH characters, thumb-typed on a phone. A `changed` refusal must not eat
+    // them — this is the longest text the app ever asks anyone to type.
+    const model = fixtureModel("claude--plan-approval.txt");
+    const user = userEvent.setup();
+    render(<PromptSelectBlock prompt={model} onAction={() => false} />);
+    await user.click(screen.getByRole("button", { name: new RegExp(OFFER) }));
+    await user.type(screen.getByRole("textbox", { name: "Feedback text" }), "keep me");
+    await user.click(screen.getByRole("button", { name: "Send feedback" }));
+    expect(screen.getByRole("textbox", { name: "Feedback text" })).toHaveValue("keep me");
+  });
+
+  it("says WE are sending, not that the terminal is, while our own sequence runs", async () => {
+    // Our choreography focuses the row and fills it, so mid-flight the screen is indistinguishable
+    // from "someone at the terminal is typing" — which would be a lie told to the person who just
+    // pressed Send about their own action.
+    const model = fixtureModel("claude--plan-approval.txt");
+    let release: () => void = () => {};
+    const blocked = new Promise<boolean>((r) => (release = () => r(true)));
+    const user = userEvent.setup();
+    render(<PromptSelectBlock prompt={model} onAction={() => blocked} />);
+    await user.click(screen.getByRole("button", { name: new RegExp(OFFER) }));
+    await user.type(screen.getByRole("textbox", { name: "Feedback text" }), "use a switch");
+    await user.click(screen.getByRole("button", { name: "Send feedback" }));
+    expect(await screen.findByText("Sending feedback…")).toBeInTheDocument();
+    expect(screen.queryByText(/in the terminal/)).toBeNull();
+    release();
+  });
+
+  it("drives the real choreography end to end through the wired handler", async () => {
+    const name = "claude--plan-approval--three-row.txt";
+    const model = fixtureModel(name);
+    // The three real captures the flow actually walks: the dialog as tapped, then focused-and-empty
+    // (what the digit produces), then filled — the placeholder swapped for our words, which is
+    // exactly what the terminal shows once the paste lands.
+    const focusedEmpty = fixtureText("claude--plan-approval--three-row-focused.txt");
+    const pane = (text: string) => ({ paneId: "w1:p1", text, truncated: false, revision: 7 });
+    mockFetchPane
+      .mockResolvedValueOnce(pane(fixtureText(name))) // entry guard
+      .mockResolvedValueOnce(pane(focusedEmpty)) // focus poll: focused, box still empty
+      .mockResolvedValue(pane(focusedEmpty.replace("Tell Claude what to change", "use a switch")));
+    const user = userEvent.setup();
+    render(<Harness prompt={model} detectedRevision={7} />);
+    await user.click(screen.getByRole("button", { name: new RegExp(OFFER) }));
+    await user.type(screen.getByRole("textbox", { name: "Feedback text" }), "use a switch");
+    await user.click(screen.getByRole("button", { name: "Send feedback" }));
+    // Two verification polls at the real pacing (POLL_DELAY_MS) sit between the tap and the Enter.
+    await waitFor(() => expect(screen.getByTestId("status")).toHaveTextContent("Sent"), {
+      timeout: 5000,
+    });
+    // `3`, not `4` — this install has no clear-context row, and the key comes off the screen.
+    expect(mockSendKeys.mock.calls.map((c) => c[1])).toEqual([["3"], ["Enter"]]);
+    expect(mockSendReply).toHaveBeenCalledWith("w1:p1", "use a switch", false, undefined);
+  });
+});
+
+describe("PromptSelectBlock — Grok's z row is not Claude's plan-feedback composer", () => {
+  const grokAsk: PromptModel = {
+    question: "Pick a size?",
+    family: "select",
+    options: [
+      { label: "Small", keys: ["1"] },
+      { label: "Large", keys: ["2"] },
+    ],
+    feedback: { key: "z", focused: false, text: "", purpose: "free-text" },
+    signature: "pick-a-size-region",
+    coreSignature: "pick-a-size-core",
+  };
+
+  it("does not offer Tell Claude what to change", () => {
+    render(<PromptSelectBlock prompt={grokAsk} onAction={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /Tell Claude what to change/ })).toBeNull();
+    expect(screen.queryByText(/Claude keeps planning/)).toBeNull();
+    expect(screen.getByRole("button", { name: /Small/ })).toBeEnabled();
+  });
+
+  it("locks the options while z has the keyboard, without the Claude banner", () => {
+    const focused = {
+      ...grokAsk,
+      feedback: { key: "z", focused: true, text: "", purpose: "free-text" as const },
+    };
+    render(<PromptSelectBlock prompt={focused} onAction={vi.fn()} />);
+    expect(screen.getByText(/free-text row has the keyboard/)).toBeInTheDocument();
+    expect(screen.queryByText(/feedback box has the keyboard/)).toBeNull();
+    for (const button of screen.getAllByRole("button")) expect(button).toBeDisabled();
+  });
+});
+
+// M46 spec 11: a card drawn from cached state is readable and cannot be answered. With a `paneId`
+// the card enables only while the bridge has answered a read for that pane lately; a parent that drew
+// the screen from the cache says `stale`. Nothing is queued: a tap on a disabled option sends nothing.
+describe("PromptSelectBlock, no action from cached state (M46 spec 11)", () => {
+  beforeEach(() => resetLiveness());
+
+  it("shows the question and options, disables them, and says to reconnect when the pane is not live", async () => {
+    const onAction = vi.fn();
+    const user = userEvent.setup();
+    render(<PromptSelectBlock prompt={selectModel} paneId="w1:p1" onAction={onAction} />);
+
+    expect(screen.getByText("Which color theme should the dashboard use?")).toBeInTheDocument();
+    expect(screen.getByText("Reconnect to answer.")).toBeInTheDocument();
+    const red = screen.getByRole("button", { name: /Red/ });
+    const green = screen.getByRole("button", { name: /Green/ });
+    expect(red).toBeDisabled();
+    expect(green).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Reconnect to answer.");
+
+    await user.click(red);
+    await user.click(green);
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("enables the options and drops the note once a live read lands", async () => {
+    const onAction = vi.fn();
+    const user = userEvent.setup();
+    render(<PromptSelectBlock prompt={selectModel} paneId="w1:p1" onAction={onAction} />);
+    expect(screen.getByRole("button", { name: /Red/ })).toBeDisabled();
+
+    act(() => markLive("w1:p1"));
+
+    expect(screen.queryByText("Reconnect to answer.")).toBeNull();
+    expect(screen.getByRole("button", { name: /Red/ })).toBeEnabled();
+    expect(onAction).not.toHaveBeenCalled(); // reconnecting answers nothing by itself
+    await user.click(screen.getByRole("button", { name: /Green/ }));
+    expect(onAction).toHaveBeenCalledWith({ kind: "option", option: selectModel.options[1] });
+  });
+
+  it("stays locked while the parent says the screen is stale, even for a live pane", async () => {
+    markLive("w1:p1");
+    const onAction = vi.fn();
+    const user = userEvent.setup();
+    render(<PromptSelectBlock prompt={selectModel} paneId="w1:p1" stale onAction={onAction} />);
+    expect(screen.getByText("Reconnect to answer.")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Red/ }));
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("asks nothing of liveness when no paneId is given (a presentational card)", () => {
+    render(<PromptSelectBlock prompt={selectModel} onAction={vi.fn()} />);
+    expect(screen.queryByText("Reconnect to answer.")).toBeNull();
+    expect(screen.getByRole("button", { name: /Red/ })).toBeEnabled();
+  });
+});

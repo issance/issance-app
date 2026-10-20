@@ -1,0 +1,1091 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, waitFor } from "@testing-library/react";
+import type { ComponentProps } from "react";
+import { MemoryRouter } from "react-router";
+
+import { http, HttpResponse } from "msw";
+import { AnsiOutput } from "./ansi-output";
+import { FileLinksProvider } from "./file-links";
+import { paneLinkHandlers, PaneFileLinks, testFileOpener } from "@/test/file-links";
+import { server } from "@/test/setup";
+import { setDeviceToken } from "@/lib/pairing";
+import { codexPaddingScreen } from "@/test/codex-padding";
+
+const ESC = "\x1b";
+const MUTED_RULE_COLOUR = "var(--terminal-muted-fg, #a1a1a1)"; // dark half as the fallback
+
+// The mirror is shared by every harness. What it does per harness comes through the adapter registry
+// (`adapterFor(agent)?.prepareDisplay`), so it must not import a harness module of its own.
+describe("ansi-output's harness boundary", () => {
+  it("imports nothing from a lib/harness/<name>/ module", () => {
+    const source = readFileSync(join(import.meta.dirname, "ansi-output.tsx"), "utf8");
+    const imports = [...source.matchAll(/from\s+"([^"]+)"/g)].map((m) => m[1]!);
+    expect(imports.filter((spec) => /lib\/harness\/[^"]+/.test(spec))).toEqual([]);
+  });
+});
+
+describe("Grok's phone display", () => {
+  const captured = readFileSync(
+    join(import.meta.dirname, "..", "fixtures", "panes", "grok--output-scrollbar.txt"),
+    "utf8",
+  );
+
+  it("shows the reply without terminal padding or the scrollbar's empty viewport rows", () => {
+    const { container } = render(
+      <AnsiOutput text={captured} agent="grok" query="GB_BROWSER_RENDER_END" currentMatch={0} />,
+    );
+    const pre = container.querySelector("pre")!;
+    expect(pre.textContent).toContain("GB_BROWSER_RENDER_BEGIN");
+    expect(pre.textContent).toContain("GB_BROWSER_RENDER_END");
+    expect(pre.textContent).not.toContain("█");
+    expect(pre.textContent).not.toMatch(/\n(?: *\n){3}/);
+    expect(pre.textContent).not.toMatch(/ {10,}(?:\n|$)/);
+    expect(pre.querySelector('[data-find-match="current"]')!.textContent).toBe("GB_BROWSER_RENDER_END");
+    expect([...pre.querySelectorAll("span")].some(
+      (s) => s.style.backgroundColor === "rgb(28, 28, 28)" && s.textContent!.trim() !== "",
+    )).toBe(true);
+  });
+
+  it("applies screen-row hiding before compacting Grok's display", () => {
+    const { container } = render(<AnsiOutput text={captured} agent="grok" hideLeadingLines={20} />);
+    const pre = container.querySelector("pre")!;
+    expect(pre.textContent).toContain("Help improve Grok");
+    expect(pre.textContent).not.toContain("const message");
+    expect(pre.textContent).not.toMatch(/ {10,}(?:\n|$)/);
+  });
+
+  it("keeps a typed block and its meaningful background while dropping only right padding", () => {
+    const text = [
+      `${ESC}[48;2;36;36;36m literal ${ESC}[38;2;225;225;225m█${ESC}[0m          `,
+      "  ╭────────────────────────────────────────╮",
+      "  │ ❯                                      │",
+      "  ╰──────────────────── Grok 4.7 (high) ─╯",
+      "",
+      "  Shift+Tab:mode  │  Ctrl+.:shortcuts",
+    ].join("\n");
+    const { container } = render(<AnsiOutput text={text} agent="grok" />);
+    const pre = container.querySelector("pre")!;
+    expect(pre.textContent).toBe(" literal █");
+    expect([...pre.querySelectorAll("span")].some(
+      (s) => s.style.backgroundColor === "rgb(36, 36, 36)",
+    )).toBe(true);
+  });
+
+  // A run of coloured blanks after text is a swatch, not padding: no text on the row wears that
+  // colour, so it is the content. Only blanks on the canvas, or in a colour the row's own text sits
+  // on (a code block's fill), are padding.
+  it("keeps trailing blanks in a colour no text on the row uses", () => {
+    const text = [
+      `${ESC}[48;2;20;20;20mswatch:${ESC}[48;2;200;30;30m   ${ESC}[48;2;20;20;20m          ${ESC}[0m`,
+      "  ╭────────────────────────────────────────╮",
+      "  │ ❯                                      │",
+      "  ╰──────────────────── Grok 4.7 (high) ─╯",
+      "",
+      "  Shift+Tab:mode  │  Ctrl+.:shortcuts",
+    ].join("\n");
+    const { container } = render(<AnsiOutput text={text} agent="grok" />);
+    const pre = container.querySelector("pre")!;
+    expect(pre.textContent).toBe("swatch:   ");
+    expect([...pre.querySelectorAll("span")].some(
+      (s) => s.style.backgroundColor === "rgb(200, 30, 30)" && s.textContent === "   ",
+    )).toBe(true);
+  });
+
+  it("keeps a painted dark block when it belongs to colored message text, not canvas padding", () => {
+    const text = [
+      `${ESC}[48;2;20;20;20m${ESC}[38;2;225;225;225m literal   ${ESC}[38;2;25;25;25m${ESC}[48;2;25;25;25m█${ESC}[0m`,
+      "  ╭────────────────────────────────────────╮",
+      "  │ ❯                                      │",
+      "  ╰──────────────────── Grok 4.7 (high) ─╯",
+      "",
+      "  Shift+Tab:mode  │  Ctrl+.:shortcuts",
+    ].join("\n");
+    const { container } = render(<AnsiOutput text={text} agent="grok" />);
+    expect(container.querySelector("pre")!.textContent).toBe(" literal   █");
+  });
+
+  it.each([
+    { agent: "grok", grammars: false, wrap: true },
+    { agent: "grok", grammars: true, wrap: false },
+    { agent: undefined, grammars: true, wrap: true },
+  ])("keeps column-faithful output outside Grok's wrapped normal view ($agent, $grammars, $wrap)", (props) => {
+    const { container } = render(<AnsiOutput text={captured} {...props} />);
+    expect(container.querySelector("pre")!.textContent).toContain("█");
+  });
+});
+
+// The mirror renders in DARK space under every theme, and the light theme inverts it wholesale
+// (.adr/0002). These guard the two ways that arrangement silently breaks.
+describe("terminal mirror colour space", () => {
+  function mirror(text: string) {
+    const { container } = render(<AnsiOutput text={text} />);
+    return container.querySelector("pre")!;
+  }
+
+  it("inverts in light and leaves dark alone", () => {
+    const pre = mirror("hello");
+    expect(pre.className).toContain("[filter:invert(1)_hue-rotate(180deg)]");
+    // Without the dark: reset the filter would apply in BOTH themes and dark would render inverted.
+    expect(pre.className).toContain("dark:[filter:none]");
+  });
+
+  // Guards the ONE-SPELLING half of ADR 0002 rule 2. `bg-background` would in fact work here — an
+  // inherited light-dark() token resolves against THIS element's colour-scheme (dark), not the
+  // root's — but the mirror deliberately keeps a single spelling so nobody has to know that to read
+  // it. Mixing the two is the regression this catches; a computed-style test would not.
+  // Since M57 spec 17 a theme's `ansi` block may set the mirror's own ground and ink; the literals
+  // stay as the fallbacks, so without one the pixels are the dark-space values they always were.
+  it("uses the mirror's own dark-space colours, the literals as fallbacks, never page tokens", () => {
+    const pre = mirror("hello");
+    expect(pre.className).toContain("bg-[color:var(--mirror-ground,#0a0a0a)]");
+    expect(pre.className).toContain("text-[color:var(--mirror-ink,#fafafa)]");
+    expect(pre.className).not.toMatch(/\bbg-background\b/);
+    expect(pre.className).not.toMatch(/\btext-foreground\b/);
+  });
+
+  // The colour lives on the SEGMENT span, and a no-wrap line wraps its segments in a clipping
+  // inline-block span — so the query has to reach the leaf, not whatever element happens to contain
+  // the glyph first. A frame row is a no-wrap line (blocks.ts FRAME_ROW), which is how this stopped
+  // matching what it meant to match.
+  const leafSpan = (pre: HTMLElement, has: string) =>
+    [...pre.querySelectorAll("span")].find(
+      (s) => s.textContent?.includes(has) && s.querySelector("span") === null,
+    );
+
+  it("keeps muted rule glyphs on a literal dark-space grey", () => {
+    const span = leafSpan(mirror("├────────────┤\n"), "─");
+    expect(span).toBeDefined();
+    expect(span!.style.color).toBe(MUTED_RULE_COLOUR);
+  });
+
+  // The frame row keeps BOTH properties at once: clipped to one visual line, and still painted the
+  // muted grey. The clipping wrapper must not swallow the segment styling on its way in.
+  it("renders a frame row on one clipped line without losing the muted colour", () => {
+    const pre = mirror("├────────────┤\n");
+    const clip = [...pre.querySelectorAll("span")].find((s) => s.className.includes("overflow-hidden"));
+
+    expect(clip).toBeDefined();
+    expect(clip!.className).toContain("whitespace-pre");
+    expect(leafSpan(pre, "─")!.style.color).toBe(MUTED_RULE_COLOUR);
+  });
+
+  it("emits palette variables for indexed colour so the 16 slots stay themeable", () => {
+    const pre = mirror(`${ESC}[31mred${ESC}[0m`);
+    const span = [...pre.querySelectorAll("span")].find((s) => s.textContent === "red");
+    expect(span!.style.color).toBe("var(--ansi-1)");
+  });
+});
+
+// The mirror must stay selectable on the phone. An installed iOS PWA (display:standalone) suppresses
+// long-press selection app-wide unless an element opts back in with -webkit-user-select:text — so
+// without these the operator can't select-and-copy the terminal text on the phone at all (the pane
+// menu's "Copy output" is the one-tap alternative). Pinned as the classes that PRODUCE the behaviour,
+// the way the colour-space tests above are, since jsdom runs no selection.
+describe("terminal mirror text selection (mobile copy)", () => {
+  it("opts the <pre> back into text selection, both spellings", () => {
+    const { container } = render(<AnsiOutput text="hello" />);
+    const pre = container.querySelector("pre")!;
+    expect(pre.className).toContain("select-text");
+    expect(pre.className).toContain("[-webkit-user-select:text]");
+  });
+});
+
+// Native mirrors (muse in .adr/0047) skip the light-theme inversion: the palette reads raw on
+// the reference ground, while inversion drops body text to ~2:1. opencode is NOT one: on its
+// dark background answer the body is rgb(238,238,238), 1.13:1 raw against 17.32:1 inverted.
+// The <pre> carries the
+// reference ground in light and dark-space halves under `dark:`, and only bright foregrounds —
+// unreadable on white — resolve dark through a light-gated custom property.
+describe("native mirror (muse)", () => {
+  // `grammars={false}` throughout this block, and it is the point rather than a workaround: the
+  // native display pass is PRESENTATION, not a grammar, so it is gated on the native-mirror
+  // predicate and runs with the adapter switched off (.adr/0047, harness/index.ts). Leaving grammars
+  // on would also hand these one-line fragments to the M34 post-pass — a pane with no composer on it
+  // is the unread-dialog card's screen (.adr/0053) — and the `<pre>` found below would be the card's
+  // own mirror rather than the block renderer's.
+  function nativePre(text: string, agent?: string) {
+    const { container } = render(<AnsiOutput text={text} agent={agent} grammars={false} />);
+    return container.querySelector("pre")!;
+  }
+
+  it.each([["muse"]])("renders %s on the reference ground with no inversion filter", (agent) => {
+    const pre = nativePre("hello", agent);
+    expect(pre.className).toContain("terminal-muse");
+    expect(pre.className).toContain("bg-[#fffbf8]");
+    expect(pre.className).toContain("text-[#0a0a0a]");
+    expect(pre.className).toContain("dark:bg-[color:var(--mirror-ground,#0a0a0a)]");
+    expect(pre.className).toContain("dark:text-[color:var(--mirror-ink,#fafafa)]");
+    expect(pre.className).not.toContain("invert(1)");
+  });
+
+  // The per-pane override (lib/mirror-invert.ts) is the seam ADR 0002 reserved, and it is what
+  // actually serves a light-themed opencode or codex pane. It wins in BOTH directions.
+  it("renders natively when the pane opts in, against the agent bit", () => {
+    for (const agent of ["opencode", "codex", undefined]) {
+      const { container } = render(
+        <AnsiOutput text="hello" agent={agent} nativeMirror grammars={false} />,
+      );
+      const pre = container.querySelector("pre")!;
+      expect(pre.className).toContain("bg-[#fffbf8]");
+      expect(pre.className).not.toContain("invert(1)");
+    }
+  });
+
+  it("inverts when the pane opts out, even for a native agent", () => {
+    const { container } = render(
+      <AnsiOutput text="hello" agent="muse" nativeMirror={false} grammars={false} />,
+    );
+    const pre = container.querySelector("pre")!;
+    expect(pre.className).toContain("[filter:invert(1)_hue-rotate(180deg)]");
+    expect(pre.className).not.toContain("bg-[#fffbf8]");
+  });
+
+  it("keeps inverting every other agent", () => {
+    // "Muse" and "muse-code" pin the exactness: near-miss strings must not engage (#99).
+    for (const agent of [undefined, "shell", "codex", "opencode", "Muse", "muse-code"]) {
+      const pre = nativePre("hello", agent);
+      expect(pre.className).not.toContain("terminal-muse");
+      expect(pre.className).toContain("[filter:invert(1)_hue-rotate(180deg)]");
+    }
+  });
+
+  it("marks muted spans for the light-gated chrome rule", () => {
+    const pre = nativePre("─".repeat(12), "muse");
+    const span = [...pre.querySelectorAll("span")].find((s) => s.textContent!.includes("─"));
+    expect(span!.className).toContain("terminal-muted");
+    expect(span!.style.color).toBe(MUTED_RULE_COLOUR);
+  });
+
+  it("resolves bright foregrounds through the light-gated property, dark untouched", () => {
+    const pre = nativePre(`${ESC}[38;2;250;250;249mbright${ESC}[0m`, "muse");
+    const span = [...pre.querySelectorAll("span")].find((s) => s.textContent === "bright");
+    expect(span!.className).toContain("terminal-light-dark-fg");
+    // Emitted colour stays the fallback: dark defines nothing, so it stands. (jsdom keeps
+    // the parser's spaceless rgb() inside var(); browsers parse either spelling.)
+    expect(span!.style.color).toBe("var(--terminal-light-dark-fg, rgb(250,250,249))");
+  });
+
+  it("leaves Muse's dark body tones raw", () => {
+    const pre = nativePre(`${ESC}[38;2;111;114;122mbody${ESC}[0m`, "muse");
+    const span = [...pre.querySelectorAll("span")].find((s) => s.textContent === "body");
+    expect(span!.className).not.toContain("terminal-light-dark-fg");
+    expect(span!.style.color).toBe("rgb(111, 114, 122)");
+  });
+
+  it.each([["muse"]])("paints the current find match for %s without the cancelling filter", (agent) => {
+    const text = `${ESC}[38;2;111;114;122mfind the needle${ESC}[0m`;
+    const { container } = render(
+      <AnsiOutput text={text} query="needle" currentMatch={0} agent={agent} grammars={false} />,
+    );
+    const match = container.querySelector('[data-find-match="current"]')!;
+    expect(match.className).toContain("bg-yellow-400");
+    expect(match.className).toContain("text-black");
+    expect(match.className).not.toContain("invert(1)");
+  });
+
+  it("keeps the cancelling filter on current matches elsewhere", () => {
+    const { container } = render(<AnsiOutput text="find the needle" query="needle" currentMatch={0} />);
+    const match = container.querySelector('[data-find-match="current"]')!;
+    expect(match.className).toContain("[filter:invert(1)_hue-rotate(180deg)]");
+  });
+});
+
+// Wrap defaults ON (#53): the mirror is mostly agent prose and a phone shows far fewer columns than
+// the desktop width panes are spawned at. Structural clipping applies only in this wrap-on path;
+// with View's Wrap off, the full pre pans instead, so both paths need coverage.
+describe("mirror line wrapping", () => {
+  function preFor(props: Partial<ComponentProps<typeof AnsiOutput>>) {
+    const { container } = render(<AnsiOutput text="a very long line" {...props} />);
+    return container.querySelector("pre")!;
+  }
+
+  it("wraps by default rather than making the block a horizontal panner", () => {
+    const cls = preFor({}).className;
+    expect(cls).toContain("whitespace-pre-wrap");
+    expect(cls).not.toContain("overflow-x-auto");
+  });
+
+  it("still pans, column-faithful, when wrap is turned off", () => {
+    const cls = preFor({ wrap: false }).className;
+    expect(cls).toContain("whitespace-pre");
+    expect(cls).toContain("overflow-x-auto");
+    expect(cls).not.toContain("whitespace-pre-wrap");
+  });
+
+  it("rebalances rewrapped lines against orphans while wrapping", () => {
+    const cls = preFor({}).className;
+    expect(cls).toContain("text-pretty");
+    // ...and off the panning path: a column-faithful pan breaks nothing at all.
+    expect(preFor({ wrap: false }).className).not.toContain("text-pretty");
+  });
+
+  it("keeps a live-shaped ANSI labelled rule clipped while muting only its rule runs", () => {
+    const purple = "rgb(209, 131, 232)";
+    const leadBg = "rgb(24, 25, 26)";
+    const labelBg = "rgb(27, 28, 29)";
+    const url = "https://issance.com/docs/hangar/";
+    const tail = "─".repeat(20);
+    const visibleRule = `── ⠴ Working ${url} ${tail}`;
+    const rule =
+      `${ESC}[0m${ESC}[38;2;209;131;232;48;2;24;25;26m── ⠴${ESC}[0m ` +
+      `${ESC}[0m${ESC}[38;2;209;131;232;48;2;27;28;29mWorking ${url} ${tail}${ESC}[0m`;
+    const text = `ordinary prose\n${rule}\n`;
+    const visibleText = `ordinary prose\n${visibleRule}\n`;
+    const query = `${url} ─`; // crosses the label → tail split introduced by structural refinement
+    const { container, rerender } = render(<AnsiOutput text={text} query={query} currentMatch={0} agent="pi" />);
+    const pre = container.querySelector("pre")!;
+    // `span.overflow-hidden`, not `span.inline-block`: the table-run scroller is an inline-block too.
+    const clipped = pre.querySelector("span.overflow-hidden")!;
+
+    expect(clipped.className).toContain("max-w-full");
+    expect(clipped.className).toContain("overflow-hidden");
+    // `overflow-hidden` gives an inline-block a bottom-edge baseline; align it to the line box's
+    // bottom so the border keeps the terminal grid's one-row line advance.
+    expect(clipped.className).toContain("align-bottom");
+    expect(clipped.className).toContain("whitespace-pre");
+    expect(clipped.className).not.toContain("whitespace-nowrap");
+    expect(clipped.className).toContain("break-normal");
+    // Firefox must not restore LINK_CLASS's break-all inside a no-wrap row.
+    expect(clipped.className).toContain("[&_a]:break-normal");
+    expect(clipped.textContent).toBe(visibleRule);
+    expect(clipped.children).toHaveLength(5);
+    // SAFETY: `children` is typed Element, but these five nodes are the renderer's segment spans.
+    const [lead, spinner, separator, label, trailing] = [...clipped.children] as HTMLElement[];
+    expect(lead.style.color).toBe(MUTED_RULE_COLOUR);
+    expect(lead.style.fontWeight).toBe("400");
+    expect(lead.style.opacity).toBe("1");
+    expect(lead.style.backgroundColor).toBe(leadBg);
+    expect(spinner.style.color).toBe(purple);
+    expect(spinner.style.backgroundColor).toBe(leadBg);
+    expect(separator.style.color).toBe("");
+    expect(label.style.color).toBe(purple);
+    expect(label.style.backgroundColor).toBe(labelBg);
+    expect(trailing.style.color).toBe(MUTED_RULE_COLOUR);
+    expect(trailing.style.fontWeight).toBe("400");
+    expect(trailing.style.opacity).toBe("1");
+    expect(trailing.style.backgroundColor).toBe(labelBg);
+    const anchor = clipped.querySelector("a")!;
+    expect(anchor.getAttribute("href")).toBe(url);
+    expect(anchor.getAttribute("target")).toBe("_blank");
+    expect(anchor.getAttribute("rel")).toBe("noopener noreferrer");
+    expect(anchor.className).toContain("underline");
+    expect(anchor.className).toContain("cursor-pointer");
+    expect(anchor.className).toContain("py-[0.35em]");
+    const match = anchor.querySelector('[data-find-match="current"]')!;
+    expect(match.textContent).toBe(url);
+    const offsetsOf = (selector: string) => {
+      const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
+      const offsets: number[] = [];
+      let offset = 0;
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (node.parentElement?.closest(selector) && !offsets.includes(offset)) offsets.push(offset);
+        offset += node.textContent!.length;
+      }
+      return offsets;
+    };
+    expect(offsetsOf('[data-find-match]')).toEqual([
+      visibleText.indexOf(url),
+      visibleText.indexOf(url) + url.length,
+      visibleText.indexOf(url) + url.length + 1,
+    ]);
+    expect(offsetsOf("a")).toEqual([visibleText.indexOf(url)]);
+    const textNodes = document.createTreeWalker(clipped, NodeFilter.SHOW_TEXT);
+    const nodes: Node[] = [];
+    for (let node = textNodes.nextNode(); node; node = textNodes.nextNode()) nodes.push(node);
+    const selection = document.getSelection()!;
+    const range = document.createRange();
+    range.setStart(nodes[0]!, 0);
+    range.setEnd(nodes.at(-1)!, nodes.at(-1)!.textContent!.length);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    expect(selection.toString()).toBe(visibleRule);
+    selection.removeAllRanges();
+    expect(pre.textContent).toBe(visibleText);
+
+    rerender(<AnsiOutput text={text} query={query} currentMatch={0} agent="pi" wrap={false} />);
+    expect(container.querySelector("span.overflow-hidden")).toBeNull();
+    expect(container.querySelector("pre")!.textContent).toBe(visibleText);
+  });
+
+  it("clips a plain border only while wrapping, leaving ordinary output and wrap-off panning alone", () => {
+    const border = `  ${"─".repeat(20)}  `;
+    const { container: plain } = render(<AnsiOutput text={`${border}\n`} />);
+    expect(plain.querySelector("span.overflow-hidden")?.textContent).toBe(border);
+
+    const { container: wrapped } = render(<AnsiOutput text={`unbroken-${"x".repeat(40)}\n`} />);
+    const wrappedPre = wrapped.querySelector("pre")!;
+    expect(wrappedPre.className).toContain("break-words");
+    expect(wrappedPre.querySelector("span.overflow-hidden")).toBeNull();
+
+    const { container: panned } = render(<AnsiOutput text={`${border}\n`} wrap={false} />);
+    const pannedPre = panned.querySelector("pre")!;
+    expect(pannedPre.className).toContain("overflow-x-auto");
+    expect(pannedPre.querySelector("span.overflow-hidden")).toBeNull();
+    expect(pannedPre.textContent).toBe(`${border}\n`);
+  });
+  it("tags only Codex's terminal-wide user fill for mobile transparency", () => {
+    const user = `${ESC}[48;2;240;240;240m› submitted message${" ".repeat(32)}${ESC}[0m`;
+    const diff = `${ESC}[48;2;33;58;43m+ semantic diff${ESC}[0m`;
+    // The mark is gated on the codex adapter, so grammars stay ON — which means the fragment has to
+    // be a plausible codex pane. Without a composer on screen the M34 post-pass answers with the
+    // unread-dialog card instead of the mirror (.adr/0053), and the marked span would never render.
+    const { container } = render(
+      <AnsiOutput text={`${user}\n${diff}\n${codexPaddingScreen}`} agent="codex" />,
+    );
+    // SAFETY: the marked segment is a <span> the renderer just produced, so querySelector on the
+    // class it only ever sets on a span returns an HTMLElement or null; the assertions below
+    // dereference it and would fail loudly on null.
+    const userSpan = container.querySelector(".terminal-mobile-transparent-bg") as HTMLElement;
+
+    expect(userSpan.textContent).toContain("submitted message");
+    // Desktop keeps Codex's native fill, carried in the custom property the stylesheet reads. The
+    // inline background-color is gone on purpose: a class cannot beat one without `!important`.
+    expect(userSpan.style.backgroundColor).toBe("");
+    expect(userSpan.style.getPropertyValue("--terminal-seg-bg")).toBe("rgb(240,240,240)");
+    const diffSpan = [...container.querySelectorAll("span")].find((node) =>
+      node.textContent?.includes("semantic diff"),
+    )!;
+    expect(diffSpan.classList.contains("terminal-mobile-transparent-bg")).toBe(false);
+    expect(diffSpan.getAttribute("style")).toContain("rgb(33, 58, 43)");
+  });
+
+  it("drops Codex's composer padding band from the mirror: no painted blank row is left behind", () => {
+    const body = Array.from({ length: 60 }, (_, i) => `Earlier output ${i}`).join("\n") + "\n";
+    const { container } = render(<AnsiOutput text={body + codexPaddingScreen} agent="codex" />);
+    const pre = container.querySelector("pre")!;
+
+    // The transcript stays, down to its last line; the prompt, its two background-only rows and the
+    // statusline belong to the composer and are not drawn in the mirror.
+    expect(pre.textContent).toBe(`${body}• Verification complete. Keep this transcript.`);
+    const paintedBlanks = [...pre.querySelectorAll("span")].filter(
+      (span) => span.textContent?.trim() === "" && span.style.backgroundColor !== "",
+    );
+    expect(paintedBlanks).toHaveLength(0);
+  });
+
+  it("does not suppress the same ANSI background for an unknown agent", () => {
+    const user = `${ESC}[48;2;240;240;240mordinary terminal output${ESC}[0m`;
+    const { container } = render(<AnsiOutput text={user} agent="shell" />);
+    expect(container.querySelector(".terminal-mobile-transparent-bg")).toBeNull();
+  });
+});
+
+// With wrapping off the screen is a grid. A CJK glyph falls back to a face whose advance is not two
+// cells (components/painted-cells.tsx), so outside tables too each one is held to two cells, or
+// every wall to its right drifts. Wrapping prose keeps its natural advances.
+describe("fixed-column terminal text", () => {
+  const text = `${ESC}[35m→ 1. 커피${ESC}[0m   │ details\n  2. 차      │ https://example.com\n`;
+
+  it("holds Hangul to two cells outside tables when wrapping is off", () => {
+    const { container } = render(<AnsiOutput text={text} wrap={false} query="커피" />);
+    const pre = container.querySelector("pre")!;
+    const cells = [...pre.querySelectorAll('[class~="w-[2ch]"]')];
+
+    expect(cells.map((cell) => cell.textContent).join("")).toBe("커피차");
+    expect(pre.textContent).toBe("→ 1. 커피   │ details\n  2. 차      │ https://example.com\n");
+    expect(pre.querySelector("[data-find-match]")!.textContent).toBe("커피");
+    expect(pre.querySelector("a")!.textContent).toBe("https://example.com");
+  });
+
+  it("keeps the underline on the wide Hangul inside a link", () => {
+    const { container } = render(
+      <AnsiOutput text="open https://example.com/커피 now" wrap={false} />,
+    );
+    const link = container.querySelector("a")!;
+    const cells = [...link.querySelectorAll<HTMLElement>('[class~="w-[2ch]"]')];
+
+    expect(link.textContent).toBe("https://example.com/커피");
+    expect(cells.map((cell) => cell.textContent)).toEqual(["커", "피"]);
+    // An underline does not propagate into an inline-block child, so each wide piece draws the
+    // link's decoration itself.
+    expect(link.className).toContain("underline");
+    for (const cell of cells) expect(cell.className).toContain("[text-decoration:inherit]");
+  });
+
+  it("keeps wrapping prose free of fixed-width cells", () => {
+    const { container } = render(<AnsiOutput text="한글 설명입니다." />);
+    expect(container.querySelector('[class~="w-[2ch]"]')).toBeNull();
+    expect(container.querySelector("pre")!.textContent).toBe("한글 설명입니다.");
+  });
+});
+
+// Wrap is right for prose and wrong for a table, whose meaning is the column a character sits in
+// (lib/table-run.ts). So a table run pans inside its own scroller while everything around it keeps
+// wrapping. What a refactor would break silently is not the scroller — it is the mirror text around
+// it: the run is grouped by moving line nodes under one span, and the find offsets, the link
+// offsets and a clipboard copy are all defined by the "\n" text nodes those lines sit between.
+describe("a table pans while the mirror around it wraps", () => {
+  const TABLE = ["| Option | Cost |", "| --- | --- |", "| A | low |", "| B | high |"].join("\n");
+  const TEXT = `here is the comparison:\n\n${TABLE}\n\nsee https://issance.com/docs/hangar/`;
+
+  function mirror(props: Partial<ComponentProps<typeof AnsiOutput>> = {}) {
+    const { container } = render(<AnsiOutput text={TEXT} {...props} />);
+    return container.querySelector("pre")!;
+  }
+
+  it("puts the whole table in ONE scroller, so its rows pan together and stay aligned", () => {
+    const pre = mirror();
+    const runs = [...pre.querySelectorAll("span.overflow-x-auto")];
+
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.textContent).toBe(TABLE);
+    // Per-line scrollers would let two rows sit at different scrollLeft — the columns would come
+    // apart under the thumb, which is the exact failure wrapping already causes.
+    expect(runs[0]!.className).toContain("whitespace-pre");
+    expect(runs[0]!.className).toContain("inline-block");
+  });
+
+  it("pins overflow-y, so a link's em-padding cannot make the run a second vertical scroller", () => {
+    expect(mirror().querySelector("span.overflow-x-auto")!.className).toContain("overflow-y-hidden");
+  });
+
+  it("leaves the mirror text, the find offsets and the autolink exactly where they were", () => {
+    const pre = mirror({ query: "high" });
+
+    // Byte-identical to the input: grouping moved nodes, it did not add or drop a separator.
+    expect(pre.textContent).toBe(TEXT);
+    expect(pre.querySelector("[data-find-match]")!.textContent).toBe("high");
+    expect(pre.querySelector("span.overflow-x-auto")!.querySelector("[data-find-match]")).not.toBeNull();
+    expect(pre.querySelector("a")!.textContent).toBe("https://issance.com/docs/hangar/");
+  });
+
+  it("does not nest a scroller inside the wrap-off pan, which is already column-faithful", () => {
+    expect(mirror({ wrap: false }).querySelector("span.overflow-x-auto")).toBeNull();
+  });
+
+  it("holds each double-width character of a run to two columns, so a CJK table's walls line up", () => {
+    // The mirror's monospace stack has no CJK face, so an ideograph falls back to a font whose
+    // advance is not two ASCII cells, and every wall after it drifts. Each one in a run sits in a
+    // box exactly 2ch wide instead; prose outside the run keeps its free wrapping.
+    const table = ["┌──────────┬────────┐", "│ 用水位置 │ 建議   │", "├──────────┼────────┤", "│ 廚房     │ 淨水   │", "└──────────┴────────┘"].join("\n");
+    const text = `中文說明\n\n${table}\n`;
+    const { container } = render(<AnsiOutput text={text} />);
+    const pre = container.querySelector("pre")!;
+    const run = pre.querySelector("span.overflow-x-auto")!;
+    const cells = [...run.querySelectorAll('[class~="w-[2ch]"]')];
+
+    expect(cells.map((c) => c.textContent).join("")).toBe("用水位置建議廚房淨水");
+    expect(pre.querySelectorAll('[class~="w-[2ch]"]')).toHaveLength(cells.length);
+    expect(pre.textContent).toBe(text);
+  });
+
+  it("leaves the border clip alone: a rule beside a table stays clipped and outside the run", () => {
+    // A repeated rule carries no separator at any member row's column offsets, so the run ends at
+    // it and the rule keeps the single-row clip it has always had.
+    const rule = "─".repeat(20);
+    const table = ["┌──────┬──────┐", "│ a    │ b    │", "├──────┼──────┤", "│ 1    │ 2    │", "└──────┴──────┘"].join("\n");
+    const text = `${table}\n${rule}\n`;
+    const { container } = render(<AnsiOutput text={text} />);
+    const run = container.querySelector("span.overflow-x-auto")!;
+
+    expect(run.textContent).toBe(table);
+    expect(container.querySelector("span.overflow-hidden")!.textContent).toBe(rule);
+    expect(container.querySelector("pre")!.textContent).toBe(text);
+  });
+
+  // THE PRECEDENCE. A box-drawn table's rows open and close on a vertical stroke, so blocks.ts's
+  // FRAME_ROW marks every one of them `noWrap` (issue #156) at the same time as table-run.ts claims
+  // them for a run. The two answers are ordered, not merged: a detected table owns its rows, frame
+  // rows included, so the whole table pans as one unit. A frame row with no table around it keeps
+  // the clip. These two tests are the pair; neither alone would catch a regression in the order.
+  describe("a table run outranks the frame-row clip on the rows it owns", () => {
+    const BOX = ["┌──────┬──────┐", "│ a    │ b    │", "├──────┼──────┤", "│ 1    │ 2    │", "└──────┴──────┘"];
+
+    it("clips no row of a box table, so the one scroller has something to pan", () => {
+      const table = BOX.join("\n");
+      const { container } = render(<AnsiOutput text={`prose\n\n${table}\n`} />);
+      const run = container.querySelector("span.overflow-x-auto")!;
+
+      // Every row is inside the run, and NOT ONE of them carries a clip of its own. A per-row clip
+      // would hide the same columns on every row and leave the run's scrollWidth at its clientWidth,
+      // which is the table silently refusing to pan.
+      expect(run.textContent).toBe(table);
+      expect(run.querySelectorAll("span.overflow-hidden")).toHaveLength(0);
+      expect(container.querySelectorAll("span.overflow-hidden")).toHaveLength(0);
+      expect(container.querySelector("pre")!.textContent).toBe(`prose\n\n${table}\n`);
+    });
+
+    it("still clips a framed row that no table claims", () => {
+      // A one-column chrome box: no cross anywhere, so no anchor and no run. Nothing about the
+      // table grammar may reach this row, so it keeps the clip #156 gave it.
+      const panel = ["╭──────────────╮", "│ Continue?    │", "╰──────────────╯"];
+      const { container } = render(<AnsiOutput text={`${panel.join("\n")}\n`} />);
+
+      expect(container.querySelector("span.overflow-x-auto")).toBeNull();
+      const clipped = [...container.querySelectorAll("span.overflow-hidden")].map((s) => s.textContent);
+      expect(clipped).toContain("│ Continue?    │");
+    });
+  });
+
+  // The grouping moves line nodes under a span and hoists one "\n" out of it, so the arrangements
+  // worth testing are the ones where that newline is decisive: a run with nothing before it, two
+  // runs in one block, and two runs with no gap. TEXT above always has prose first, so on its own it
+  // never renders the branch where the hoisted newline would be wrong.
+  describe("the arrangements where the hoisted newline decides", () => {
+    const A = ["| a | b |", "| --- | --- |", "| 1 | 2 |"].join("\n");
+    const B = ["| c | d |", "| --- | --- |", "| 3 | 4 |"].join("\n");
+
+    function offsetsOf(pre: HTMLElement, selector: string): number[] {
+      const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
+      const at: number[] = [];
+      let seen = 0;
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const owner = node.parentElement?.closest(selector);
+        if (owner && !at.includes(seen)) at.push(seen);
+        seen += node.textContent!.length;
+      }
+      return at;
+    }
+
+    it.each([
+      ["a run that starts the mirror", `${A}\nafter\n`],
+      ["a run that ends the mirror, no trailing newline", `before\n${A}`],
+      ["two runs with prose between them", `${A}\nbetween\n${B}\n`],
+      ["two runs with no gap at all", `${A}\n${B}\n`],
+      ["the whole mirror being one run", A],
+    ])("keeps the mirror text byte-identical: %s", (_name, text) => {
+      const { container } = render(<AnsiOutput text={text} />);
+      expect(container.querySelector("pre")!.textContent).toBe(text);
+    });
+
+    it("keeps find offsets true when a match sits after a run that starts the mirror", () => {
+      const text = `${A}\nbetween\n${B}\n`;
+      const { container } = render(<AnsiOutput text={text} query="3" />);
+      const pre = container.querySelector("pre")!;
+
+      // The highlighted node must start at the same index in the DOM text as in the input string.
+      expect(offsetsOf(pre, "[data-find-match]")).toEqual([text.indexOf("3")]);
+      expect(pre.textContent).toBe(text);
+    });
+
+    it("anchors a URL at its true offset inside a run", () => {
+      const table = ["| doc | note |", "| --- | --- |", "| https://issance.com/docs/hangar/ | read |"].join("\n");
+      const text = `before\n${table}\n`;
+      const { container } = render(<AnsiOutput text={text} />);
+      const pre = container.querySelector("pre")!;
+
+      expect(offsetsOf(pre, "a")).toEqual([text.indexOf("https://")]);
+      expect(pre.querySelector("span.overflow-x-auto")!.querySelector("a")).not.toBeNull();
+    });
+  });
+
+  it("survives a poll that shifts the table's line index, so the reader's pan is not thrown away", () => {
+    // The mirror is a rendered grid: one new line of output moves every line index. Keyed by index,
+    // the scroller would unmount on that poll and scrollLeft would snap back to zero under the
+    // thumb, with the table still sitting in the same place on screen.
+    const table = ["| a | b |", "| --- | --- |", "| 1 | 2 |"].join("\n");
+    const { container, rerender } = render(<AnsiOutput text={`one\n\n${table}\n`} />);
+    const before = container.querySelector("span.overflow-x-auto")!;
+
+    rerender(<AnsiOutput text={`one\ntwo\n\n${table}\n`} />);
+
+    expect(container.querySelector("span.overflow-x-auto")).toBe(before);
+  });
+});
+
+// URLs printed by an agent are plain characters — the mirror finds them and wraps those ranges in
+// anchors. The invariants worth guarding are the ones a refactor would silently break: the text is
+// still exactly what the terminal printed, and nothing but http(s) ever becomes an href.
+describe("clickable links in the mirror", () => {
+  function mirror(props: Partial<ComponentProps<typeof AnsiOutput>> & { text: string }) {
+    const { container } = render(<AnsiOutput {...props} />);
+    return container.querySelector("pre")!;
+  }
+
+  it("links a bare URL without changing the rendered text", () => {
+    const pre = mirror({ text: "opened https://issance.com/docs/hangar/ ok\n" });
+    const a = pre.querySelector("a")!;
+    expect(a.getAttribute("href")).toBe("https://issance.com/docs/hangar/");
+    expect(a.textContent).toBe("https://issance.com/docs/hangar/");
+    // The mirror must stay a faithful copy — the anchor adds structure, never characters.
+    expect(pre.textContent).toBe("opened https://issance.com/docs/hangar/ ok\n");
+  });
+
+  it("opens in a new tab and severs the opener — these hrefs come from agent output", () => {
+    const a = mirror({ text: "https://issance.com/docs/hangar/" }).querySelector("a")!;
+    expect(a.getAttribute("target")).toBe("_blank");
+    expect(a.getAttribute("rel")).toBe("noopener noreferrer");
+  });
+
+  it("never links a dangerous scheme", () => {
+    const pre = mirror({ text: "javascript:alert(1) data:text/html,<script>x</script>\n" });
+    expect(pre.querySelector("a")).toBeNull();
+    expect(pre.querySelector("script")).toBeNull(); // text nodes only — the XSS boundary holds
+  });
+
+  // A URL that changes colour mid-way (an agent underlining just the path, say) is split across
+  // segments. Each slice gets its own anchor, so the whole run is tappable and carries one href.
+  it("links a URL that straddles an SGR change", () => {
+    const pre = mirror({ text: `${ESC}[34mhttps://issance.com/docs/hangar/` });
+    const anchors = [...pre.querySelectorAll("a")];
+    expect(anchors.length).toBeGreaterThan(1);
+    expect(anchors.every((a) => a.getAttribute("href") === "https://issance.com/docs/hangar/")).toBe(true);
+    expect(anchors.map((a) => a.textContent).join("")).toBe("https://issance.com/docs/hangar/");
+  });
+
+  // The mirror renders the *grid*, so a URL longer than the pane arrives cut at the column edge: one
+  // anchor with a truncated href, and the rest of the URL as inert text. The logical read the bridge
+  // sends for exactly that case is what turns the fragments back into the one URL they were.
+  it("links every fragment of a wrapped URL to the whole URL, when the logical text is there", () => {
+    const pre = mirror({
+      text: "run this:\nhttps://a.dev/auth?client=1&s\ntate=y then\n",
+      logicalText: "run this:\nhttps://a.dev/auth?client=1&state=y then\n",
+    });
+    const anchors = [...pre.querySelectorAll("a")];
+    expect(anchors.map((a) => a.getAttribute("href"))).toEqual([
+      "https://a.dev/auth?client=1&state=y",
+      "https://a.dev/auth?client=1&state=y",
+    ]);
+    expect(anchors.map((a) => a.textContent).join("")).toBe("https://a.dev/auth?client=1&state=y");
+    // Faithfulness is not negotiable: the rows are still exactly what the terminal printed.
+    expect(pre.textContent).toBe("run this:\nhttps://a.dev/auth?client=1&s\ntate=y then\n");
+  });
+
+  it("keeps the fragment truncated when no logical text came with it", () => {
+    const pre = mirror({ text: "https://a.dev/auth?client=1&s\ntate=y then\n" });
+    expect([...pre.querySelectorAll("a")].map((a) => a.getAttribute("href"))).toEqual([
+      "https://a.dev/auth?client=1&s",
+    ]);
+  });
+
+  // Find and links split the same coordinate space; the order they nest in is the easy thing to get
+  // wrong, and getting it wrong drops one of them.
+  it("still highlights a find match inside a link", () => {
+    const pre = mirror({ text: "see https://issance.com/docs/hangar/", query: "herdr" });
+    const a = pre.querySelector("a")!;
+    const hit = a.querySelector("[data-find-match]")!;
+    expect(hit.textContent).toBe("herdr");
+    expect(a.textContent).toBe("https://issance.com/docs/hangar/");
+  });
+
+  // The underline inherits the agent's colour rather than pinning one, so it stays legible whatever
+  // the pane printed and whichever theme is up.
+  it("underlines in currentColor rather than a fixed colour", () => {
+    const a = mirror({ text: "https://issance.com/docs/hangar/" }).querySelector("a")!;
+    expect(a.className).toContain("underline");
+    expect(a.className).toContain("break-all");
+    expect(a.className).not.toMatch(/decoration-\[#/);
+  });
+
+  // The tap-target pad must scale with the font-size control. jsdom has no layout, so this can only
+  // guard the unit — but the unit is the whole point: a px pad tuned for 12px text reaches past the
+  // neighbouring line's centre at 9px (the A− floor), and a tap on ordinary output opens a link.
+  // The padded box deliberately OVERLAPS its neighbours (~22px against a 15px line advance); what
+  // must hold is that it never reaches the neighbouring line's centre, which only an em value keeps
+  // true across the A+/A- range. See the LINK_CLASS comment for the full argument.
+  it("sizes the link tap target in em, never px", () => {
+    const a = mirror({ text: "https://issance.com/docs/hangar/" }).querySelector("a")!;
+    expect(a.className).toContain("py-[0.35em]");
+    expect(a.className).not.toMatch(/\bpy-\[[\d.]+px\]/);
+  });
+});
+
+// ── Terminal graphics (Kitty placeholders) ───────────────────────────────────
+// The terminal painted the pixels itself and left a rectangle of U+10EEEE cells behind, so what
+// reaches the mirror is placeholder characters (lib/mirror-images.ts's header). These pin the four
+// things that make the card stand in for them honestly: one card per image however many cells it
+// covers, a badge rather than a wrong picture, a row's own text survives, and — the one that bit —
+// every character the card replaced still counts in the find/link coordinate space.
+
+describe("terminal mirror image placeholders", () => {
+  const KITTY_PLACEHOLDER = "\u{10EEEE}\u{10EEEE}\u{10EEEE}";
+  const BLOB = "/api/blobs/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+  it("renders a placeholder badge when images are absent", () => {
+    const { container } = render(<AnsiOutput text={`header\n${KITTY_PLACEHOLDER}\nfooter`} />);
+    expect(container.textContent).toContain("[Image]");
+  });
+
+  // Reads need the pairing token (ADR 0086), so the card's bytes are fetched with it and drawn from
+  // an object URL. The card appears once they are here.
+  const firstImg = (container: HTMLElement) =>
+    vi.waitFor(() => {
+      const img = container.querySelector("img");
+      if (img === null) throw new Error("no picture yet");
+      return img;
+    });
+
+  it("renders an inline image when images are provided", async () => {
+    const { container } = render(
+      <AnsiOutput text={`header\n${KITTY_PLACEHOLDER}\nfooter`} images={[BLOB]} />,
+    );
+    const img = await firstImg(container);
+    expect(img.getAttribute("src")).toMatch(/^blob:/);
+  });
+
+  it("is ONE card for one image, however many cells it covers", async () => {
+    const rows = `${KITTY_PLACEHOLDER}\n${KITTY_PLACEHOLDER}\n${KITTY_PLACEHOLDER}`;
+    const { container } = render(<AnsiOutput text={`header\n${rows}\nfooter`} images={[BLOB]} />);
+    await firstImg(container);
+    expect(container.querySelectorAll("img")).toHaveLength(1);
+  });
+
+  it("reports the cluster count, which is what makes the caller's fetch on-demand", () => {
+    const onImageClusterCount = vi.fn();
+    const two = `${KITTY_PLACEHOLDER}\n${KITTY_PLACEHOLDER}\nbetween\n${KITTY_PLACEHOLDER}`;
+    render(<AnsiOutput text={two} onImageClusterCount={onImageClusterCount} />);
+    expect(onImageClusterCount).toHaveBeenLastCalledWith(2);
+    onImageClusterCount.mockClear();
+    render(<AnsiOutput text="no images here" onImageClusterCount={onImageClusterCount} />);
+    expect(onImageClusterCount).toHaveBeenLastCalledWith(0);
+  });
+
+  it("shows a badge for the cluster the ordering could not match, never a repeated image", async () => {
+    // Aligned from the END: the one image belongs to the LAST cluster, and the first gets the badge.
+    const two = `${KITTY_PLACEHOLDER}\nbetween\n${KITTY_PLACEHOLDER}`;
+    const { container } = render(<AnsiOutput text={two} images={[BLOB]} />);
+    await firstImg(container);
+    expect(container.querySelectorAll("img")).toHaveLength(1);
+    expect(container.textContent).toContain("[Image]");
+  });
+
+  it("keeps the text on a row that holds both a placeholder and real text", async () => {
+    const { container } = render(
+      <AnsiOutput text={`Screenshot: ${KITTY_PLACEHOLDER}\nafter`} images={[BLOB]} />,
+    );
+    await firstImg(container);
+    // The sentence survives, the card renders beside it, and the placeholder glyphs are gone.
+    expect(container.textContent).toContain("Screenshot:");
+    expect(container.querySelectorAll("img")).toHaveLength(1);
+    expect(container.textContent).not.toContain("\u{10EEEE}");
+  });
+
+  it("advances the find offset over the rows the card replaced", () => {
+    // The bug this pins: the cluster loop used to skip the placeholder lines WITHOUT advancing the
+    // shared offset, so every find match and every autolink below an image was addressed a
+    // screenful early and highlighted the wrong characters.
+    const text = `aaa\n${KITTY_PLACEHOLDER}\nbbbbbbb needle ccc`;
+    const { container } = render(<AnsiOutput text={text} query="needle" currentMatch={0} />);
+    const hit = container.querySelector("[data-find-match]")!;
+    expect(hit.textContent).toBe("needle");
+  });
+
+  it("advances the autolink offset over them too", () => {
+    const url = "https://issance.com/docs/hangar/";
+    const text = `aaa\n${KITTY_PLACEHOLDER}\nsee ${url} now`;
+    const { container } = render(<AnsiOutput text={text} />);
+    // Two anchors: the image card's own, and the autolink. The autolink's text must be the URL.
+    const link = [...container.querySelectorAll("a")].find((a) => a.querySelector("img") === null)!;
+    expect(link.textContent).toBe(url);
+    expect(link.getAttribute("href")).toBe(url);
+  });
+
+  it("says on the card that the picture was matched by order", async () => {
+    // The match is an approximation, so a matched card must read as a guess and point at History.
+    const { container } = render(
+      <AnsiOutput text={`header\n${KITTY_PLACEHOLDER}\nfooter`} images={[BLOB]} />,
+    );
+    await firstImg(container);
+    expect(container.textContent).toContain("matched by order, open History to check");
+    expect(container.querySelector("a[title]")?.getAttribute("title")).toBe(
+      "matched by order, open History to check",
+    );
+  });
+
+  it("does not put the matched-by-order line on the badge", () => {
+    // The badge claims nothing about a picture, so there is nothing for it to hedge.
+    const { container } = render(<AnsiOutput text={`header\n${KITTY_PLACEHOLDER}\nfooter`} />);
+    expect(container.textContent).toContain("[Image]");
+    expect(container.textContent).not.toContain("matched by order");
+  });
+
+  it("falls back to the badge when the image fails to load", async () => {
+    // A peer on an older build has no `blobs/<hash>` route and answers 404 (CREW_PROTOCOL §9.1),
+    // and a blob can also be gone. Either way: the badge, never a broken-image glyph.
+    const { container } = render(
+      <AnsiOutput text={`header\n${KITTY_PLACEHOLDER}\nfooter`} images={[BLOB]} />,
+    );
+    fireEvent.error(await firstImg(container));
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).toContain("[Image]");
+  });
+
+  it("fetches the picture's bytes with the pairing token, from the blob path the journal named", async () => {
+    const seen: { path: string; auth: string | null }[] = [];
+    server.use(
+      http.get("/api/blobs/:hash", ({ request }) => {
+        seen.push({ path: new URL(request.url).pathname, auth: request.headers.get("authorization") });
+        return new HttpResponse(new Uint8Array([1]), { headers: { "content-type": "image/png" } });
+      }),
+    );
+    setDeviceToken("tok-test-placeholder");
+    const { container } = render(
+      <AnsiOutput text={`header\n${KITTY_PLACEHOLDER}\nfooter`} images={[BLOB]} />,
+    );
+    const img = await firstImg(container);
+    // The link around the picture is the object URL the page minted itself, not the bridge path.
+    expect(img.closest("a")?.getAttribute("href")).toMatch(/^blob:/);
+    expect(seen).toEqual([{ path: BLOB, auth: "Bearer tok-test-placeholder" }]);
+  });
+
+  it("speaks German: the badge and the matched-by-order line come from the German catalog", async () => {
+    vi.resetModules();
+    const [{ AnsiOutput: FreshOutput }, { __resetLocale, setLocale, whenLocaleReady }, { de }, { en }] =
+      await Promise.all([
+        import("./ansi-output"),
+        import("@/lib/i18n"),
+        import("@/lib/i18n/messages/de"),
+        import("@/lib/i18n/messages/en"),
+      ]);
+    __resetLocale();
+    try {
+      const { container } = render(
+        <FreshOutput text={`header\n${KITTY_PLACEHOLDER}\n${"x"}\n${KITTY_PLACEHOLDER}\nfooter`} images={[BLOB]} />,
+      );
+      await act(async () => {
+        setLocale("de");
+        await whenLocaleReady("de");
+      });
+      await vi.waitFor(() => expect(container.textContent).toContain(de["mirror.imageBadge"]));
+      expect(container.textContent).toContain(de["mirror.imageMatchedByOrder"]);
+      // All three differ from English, so this cannot pass by falling back to it.
+      expect(de["mirror.imageBadge"]).not.toBe(en["mirror.imageBadge"]);
+      expect(de["mirror.imageMatchedByOrder"]).not.toBe(en["mirror.imageMatchedByOrder"]);
+      expect(de["mirror.imageAlt"]).not.toBe(en["mirror.imageAlt"]);
+      expect(container.textContent).not.toContain(en["mirror.imageBadge"]);
+      expect(container.textContent).not.toContain(en["mirror.imageMatchedByOrder"]);
+      const img = await vi.waitFor(() => {
+        const found = container.querySelector("img");
+        if (found === null) throw new Error("no picture yet");
+        return found;
+      });
+      expect(img.getAttribute("alt")).toBe(de["mirror.imageAlt"]);
+    } finally {
+      __resetLocale();
+    }
+  });
+
+  it("falls back to the badge when the bridge refuses the bytes", async () => {
+    // The fetch now carries the token, so a refusal (404 from an old peer, 403 before pairing)
+    // arrives as an answer, not as an `<img>` error. Same outcome: the badge.
+    server.use(http.get("/api/blobs/:hash", () => new HttpResponse("not found", { status: 404 })));
+    const { container } = render(
+      <AnsiOutput text={`header\n${KITTY_PLACEHOLDER}\nfooter`} images={[BLOB]} />,
+    );
+    await vi.waitFor(() => expect(container.textContent).toContain("[Image]"));
+    expect(container.querySelector("img")).toBeNull();
+  });
+});
+
+// A segment's background paints its content box and a glyph paints its EM BOX, so at the mirror's
+// 1.25 leading every character whose job is to fill its cell is a quarter of a row short and the
+// pill or bar it belongs to steps at the join (lib/cell-glyphs.ts). These guard the three things
+// painting it instead must not cost: the text, the offsets, and the paint's own colour source.
+describe("cell-filling glyphs", () => {
+  const LEFT_CAP = "\ue0b6";
+  const RIGHT_CAP = "\ue0b4";
+  const FULL_BLOCK = "\u2588";
+
+  function mirror(text: string, props?: Partial<ComponentProps<typeof AnsiOutput>>) {
+    const { container } = render(<AnsiOutput text={text} {...props} />);
+    return container;
+  }
+
+  it("paints a Powerline cap as a cell-sized box and leaves the text intact", () => {
+    const container = mirror(`${LEFT_CAP}CX${RIGHT_CAP} 7d`);
+    const caps = container.querySelectorAll(".cell-glyph");
+    expect(caps).toHaveLength(2);
+    expect(caps[0]!.getAttribute("data-cell")).toBe("round-left");
+    expect(caps[1]!.getAttribute("data-cell")).toBe("round-right");
+    // The character is still a text node inside the box. It is invisible because its ink and the
+    // fill behind it are both currentColor — not because it was replaced.
+    expect(caps[0]!.textContent).toBe(LEFT_CAP);
+    expect(container.querySelector("pre")!.textContent).toBe(`${LEFT_CAP}CX${RIGHT_CAP} 7d`);
+  });
+
+  it("adds no element to a line with nothing to paint", () => {
+    expect(mirror("ordinary output").querySelectorAll(".cell-glyph")).toHaveLength(0);
+  });
+
+  // The paint is a fixed rule per shape in index.css, keyed on `data-cell`. The polling path
+  // builds no style object for it, and a pane byte never reaches a style attribute.
+  it("names its shape and carries no inline style", () => {
+    const cap = mirror(`${LEFT_CAP}CX${RIGHT_CAP}`).querySelector(".cell-glyph")!;
+    expect(cap.getAttribute("data-cell")).toBe("round-left");
+    expect(cap.hasAttribute("style")).toBe(false);
+  });
+
+  // Find splits a segment by OFFSET into the visible text. Painting happens inside each piece, so
+  // a match that sits beyond a painted character must still land on the right characters.
+  it("keeps find offsets correct across a painted character", () => {
+    const container = mirror(`${FULL_BLOCK}${FULL_BLOCK} needle`, {
+      query: "needle",
+      currentMatch: 0,
+    });
+    expect(container.querySelector('[data-find-match="current"]')!.textContent).toBe("needle");
+    expect(container.querySelectorAll(".cell-glyph")).toHaveLength(2);
+  });
+
+  // Links split the same coordinate space as find, and an autolink's offsets are taken over the
+  // same visible text. A URL after a painted character must still be anchored over its own
+  // characters, with nothing of the bar inside the anchor.
+  it("keeps link offsets correct across a painted character", () => {
+    const url = "https://issance.com/docs/hangar/";
+    const container = mirror(`${FULL_BLOCK}${FULL_BLOCK} ${url}`);
+    const anchor = container.querySelector("a")!;
+    expect(anchor.textContent).toBe(url);
+    expect(anchor.getAttribute("href")).toBe(url);
+    expect(container.querySelectorAll(".cell-glyph")).toHaveLength(2);
+  });
+
+  // A block character INSIDE the match: the highlight span owns the run, so the painting has to
+  // happen within it or a highlighted bar loses its cells.
+  it("paints inside a find match too", () => {
+    const container = mirror(`bar ${FULL_BLOCK}${FULL_BLOCK}`, { query: `r ${FULL_BLOCK}` });
+    const match = container.querySelector("[data-find-match]")!;
+    expect(match.textContent).toBe(`r ${FULL_BLOCK}`);
+    expect(match.querySelectorAll(".cell-glyph")).toHaveLength(1);
+  });
+});
+
+// The pane's own mirror links a path the agent printed beside the URLs it already links (ADR 0088).
+describe("terminal mirror file paths", () => {
+  const mirror = (text: string, opened: string[]) =>
+    render(
+      <FileLinksProvider value={testFileOpener(opened)}>
+        <AnsiOutput text={text} />
+      </FileLinksProvider>,
+    );
+
+  it("a path under the root opens Files in the app, a URL still opens a new tab", () => {
+    const opened: string[] = [];
+    const { container } = mirror("wrote docs/guide.md:3 see https://example.com/a.md", opened);
+    const [file, url] = [...container.querySelectorAll("a")];
+    expect(file!.textContent).toBe("docs/guide.md:3");
+    expect(file!.getAttribute("target")).toBeNull();
+    expect(url!.getAttribute("href")).toBe("https://example.com/a.md");
+    expect(url!.getAttribute("target")).toBe("_blank");
+    fireEvent.click(file!);
+    expect(opened).toEqual(["/pane/w1%3Ap1/changes/files?path=docs%2Fguide.md&line=3"]);
+  });
+
+  it("finds paths per row and keeps the find offsets of the rows below", () => {
+    const { container } = mirror("one src/a.ts\ntwo /etc/hosts\nthree lib/b.ts", []);
+    expect([...container.querySelectorAll("a")].map((a) => a.textContent)).toEqual(["src/a.ts", "lib/b.ts"]);
+  });
+
+  it("with no opener only URLs are links", () => {
+    const { container } = render(<AnsiOutput text="wrote docs/guide.md" />);
+    expect(container.querySelector("a")).toBeNull();
+  });
+
+  it("through the pane's real opener, only a path the bridge said exists becomes a link", async () => {
+    const asked: string[][] = [];
+    server.use(...paneLinkHandlers(["src/a.ts"], asked));
+    const { container } = render(
+      <MemoryRouter>
+        <PaneFileLinks>
+          <AnsiOutput text={"one src/a.ts\ntwo ../shared/routes.ts\nthree lib/gone.ts see https://example.com/x"} />
+        </PaneFileLinks>
+      </MemoryRouter>,
+    );
+    // Before the answer only the URL is a link.
+    expect([...container.querySelectorAll("a")].map((a) => a.textContent)).toEqual(["https://example.com/x"]);
+    await waitFor(() => expect(container.querySelectorAll("a")).toHaveLength(2));
+    expect([...container.querySelectorAll("a")].map((a) => a.textContent)).toEqual(["src/a.ts", "https://example.com/x"]);
+    // `../shared/routes.ts` climbs out of the root, so it is never asked about.
+    expect(asked).toEqual([["src/a.ts", "lib/gone.ts"]]);
+  });
+});

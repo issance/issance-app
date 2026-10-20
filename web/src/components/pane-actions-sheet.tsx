@@ -1,0 +1,598 @@
+import { useEffect, useRef, useState } from "react";
+import { Copy, GitBranchPlus, Maximize2, MessagesSquare, Monitor, Pencil, Pin, PinOff, ScrollText, Search, SlidersHorizontal, SquareTerminal, XCircle } from "lucide-react";
+
+import { BottomSheet } from "@/components/ui/sheet";
+import { WalkyIcon } from "@/components/walky-icon";
+import { ActionRow, DestructiveActionRow, RenameView } from "@/components/action-sheet-rows";
+import { HostChip } from "@/components/host-chip";
+import { useHostWriteBlock, useCrew } from "@/components/crew-provider";
+import { useActionEcho } from "@/hooks/use-action-echo";
+import { usePendingConfirm } from "@/hooks/use-pending-confirm";
+import { useLocale } from "@/hooks/use-locale";
+import * as api from "@/lib/api";
+import { describeApiError, describeThrownError } from "@/lib/api-error-message";
+import { t } from "@/lib/i18n";
+import { useMuxCapability, useMuxName } from "@/lib/mux-capability";
+import { branchOffOffered } from "@/lib/branch-off";
+import { setStatus } from "@/lib/status";
+import { stampTopology } from "@/lib/poll-intent";
+import { paneName } from "@/lib/pane-name";
+import { dropPin, pinMatcher, setPinned, usePins } from "@/lib/pins";
+import type { PaneView } from "@/lib/pane-view";
+import type { AgentView } from "@/lib/types";
+import type { Scope } from "@/lib/scope";
+
+interface PaneActionsSheetProps {
+  open: boolean;
+  onClose: () => void;
+  /** The pane these actions target. Null while nothing is selected (sheet closed). */
+  pane: AgentView | null;
+  /** Session scope for the rename/close writes (undefined = primary). */
+  scope?: Scope;
+  /** This device isn't authorised to write — show a read-only note instead of the actions. */
+  readOnly?: boolean;
+  /**
+   * What is on screen is a SAVED COPY, or the pane has not answered lately (`lib/liveness.ts`): the
+   * ids here may name panes that no longer exist or have been reused, so Rename, Focus, Close and
+   * the branch-off are replaced by a note, exactly as `readOnly` replaces them. Pin stays: it is
+   * this device's own preference and writes nothing to the machine.
+   */
+  savedCopy?: boolean;
+  /** Fired after a successful rename so the parent can revalidate (the label lands on the next poll). */
+  onRenamed: () => void;
+  /** Fired after a successful close, with the closed pane id — the parent navigates Home if it's the
+   *  pane currently open, or revalidates so it drops out of the list. */
+  onClosed: (paneId: string) => void;
+
+  /* The READ rows. All are optional and all are omitted by the pane strip, because they only
+   * mean anything for the pane you are LOOKING AT: "find in output" searches the buffer this screen
+   * has already fetched, and a strip pill can open this sheet on a pane whose output was never
+   * loaded. The pane header passes them; the strip does not. Each is `undefined` when the caller has
+   * nothing to offer (no buffered output yet; no agent session, so no transcript; a device that never
+   * asked for zen), and a row with no callback is HIDDEN — the same "a sheet is a list of things you
+   * can do" rule the capability gates below follow. The sheet closes itself before firing any of
+   * them, so the surface a row leads to (the header's find bar, the history route, the bare mirror)
+   * is the only thing on screen when it arrives. */
+
+  /** Open find-in-output. The pane header's find bar takes over the header row. */
+  onFind?: () => void;
+  /** Open the agent's own transcript. */
+  onHistory?: () => void;
+  /** Copy the pane's buffered terminal output to the clipboard. The sheet closes and a status toast
+   *  reports the result. Gated by the caller on there being output AND a usable clipboard (it is
+   *  absent over plain HTTP, a supported deploy), so an unusable row is HIDDEN — the same "a row is a
+   *  thing you can do" rule find/history/zen follow. */
+  onCopyOutput?: () => void;
+  /**
+   * Open the pane's Messages sheet (M62): the walky talky messages kept for this pane, newest first. A
+   * read in the sense find and history are, so the row sits with them and outside every write gate. The
+   * pane view passes it; the strip does not, and absence is the gate as it is for the others.
+   */
+  onMessages?: () => void;
+  /** Open this pane's own settings — today one switch, the prompt-cache warning (ADR 0042).
+   *
+   *  The FOURTH read row, and it is a read in the sense the other three are: it changes a preference on
+   *  this issance and types into nothing. Absence is the gate, as it is for find, history and zen — the
+   *  pane strip passes no callback, so a strip pill opens the sheet it always did. */
+  onSettings?: () => void;
+  /**
+   * Open on the rename view instead of the action list. The pane name in the header opens Pane
+   * settings (1.17.0) and its Rename row lands here, so there is one rename flow and not two. Read
+   * when the sheet opens; ignored where the pane cannot be renamed.
+   */
+  openInRename?: boolean;
+  /**
+   * WHICH BODY THE PANE DRAWS, and the one place that value is written (ADR 0071's shape).
+   *
+   * Absent is the gate, as it is for find, history and zen: the pane view always passes it since
+   * Chat became the default (1.17.0, ADR 0082), and a caller with no body to switch passes nothing.
+   *
+   * It lives here rather than in the header or on the belt for three reasons. ADR 0009 makes a
+   * generic menu the place a pane's actions live, and Find and History are already in it. 1.9.0
+   * spent a whole milestone clearing chrome, so the header names the workspace alone and the belt
+   * is already eight items on a small phone. And two taps is the right price for a choice made
+   * rarely, which ONE STANDING PER-DEVICE VALUE makes it: there is no per-pane override, so this is
+   * a thing you set, not a thing you flick.
+   */
+  paneView?: PaneView;
+  /** Write the standing choice. Required alongside {@link paneView}; both or neither. */
+  onPaneViewChange?: (view: PaneView) => void;
+  /**
+   * Why THIS pane keeps the terminal whatever the standing choice says — a pane with no session, a
+   * machine one release behind, a multiplexer that keeps no session log at all.
+   *
+   * The row never hides on it. A control that disappears on some panes is how an operator concludes
+   * the app is broken, and it would be worst for exactly the person whose standing mode is Chat:
+   * their pane would open on the terminal with nothing saying why.
+   */
+  paneViewNote?: string;
+  /** Enter zen mode — hide every issance surface and leave the mirror alone on the screen.
+   *
+   *  The THIRD read row, and it is gated twice through this one prop: `Settings → Zen mode` decides
+   *  whether this phone offers zen at all, and the pane header only passes a callback when there is
+   *  buffered output to look at. Absence IS the gate, exactly as it is for find and history above —
+   *  a device that never asked for zen sees a sheet byte-identical to today's. */
+  onZen?: () => void;
+
+  /**
+   * Every pane the caller's list holds, agents and shells. The pins store reads it on a pin or unpin
+   * to tell a live pin from a dormant one and to spot a reused pane id (lib/pins.ts). Omit and only
+   * this pane counts as live.
+   */
+  herd?: readonly AgentView[];
+  /**
+   * After a pin or unpin, with the pane and its new state. The dashboard passes it, because the row
+   * moves right there and is the answer (it scrolls the row into view and focuses it). Omit, as the
+   * pane view does, and a success toast says it instead, because the outcome is on another screen.
+   */
+  onPinChange?: (pane: AgentView, pinned: boolean) => void;
+  /**
+   * Open "New agent in a worktree" for this pane (ADR 0089): the New page with "New worktree" on,
+   * on this pane's repo.
+   *
+   * Absence is the first gate, as it is for the read rows: the caller passes it only for a pane whose
+   * space sits in a Git repo. The sheet adds the other two itself, because they are the same on
+   * every door: the multiplexer declares `createWorktree`, and the scope is the lead (no `?h=`), since
+   * the route is lead-local and a crew does not forward it. A write, so read-only hides it too.
+   */
+  onBranchOff?: () => void;
+  /**
+   * The pane is a durable program's conversation (a pane with no screen). Its sheet holds the writes only:
+   * no Pin to top, since the conversation list orders itself and ignores pins, and Close says what it
+   * closes (durable-simple, 2026-10-13).
+   */
+  conversation?: boolean;
+}
+
+const NO_HERD: readonly AgentView[] = [];
+
+type Mode = "actions" | "rename";
+
+// The actions for a single pane. THREE entry points, one sheet: long-pressing (or re-tapping) a pane
+// pill in the strip, the ⋮ button in the pane header — which is why find, history and zen live
+// here rather than in a second menu of their own — and a hold on a dashboard row (ADR 0070). The
+// header used to spend two of its four slots on those two icons; the pane already had a menu, so they
+// became rows in it.
+// Rename (set/clear its label) and close (kill). Opens on an action-list view; rename is a second
+// tap away so the sheet doesn't shove a keyboard-triggering input at you just to close a pane. The
+// action rows + rename view are the SHARED pieces (action-sheet-rows) the tab sheet also uses, so the
+// two stay identical. The label is user text rendered only into an <input> value / text node — never
+// markup — so it stays within the pane-output XSS boundary. Both actions are writes, so under
+// read-only they're replaced by a note.
+export function PaneActionsSheet({
+  open,
+  onClose,
+  pane,
+  scope,
+  readOnly = false,
+  savedCopy = false,
+  onRenamed,
+  onClosed,
+  onFind,
+  onHistory,
+  onCopyOutput,
+  onSettings,
+  onMessages,
+  openInRename = false,
+  onZen,
+  paneView,
+  onPaneViewChange,
+  paneViewNote,
+  herd = NO_HERD,
+  onPinChange,
+  onBranchOff,
+  conversation = false,
+}: PaneActionsSheetProps) {
+  useLocale();
+  // Whether this pane is pinned on this device, read live from the store so the row's word is right
+  // on every door (lib/pins.ts).
+  const pins = usePins();
+  const pinned = pane !== null && pinMatcher(pins)(pane);
+  const [mode, setMode] = useState<Mode>("actions");
+  const [label, setLabel] = useState("");
+  const [saving, setSaving] = useState(false);
+  // Close runs under the shared press echo (hooks/use-action-echo.ts) rather than a bare `closing`
+  // boolean. The bare boolean acknowledged the tap with a spinner and NOTHING else; on success the
+  // sheet slid away and the row itself did not disappear from the strip until the next poll landed
+  // (up to ~1.5s later), so the gap between "I confirmed a kill" and any visible consequence was
+  // long enough to re-tap. The echo closes that gap at the control: `run` buzzes and goes `pending`
+  // synchronously with the tap, before any network wait. The ✓ phase is never reached here — the
+  // success branch closes the sheet — and that is correct: the pane VANISHING is the outcome, and a
+  // success `setStatus` on top of it would announce a fact the screen is already making.
+  const closeEcho = useActionEcho();
+  const { pending, confirm, reset } = usePendingConfirm();
+  const inputRef = useRef<HTMLInputElement>(null);
+  // Rename and close are writes, and both are §10.3 writes to a specific machine — the PANE's, read
+  // off the row rather than from the ambient scope, because a pane's host is the only thing that
+  // says where closing it kills a terminal. Undefined on a solo install and on a reachable host, so
+  // this sheet is byte-identical to today everywhere except a crew with a quiet member.
+  const hostBlock = useHostWriteBlock(pane?.host);
+  // What the multiplexer underneath can actually do to a pane (M10/06) — asked per row, below.
+  // Asked of the PANE's own machine, for `hostBlock`'s reason one step on (M22/03): a member runs
+  // its own multiplexer, so a row this sheet offers has to be a row that machine can carry out.
+  // Undefined on a solo install and for a pane on the lead, which is the lead's own answer.
+  // The session comes off the sheet's scope (M55): a program session's panes answer for their program.
+  const paneHost = { host: pane?.host, session: scope?.session };
+  const canRename = useMuxCapability("renamePane", paneHost);
+  const canClose = useMuxCapability("closePane", paneHost);
+  const canFocus = useMuxCapability("setFocus", paneHost);
+  // Asked of the LEAD, with no host: the branch-off route never leaves the lead, so the lead's own
+  // multiplexer is the one that must be able to do it. In the session the sheet acts in (M55): a
+  // program session on the lead makes no worktree, whatever its terminal neighbour can do.
+  const canWorktree = useMuxCapability("createWorktree", { session: scope?.session });
+  const showBranchOff = onBranchOff !== undefined && branchOffOffered(canWorktree.capable, scope);
+  const [focusing, setFocusing] = useState(false);
+  // The mux name for the "Focus in <mux>" row and its toast — see `focusMux` below for why this
+  // is gated to panes on the LOCAL machine before it's trusted.
+  const localMuxName = useMuxName();
+  const { lead } = useCrew();
+  // `useMuxName()` always answers for the issance THIS PAGE IS RUNNING ON (its own `/api/config`,
+  // never a peer's — see that hook's own comment). A pane's `host` is undefined on a solo install
+  // and, on a crew, is the LEAD's own id for a lead-hosted pane (lib/types.ts's doc on `host`) — so
+  // either of those means "focus" runs on the mux this page already knows the name of. A pane whose
+  // `host` names some OTHER member may be driven by a different multiplexer entirely, and naming the
+  // local one would be a guess dressed as a fact. `focusMux` is `""` in that case, which is also the
+  // "bridge hasn't answered yet" case `useMuxName()` itself returns — both get the same generic,
+  // never-wrong fallback copy below.
+  const focusMux = pane?.host === undefined || pane.host === lead ? localMuxName : "";
+
+  // Reset to the action list — and reprefill the label — whenever the sheet opens on a (new) pane,
+  // AND whenever it closes, so reopening never lands you mid-rename. Intentionally NOT keyed on the
+  // live label, so a background poll landing while you type can't clobber your edit.
+  useEffect(() => {
+    setMode(open && openInRename && canRename.capable ? "rename" : "actions");
+    if (!open) return;
+    setLabel(pane?.paneLabel ?? "");
+    reset();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, pane?.paneId]);
+
+  // Autofocus the label input when rename mode opens, so the phone keyboard pops without a second tap.
+  useEffect(() => {
+    if (mode === "rename") inputRef.current?.focus();
+  }, [mode]);
+
+  async function save() {
+    if (!pane || saving || savedCopy) return;
+    const next = label.trim();
+    setSaving(true);
+    try {
+      const res = await api.renamePane(pane.paneId, next, scope);
+      if (res.ok) {
+        setStatus(next ? t("paneActions.status.renamed") : t("paneActions.status.labelCleared"), "success");
+        onRenamed();
+        onClose();
+      } else {
+        setStatus(describeApiError(res, t("paneActions.status.renameFailed")), "error");
+      }
+    } catch (e) {
+      setStatus(describeThrownError(e), "error");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // Two-tap: the first tap arms (row flips to "Tap again to close"), the second closes.
+  //
+  // The echo's `action` must resolve the bridge's verdict as a boolean, and BOTH failure branches
+  // stay here rather than moving to `lib/mutate.ts`: this row already reports every refusal in its
+  // own words (`closeFailed` is the fallback for a body that carried none), so it is not a swallow
+  // site. `pane` is copied to a local first — narrowing does not survive into the async closure.
+  async function requestClose() {
+    if (!pane || closeEcho.pending || savedCopy) return;
+    const target = pane;
+    if (!confirm(target.paneId)) return;
+    await closeEcho.run(target.paneId, async () => {
+      try {
+        const res = await api.closePane(target.paneId, scope);
+        if (!res.ok) {
+          setStatus(describeApiError(res, t("paneActions.status.closeFailed")), "error");
+          return false;
+        }
+        onClose();
+        // A pane closed from issance takes its pin with it (ADR 0070), on every door this sheet has.
+        // A pane closed in the terminal only leaves its pin dormant: absence never prunes.
+        dropPin(target);
+        // Same catch-up as a create: the list the operator just closed a pane out of should not
+        // wait out an idle-timed gap to show it gone.
+        stampTopology();
+        onClosed(target.paneId);
+        return true;
+      } catch (e) {
+        setStatus(describeThrownError(e), "error");
+        return false;
+      }
+    });
+  }
+
+  /**
+   * Put this pane on the operator's own screen.
+   *
+   * The ONE act in the app that moves a terminal nobody is holding, which is why it is a row you
+   * tap and never a consequence of navigating (ADR 0031). No confirm: it is reversible by the
+   * operator's own keyboard, unlike the close below it.
+   *
+   * The sheet closes on success, because the answer to "show it in the terminal" is on the other
+   * screen and the operator is about to look there.
+   */
+  async function showInTerminal() {
+    if (!pane || focusing || savedCopy) return;
+    setFocusing(true);
+    try {
+      const res = await api.focusPane(pane.paneId, scope);
+      if (res.ok) {
+        setStatus(t("paneActions.focus.done"), "success");
+        onClose();
+      } else {
+        setStatus(describeApiError(res, t("paneActions.focus.failed")), "error");
+      }
+    } catch (e) {
+      setStatus(describeThrownError(e), "error");
+    } finally {
+      setFocusing(false);
+    }
+  }
+
+  /**
+   * Pin or unpin this pane on this device. Close first, then act, for the reason the find row
+   * states: the sheet's focus-restore then runs before whatever the caller does with focus.
+   */
+  function togglePin() {
+    if (!pane) return;
+    const next = !pinned;
+    onClose();
+    setPinned(pane, next, herd);
+    if (onPinChange) onPinChange(pane, next);
+    else setStatus(next ? t("paneActions.pin.done") : t("paneActions.unpin.done"), "success");
+  }
+
+  const confirming = !!pane && pending === pane.paneId;
+
+  return (
+    <BottomSheet
+      open={open}
+      onClose={onClose}
+      title={
+        pane ? (
+          // Every row below acts on THIS pane on THIS machine — rename, close, focus — so the
+          // machine belongs beside the name in the one place every one of those rows sits under:
+          // the title. `HostChip` self-hides on a solo install (its own `multi` gate), so this
+          // row is byte-identical to the old plain-string title everywhere except a crew.
+          //
+          // The pane name truncates; the host does not. `min-w-0 truncate` on the name plus
+          // `HostChip`'s own `shrink-0` is what makes that trade: the host is short, bounded, and
+          // is the disambiguator that makes "close" and "focus" safe to tap — a truncated machine
+          // name is worse than a truncated pane name, because it is the half that keeps you from
+          // acting on the wrong one.
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span data-slot="pane-actions-title-name" className="min-w-0 truncate">
+              {paneName(pane)}
+            </span>
+            <HostChip host={pane.host} variant="target" />
+          </span>
+        ) : (
+          t("paneActions.title.fallback")
+        )
+      }
+    >
+      {/* The READ rows lead, and they sit OUTSIDE the read-only / host-unreachable gates below on
+          purpose. Neither of those refusals is about them: find searches a buffer this phone already
+          holds, and history opens a transcript the lead reads off its own disk — a device that may
+          not write, or a member machine that has stopped answering, takes away nothing either one
+          needs. Folding them under the gate would have made "the machine is quiet" the reason you
+          cannot search the last output you got from it, which is precisely when you want to.
+          They lead rather than trail because they are the cheap, repeatable, reversible half of this
+          sheet; rename and close are the half you arrive at deliberately.
+          Hidden in `rename` mode with the rest of the list — that view is a sub-screen, not a
+          section.
+          Pin to top / Unpin (ADR 0070) is the LAST of them, so no row the operator knows moves on
+          the ⋮, and so the first row on the two doors that pass no reads (a dashboard row's hold, the
+          pane pill's hold). It is a read in the same sense as settings: it changes this device and
+          types into no terminal, so a read-only device and a pane on a quiet machine can still pin. */}
+      {mode === "actions" && pane && (
+        <div className="mb-1 flex flex-col gap-1">
+          {onFind && (
+            <ActionRow
+              icon={<Search className="size-4 shrink-0 text-muted-foreground" />}
+              label={t("chat.find.label")}
+              onClick={() => {
+                // Close FIRST, then act. Both land in one React event, so the sheet unmounts in the
+                // same commit that mounts the find bar — see the focus note in agent-chat.tsx.
+                onClose();
+                onFind();
+              }}
+            />
+          )}
+          {onHistory && (
+            <ActionRow
+              icon={<ScrollText className="size-4 shrink-0 text-muted-foreground" />}
+              label={t("chat.history.label")}
+              onClick={() => {
+                onClose();
+                onHistory();
+              }}
+            />
+          )}
+          {/* Copy the buffered terminal output. Same "act on the output you're looking at" family as
+              find and history, so it sits with them. Close-then-act like the rows above — the copy
+              fires inside this same tap, so the clipboard write still counts as user-initiated even as
+              the sheet unmounts. */}
+          {onCopyOutput && (
+            <ActionRow
+              icon={<Copy className="size-4 shrink-0 text-muted-foreground" />}
+              label={t("chat.copyOutput.label")}
+              onClick={() => {
+                onClose();
+                onCopyOutput();
+              }}
+            />
+          )}
+          {/* The pane's walky talky messages: one more way to LOOK at what happened here, so it sits with
+              the looking rows. Close-then-act, for the reason the find row states. */}
+          {onMessages && (
+            <ActionRow
+              icon={<WalkyIcon className="size-4 shrink-0 text-muted-foreground" />}
+              label={t("walky.sheet.row")}
+              onClick={() => {
+                onClose();
+                onMessages();
+              }}
+            />
+          )}
+          {/* THE BODY SWITCH, with find/history/copy above it: it is the same family — "look at this
+              pane differently" — and it is the most standing of them, so it sits after the three
+              you reach for inside one visit and before the two that take the screen over.
+              Close-then-act, for the reason the find row states. The label names WHERE IT TAKES
+              YOU, the way every row above it does. */}
+          {paneView !== undefined && onPaneViewChange && (
+            <ActionRow
+              icon={
+                paneView === "chat" ? (
+                  <SquareTerminal className="size-4 shrink-0 text-muted-foreground" />
+                ) : (
+                  <MessagesSquare className="size-4 shrink-0 text-muted-foreground" />
+                )
+              }
+              label={t(paneView === "chat" ? "chat.mode.terminal" : "chat.mode.chat")}
+              hint={paneViewNote}
+              onClick={() => {
+                onClose();
+                onPaneViewChange(paneView === "chat" ? "terminal" : "chat");
+              }}
+            />
+          )}
+          {/* Pane settings sits between the looking rows and zen: it is the one row here that opens a
+              control rather than a view, and it is still the cheap, reversible half of this sheet — a
+              preference on this issance, typed into no terminal. Close-then-act, for the reason the find
+              row states. */}
+          {onSettings && (
+            <ActionRow
+              icon={<SlidersHorizontal className="size-4 shrink-0 text-muted-foreground" />}
+              label={t("paneActions.settings.label")}
+              onClick={() => {
+                onClose();
+                onSettings();
+              }}
+            />
+          )}
+          {/* Zen trails find and history rather than leading them: it is the same family — "look at
+              the output differently" — but it is the one row here that takes the whole screen over,
+              so it is the deliberate tap at the end of the run rather than the first thing under the
+              thumb. Close-then-act, for the reason the find row states: both land in one React
+              event, so the sheet unmounts in the same commit the chrome starts leaving. */}
+          {onZen && (
+            <ActionRow
+              icon={<Maximize2 className="size-4 shrink-0 text-muted-foreground" />}
+              label={t("chat.zen.label")}
+              onClick={() => {
+                onClose();
+                onZen();
+              }}
+            />
+          )}
+          {!conversation && (
+          <ActionRow
+            icon={
+              pinned ? (
+                <PinOff className="size-4 shrink-0 text-muted-foreground" />
+              ) : (
+                <Pin className="size-4 shrink-0 text-muted-foreground" />
+              )
+            }
+            label={pinned ? t("paneActions.unpin.label") : t("paneActions.pin.label")}
+            onClick={togglePin}
+          />
+          )}
+        </div>
+      )}
+      {readOnly ? (
+        <p className="py-2 text-sm text-muted-foreground">{t("paneActions.readOnly")}</p>
+      ) : savedCopy ? (
+        <p className="py-2 text-sm text-muted-foreground">{t("space.readOnly.savedCopy")}</p>
+      ) : hostBlock ? (
+        // Refused BEFORE anything is attempted (§10.3): no queue, no retry, no "try anyway" — the
+        // lead would answer `host_unreachable` and the operator would be left guessing whether a
+        // close half-landed. Offering the actions greyed out would suggest they're one tap from
+        // working; naming the machine and its last-seen age says what to actually wait for.
+        <p className="py-2 text-sm text-muted-foreground">
+          {t("paneActions.hostBlockSuffix", { hostBlock })}
+        </p>
+      ) : mode === "actions" ? (
+        <div className="flex flex-col gap-1">
+          {/* Close kills a real terminal, and on a crew the sheet says which machine's — but that
+              chip now lives in the TITLE row above (beside the pane name), since every row here,
+              not just Close, acts on this pane's machine. Nothing to render here on its own. */}
+          {/* Each row asks its OWN capability, not one "can this sheet do things" flag: a
+              multiplexer that renames but will not close is an ordinary shape, and a single gate
+              would take the other row down with it. A row a multiplexer cannot back is HIDDEN — the
+              sheet is a list of things you can do, and a permanently dead entry in it is worse than
+              a shorter list (the same argument the host block above makes about greying out). Both
+              rows are present on every adapter shipped today. */}
+          {canRename.capable && (
+            <ActionRow
+              icon={<Pencil className="size-4 shrink-0 text-muted-foreground" />}
+              label={t("paneActions.rename.label")}
+              onClick={() => setMode("rename")}
+            />
+          )}
+          {canFocus.capable && (
+            <ActionRow
+              icon={<Monitor className="size-4 shrink-0 text-muted-foreground" />}
+              label={
+                focusMux
+                  ? t("paneActions.focus.labelWithMux", { mux: focusMux })
+                  : t("paneActions.focus.labelFallback")
+              }
+              onClick={() => void showInTerminal()}
+            />
+          )}
+          {/* A second agent in a worktree of this pane's repo (ADR 0089). Above Close, so the
+              destructive row stays last; close-then-act, so the sheet is gone before the page opens. */}
+          {showBranchOff && (
+            <ActionRow
+              icon={<GitBranchPlus className="size-4 shrink-0 text-muted-foreground" />}
+              label={t("paneActions.branchOff.label")}
+              onClick={() => {
+                onClose();
+                onBranchOff?.();
+              }}
+            />
+          )}
+          {canClose.capable && (
+            <DestructiveActionRow
+              icon={<XCircle className="size-4 shrink-0" />}
+              label={conversation ? t("paneActions.close.conversation") : t("paneActions.close.label")}
+              confirmLabel={t("paneActions.close.confirm")}
+              closingLabel={t("paneActions.close.closing")}
+              armed={confirming}
+              // `pending` rather than `phaseOf(id)`: close is the only member of this echo group,
+              // so the group flag says the same thing without needing a pane that may be null here.
+              closing={closeEcho.pending}
+              onClick={() => void requestClose()}
+            />
+          )}
+          {/* An EMPTY sheet is the one case that must speak. Long-pressing a pane and being handed
+              a blank box says nothing at all, so when every row is gone the adapter's own reason
+              takes their place — hide the meaningless, explain the expected. */}
+          {!canRename.capable && !canClose.capable && !canFocus.capable && !showBranchOff && (
+            <p className="py-2 text-sm leading-snug text-muted-foreground">
+              {canRename.note || canClose.note || canFocus.note || t("paneActions.empty.fallback")}
+            </p>
+          )}
+        </div>
+      ) : (
+        <RenameView
+          inputRef={inputRef}
+          label={label}
+          onLabelChange={setLabel}
+          onSave={() => void save()}
+          onBack={() => setMode("actions")}
+          saving={saving}
+          // A blank pane field clears the label (blank → null on the bridge), so Save stays enabled.
+          canSave={true}
+          placeholder={t("paneActions.rename.placeholder")}
+        />
+      )}
+    </BottomSheet>
+  );
+}

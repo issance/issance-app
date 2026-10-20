@@ -1,0 +1,1109 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+
+import { parseAnsi } from "../../ansi";
+import { splitLines, type StyledLine } from "../../blocks";
+import { draftCarriesSend } from "../../draft-match";
+import { extractAgentsFooter, extractInputDraft, extractStatusLines, hasInputBox, stripChrome } from "./chrome";
+import { lineText } from "./markers";
+
+/** The statusline run as plain text. extractStatusLines returns STYLED lines — a statusline tells
+ *  its fields apart by colour, so the strip needs the segments — but most assertions here are about
+ *  WHICH rows come back, not how they look, and read better against text. */
+const statusText = (lines: StyledLine[]): string[] =>
+  extractStatusLines(lines).map((l) => lineText(l).trim());
+
+// Anchored on this file's directory (see prompt-select.test.ts for why not `new URL(import.meta.url)`).
+const PANES_DIR = join(import.meta.dirname, "..", "..", "..", "fixtures", "panes");
+
+// Synthesise the input-box shape: a top rule, the "❯ …" prompt line, a bottom rule, and an optional
+// statusline below it (matched by position, like the real captures). 40 glyphs is comfortably above
+// isBoxBorder's BARE_BORDER_MIN floor (8) — see the narrow (19- and 8-glyph) and labelled-border
+// cases below for the width-dependent bug this shape used to have.
+function boxBuffer(promptLine: string, status?: string): StyledLine[] {
+  const rule = "─".repeat(40);
+  const rows = [rule, promptLine, rule];
+  if (status !== undefined) rows.push(status);
+  return splitLines(parseAnsi(rows.join("\n")));
+}
+
+// A WRAPPED-draft box: the "❯ …" prompt plus continuation lines (indented, no "❯") between the two
+// rules — the shape a long draft takes. `above` is any real output that precedes the box.
+function wrappedBoxBuffer(promptLine: string, continuationLines: string[], above?: string[]): StyledLine[] {
+  const rule = "─".repeat(40);
+  const rows = [...(above ?? []), rule, promptLine, ...continuationLines, rule];
+  return splitLines(parseAnsi(rows.join("\n")));
+}
+
+// Same shape as boxBuffer, but with a caller-chosen border WIDTH — for pinning bug #76's
+// width-dependent border test at a narrow (sub-20-glyph) pane.
+function narrowBoxBuffer(promptLine: string, ruleWidth: number, status?: string): StyledLine[] {
+  const rule = "─".repeat(ruleWidth);
+  const rows = [rule, promptLine, rule];
+  if (status !== undefined) rows.push(status);
+  return splitLines(parseAnsi(rows.join("\n")));
+}
+
+function boxWithStatusRows(promptLine: string, statusRows: string[]): StyledLine[] {
+  const rule = "─".repeat(40);
+  return splitLines(parseAnsi(["earlier output", rule, promptLine, rule, ...statusRows].join("\n")));
+}
+
+function boxWithBlankFreeRunBelow(output: string[]): StyledLine[] {
+  const rule = "─".repeat(40);
+  return splitLines(
+    parseAnsi([rule, "❯ do the earlier thing", rule, "old statusline", ...output].join("\n")),
+  );
+}
+
+function echoedSendAboveDialog(sent: string, dialogRows: number): StyledLine[] {
+  const rule = "─".repeat(40);
+  const dialog = Array.from({ length: dialogRows }, (_, k) => `  ${k + 1}. dialog row`);
+  return splitLines(
+    parseAnsi(["earlier output", rule, `❯ ${sent}`, rule, ...dialog, "", "Esc to cancel"].join("\n")),
+  );
+}
+
+function trailingBlankCount(lines: StyledLine[]): number {
+  let count = 0;
+  while (count < lines.length && lineText(lines[lines.length - 1 - count]!).trim().length === 0) count++;
+  return count;
+}
+
+function keptAboveTail(lines: StyledLine[]): number {
+  return lines.length - trailingBlankCount(lines);
+}
+
+// stripChrome peels the agent's own input-box + statusline + trailing blanks off the TAIL. It's
+// deliberately conservative: it strips only when the full box shape matches and never removes
+// content above the last real output — when unsure it returns the buffer untouched. Driven against
+// the same real captures as the detector.
+
+function fixtureLines(name: string): StyledLine[] {
+  return splitLines(parseAnsi(readFileSync(join(PANES_DIR, name), "utf8")));
+}
+
+const joined = (lines: StyledLine[]) => lines.map(lineText).join("\n");
+
+describe("stripChrome — trims the input box off the tail", () => {
+  it("fresh-idle: removes the empty input box + statusline, keeps the welcome banner", () => {
+    const lines = fixtureLines("claude--fresh-idle.txt");
+    const kept = joined(stripChrome(lines));
+    expect(stripChrome(lines).length).toBeLessThan(lines.length);
+    expect(kept).toContain("Welcome back Altan!"); // real content above survives
+    expect(kept).not.toContain("← for agents"); // hint line gone
+    expect(kept).not.toMatch(/\/fixture-sandbox\s*$/); // statusline gone
+  });
+
+  it("working: removes the statusline + permission hint, keeps the last real output", () => {
+    const lines = fixtureLines("claude--working.txt");
+    const kept = joined(stripChrome(lines));
+    expect(stripChrome(lines).length).toBeLessThan(lines.length);
+    expect(kept).toContain("How is Claude doing this session?"); // last real block survives
+    expect(kept).not.toContain("bypass permissions"); // hint line gone
+    expect(kept).not.toContain("151.5k tokens"); // statusline gone
+  });
+
+  it("done: removes the input box (draft and all) + statusline, keeps the completed turn", () => {
+    const lines = fixtureLines("claude--done.txt");
+    const kept = joined(stripChrome(lines));
+    expect(kept).toContain("Created hello.txt containing the single word hello.");
+    expect(kept).not.toContain("cat hello.txt to verify"); // the input-box draft is chrome
+    expect(kept).not.toContain("32.7k tokens"); // statusline gone
+  });
+
+  // The newer Claude Code UI paints a "background agents" footer BELOW the statusline/hint, separated
+  // by a blank line. It broke the bottom-up anchor (only the statusline window was tolerated), so the
+  // whole box stayed visible on the mirror AND no draft chip surfaced. These three cover empty /
+  // single-line / wrapped drafts with that footer present — see the real-capture cohort in the README.
+  it("footer variant (empty prompt): strips the box + statusline + hint + background-agents footer", () => {
+    const lines = fixtureLines("claude--draft-footer-empty.txt");
+    const kept = joined(stripChrome(lines));
+    expect(stripChrome(lines).length).toBeLessThan(lines.length);
+    expect(kept).toContain("Wired up the token refresh path"); // real content above survives
+    expect(kept).not.toContain("● main"); // footer header gone
+    expect(kept).not.toContain("worker:scout"); // footer agent row gone
+    expect(kept).not.toContain("bypass permissions"); // hint gone
+    expect(kept).not.toContain("ctx:33%"); // statusline gone
+  });
+
+  it("footer variant (single-line draft): strips the box AND the footer below it", () => {
+    const lines = fixtureLines("claude--draft-footer-single.txt");
+    const kept = joined(stripChrome(lines));
+    expect(kept).toContain("Wired up the token refresh path"); // content above survives
+    expect(kept).not.toContain("update the changelog"); // the box draft is chrome
+    expect(kept).not.toContain("● main"); // footer gone with the box
+  });
+
+  it("footer variant (wrapped draft): strips the multi-line box AND the footer", () => {
+    const lines = fixtureLines("claude--draft-footer-wrapped.txt");
+    const kept = joined(stripChrome(lines));
+    expect(kept).toContain("Wired up the token refresh path"); // content above survives
+    expect(kept).not.toContain("soft-wraps it onto several"); // wrapped continuation gone
+    expect(kept).not.toContain("worker:scout"); // footer gone
+  });
+
+  // Claude Code 2.1.293 paints "❯" on the ACTIVE agent's footer row. Step 1 of the locator stepped
+  // over that row (it is the lowest "❯"-led line) and the ownership check refused it for sitting
+  // below the statusline run — so the whole box vanished: no draft, and a send from the phone typed
+  // its text and then never submitted. The pointed row must strip with the rest of the footer.
+  it("footer variant (pointed agent row): strips the box and the pointed footer row", () => {
+    const lines = fixtureLines("claude--footer-pointed-agent.txt");
+    const kept = joined(stripChrome(lines));
+    expect(kept).not.toContain("● main"); // footer header gone
+    expect(kept).not.toContain("worker:scout"); // first agent row gone
+    expect(kept).not.toContain("worker:fix"); // the POINTED agent row went with the footer
+    expect(kept).not.toContain("auto mode on"); // statusline gone
+  });
+});
+
+describe("stripChrome — conservative: leaves non-chrome untouched", () => {
+  it("returns the same buffer (same reference) when there's no tail chrome", () => {
+    const lines = splitLines(parseAnsi("hello\nworld"));
+    expect(stripChrome(lines)).toBe(lines);
+  });
+
+  it("strips a WRAPPED draft box (multi-line ❯) off the tail, keeping the output above", () => {
+    // A long stranded draft soft-wraps onto continuation lines inside the box; the whole box must
+    // still come off the mirror (regression: it used to stay visible, raw draft and all).
+    const lines = fixtureLines("claude--draft-wrapped.txt");
+    const kept = joined(stripChrome(lines));
+    expect(stripChrome(lines).length).toBeLessThan(lines.length);
+    expect(kept).toContain("Welcome back altan!"); // real content above survives
+    expect(kept).not.toContain("soft-wraps"); // the wrapped-draft continuation is gone
+    expect(kept).not.toContain("used to stay"); // ...and its last line too
+    expect(kept).not.toContain("manual mode on"); // statusline/hint gone with the box
+  });
+
+  it("does not strip a blocked-state menu (its footer is not an input box)", () => {
+    const lines = fixtureLines("claude--trust-prompt.txt");
+    const result = stripChrome(lines);
+    expect(result).toBe(lines); // untouched
+    const kept = joined(result);
+    expect(kept).toContain("Enter to confirm"); // footer preserved
+    expect(kept).toContain("Yes, I trust this folder"); // option preserved
+  });
+
+  it("only trims trailing blank lines when no box is present", () => {
+    const lines = splitLines(parseAnsi("output line\n\n\n"));
+    const kept = joined(stripChrome(lines));
+    expect(kept).toBe("output line");
+  });
+});
+
+// extractStatusLines re-surfaces the statusline RUN stripChrome removes (the branch/model/ctx/
+// permission mode the user configured) so the app can render it above the composer — positional
+// (every non-blank line below the input box's bottom border, above the background-agents footer),
+// never content-parsed. All rows, not just the first: rows 2+ used to be stripped and rendered
+// nowhere.
+describe("extractStatusLines — recovers the stripped statusline run", () => {
+  it("working: returns the statusline including the branch (the field the field-report flagged)", () => {
+    const rows = statusText(fixtureLines("claude--working.txt"));
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows[0]).toContain("feature/block-renderer"); // the branch survives
+    expect(rows[0]).toContain("151.5k tokens");
+    // The hint row below it is its own entry now — it used to be dropped on the floor.
+    expect(rows.join("\n")).toContain("bypass permissions");
+  });
+
+  it("fresh-idle: returns the statusline AND the hint row under it, in order", () => {
+    const rows = statusText(fixtureLines("claude--fresh-idle.txt"));
+    expect(rows.length).toBe(2);
+    expect(rows[0]).toContain("fixture-sandbox");
+    expect(rows[1]).toContain("← for agents");
+  });
+
+  it("done: returns the statusline of a completed turn", () => {
+    const rows = statusText(fixtureLines("claude--done.txt"));
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows[0]).toContain("tokens");
+  });
+
+  it("footer variant: returns the statusline + hint, but NOT the background-agents footer", () => {
+    const rows = statusText(fixtureLines("claude--draft-footer-empty.txt"));
+    expect(rows[0]).toContain("ctx:33%"); // the statusline itself
+    expect(rows.join("\n")).toContain("bypass permissions"); // the hint row is part of the run
+    expect(rows.join("\n")).not.toContain("worker:scout"); // …the footer below the blank is not
+    expect(rows.join("\n")).not.toContain("● main");
+  });
+
+  // The shape that motivated this (verified on a real host): a 3-row statusline under the box. The
+  // model, cwd, branch and permission mode all live on rows 2 and 3 — surfacing only row 1 made
+  // them invisible everywhere, since stripChrome (correctly) peels the whole run off the mirror.
+  it("a real 3-row statusline surfaces every row, in TUI order", () => {
+    const REAL_ROWS = [
+      "  CTX:20% CACHE:100% LIMITS 5h:22%/1h:20m 7d:26%/5d:03h",
+      "  [Opus·medium] ~/projects/workspace-sprqvntrs/argo-sprqvntrs on main*",
+      "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 4 agents",
+    ];
+    // U+00A0 after the marker, as Claude renders it — never a plain space.
+    const lines = boxWithStatusRows("❯\u00A0", REAL_ROWS);
+    expect(statusText(lines)).toEqual(REAL_ROWS.map((r) => r.trim()));
+  });
+
+  // The rows come back STYLED, which is the whole reason the strip can show a statusline the way its
+  // author meant it: fields are told apart by colour before they are read. Flattening to text here
+  // (what this used to do) threw the colour away one call before the surface that renders it.
+  it("keeps each row's colour, not just its text", () => {
+    const ESC = "\x1b";
+    const lines = boxWithStatusRows("❯ ", [
+      `${ESC}[32mCTX:20%${ESC}[0m ${ESC}[33mmain*${ESC}[0m`,
+    ]);
+    const rows = extractStatusLines(lines);
+    expect(rows.length).toBe(1);
+    // Two differently-coloured runs, both carrying a colour — a flattened row would be one bare
+    // segment with no style at all.
+    const coloured = rows[0]!.segments.filter((s) => s.style.color !== undefined);
+    expect(coloured.length).toBeGreaterThanOrEqual(2);
+    expect(coloured[0]!.style.color).not.toBe(coloured[1]!.style.color);
+    expect(lineText(rows[0]!)).toContain("CTX:20%");
+  });
+
+  it("a single-row statusline is a one-element array (no visual change for those panes)", () => {
+    const lines = boxWithStatusRows("❯\u00A0fix the flaky test", ["[Opus 4.8] · ctx:3% · main · 32k tokens"]);
+    expect(statusText(lines)).toEqual(["[Opus 4.8] · ctx:3% · main · 32k tokens"]);
+  });
+
+  it("returns [] for a box with no statusline under it at all", () => {
+    expect(extractStatusLines(boxBuffer("❯\u00A0draft"))).toEqual([]);
+  });
+
+  it("returns [] when a menu is up (no input box at the tail)", () => {
+    expect(extractStatusLines(fixtureLines("claude--select-menu.txt"))).toEqual([]);
+    expect(extractStatusLines(fixtureLines("claude--trust-prompt.txt"))).toEqual([]);
+    expect(extractStatusLines(fixtureLines("claude--permission-bash.txt"))).toEqual([]);
+  });
+
+  it("returns [] for a plain buffer with no input box", () => {
+    expect(extractStatusLines(splitLines(parseAnsi("just some output\nmore output")))).toEqual([]);
+  });
+});
+
+// extractInputDraft recovers a user draft stranded on the "❯" prompt line (a queued-then-recalled
+// message that stripChrome would otherwise hide) — the marker + separator stripped, trimmed; null
+// for an empty box, a TUI placeholder, or no box at the tail.
+// Issue #242: the footer used to be peeled off the mirror and surfaced nowhere. Every row the strip
+// takes off the tail now has a home, and this one is its own chrome element.
+describe("extractAgentsFooter — the background-agents block under the statusline", () => {
+  const footerText = (lines: StyledLine[]) => extractAgentsFooter(lines).map((l) => lineText(l).trim());
+
+  it.each(["claude--draft-footer-empty.txt", "claude--draft-footer-single.txt", "claude--draft-footer-wrapped.txt"])(
+    "%s: returns the header and the agent row, and nothing from the statusline",
+    (name) => {
+      const rows = footerText(fixtureLines(name));
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toBe("● main");
+      expect(rows[1]).toContain("worker:scout");
+      expect(rows[1]).toContain("Reviewing the test suite");
+      expect(rows.join("\n")).not.toContain("ctx:33%");
+      expect(rows.join("\n")).not.toContain("bypass permissions");
+    },
+  );
+
+  it("footer-pointed-agent: the pointed active-agent row is part of the block", () => {
+    const rows = footerText(fixtureLines("claude--footer-pointed-agent.txt"));
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toBe("● main");
+    expect(rows[1]).toContain("worker:scout");
+    expect(rows[2]!.startsWith("❯ ◯ worker:fix")).toBe(true);
+    expect(rows[2]).toContain("Chasing the footer pointer");
+    expect(rows.join("\n")).not.toContain("auto mode on"); // the statusline above stays out
+  });
+
+  it("keeps each row styled, as the pane painted it", () => {
+    const [header] = extractAgentsFooter(fixtureLines("claude--draft-footer-single.txt"));
+    expect(header!.segments.some((s) => s.bold)).toBe(true);
+  });
+
+  it("is empty when the statusline has no footer under it", () => {
+    const lines = boxWithStatusRows("❯\u00A0", ["  [Opus] ~/repo on main", "  ⏵⏵ bypass permissions on"]);
+    expect(extractAgentsFooter(lines)).toEqual([]);
+  });
+
+  it("is empty when the rows under the blank are a statusline's own, not Claude's agent block", () => {
+    const lines = boxWithStatusRows("❯\u00A0", ["  [Opus] ~/repo on main", "", "  second part of my statusline"]);
+    expect(extractAgentsFooter(lines)).toEqual([]);
+  });
+
+  it("is empty when there is no input box at the tail", () => {
+    expect(extractAgentsFooter(splitLines(parseAnsi("hello\nworld")))).toEqual([]);
+  });
+});
+
+describe("extractInputDraft — recovers a stranded prompt-line draft", () => {
+  it("draft-footer-single: returns the draft left in the input box (the text stripChrome hides)", () => {
+    // A fixture whose draft stripChrome removes as chrome — here we surface it instead. Not
+    // claude--done.txt any more: that capture's "❯" line is faint, so it was a generated suggestion
+    // rather than a draft (see the ghost-text block below and the `done` row in the pinned table).
+    const draft = extractInputDraft(fixtureLines("claude--draft-footer-single.txt"));
+    expect(draft).toContain("remember to update the changelog");
+  });
+
+  it("returns null for an empty box (bare ❯)", () => {
+    expect(extractInputDraft(boxBuffer("❯"))).toBeNull();
+    expect(extractInputDraft(boxBuffer("❯ "))).toBeNull();
+  });
+
+  it("returns null for the queued-messages placeholder line", () => {
+    expect(extractInputDraft(boxBuffer("❯ Press up to edit queued messages"))).toBeNull();
+  });
+
+  it("returns null when there's no input box at the tail", () => {
+    expect(extractInputDraft(splitLines(parseAnsi("just some output\nmore output")))).toBeNull();
+    expect(extractInputDraft(fixtureLines("claude--trust-prompt.txt"))).toBeNull();
+  });
+
+  // GHOST TEXT: a newer Claude Code paints a generated "suggested next prompt" inside an otherwise
+  // empty box. Both fixtures below are REAL captures of the same live pane (Claude Code v2.1.235,
+  // through the bridge): the suggestion, and the same box after typing over it. The wire form of the
+  // suggestion is `❯ \x1b[0m\x1b[2mfix it\x1b[0m` — SGR 2 (faint) and no colour — while the
+  // marker and every real draft carry no SGR at all. Content cannot separate the two; style can.
+  describe("ghost text (a generated suggestion) is not a draft", () => {
+    // Faithful to the capture: the marker is unstyled, an SGR reset opens the run, SGR 2 paints it.
+    const ghostBox = (ghost: string) =>
+      splitLines(parseAnsi(`earlier output\n${"─".repeat(40)}\n❯ \x1b[0m\x1b[2m${ghost}\x1b[0m\n${"─".repeat(40)}`));
+
+    it("ghost-suggestion fixture: the faint suggestion is not surfaced as a stranded draft", () => {
+      expect(extractInputDraft(fixtureLines("claude--ghost-suggestion.txt"))).toBeNull();
+    });
+
+    it("ghost-typed-over fixture: text typed over the suggestion IS a draft", () => {
+      expect(extractInputDraft(fixtureLines("claude--ghost-typed-over.txt"))).toBe("hello real draft text");
+    });
+
+    // The consequence that matters most for the composer: a null draft is what makes the pre-clear
+    // sweep (ctrl+k + a Backspace burst, fired only when the derived draft is non-null) stay home.
+    // Firing it at a ghost clears nothing — verified live: after a full sweep the same faint run is
+    // still on the line — so the keys were destructive for no gain, every send.
+    it("a box holding only faint text yields no draft, so nothing is there to sweep", () => {
+      expect(extractInputDraft(ghostBox("fix it"))).toBeNull();
+      expect(extractInputDraft(ghostBox("run the tests and report back"))).toBeNull();
+    });
+
+    // The box never holds both at once (typing replaces the suggestion outright), so "every visible
+    // run is faint" is the whole-box test. A line mixing faint and normal runs is therefore the
+    // operator's text and must stay recoverable.
+    it("keeps a draft whose line also carries a non-faint run", () => {
+      const mixed = splitLines(
+        parseAnsi(`${"─".repeat(40)}\n❯ \x1b[2mfix\x1b[0m the parser\n${"─".repeat(40)}`),
+      );
+      expect(extractInputDraft(mixed)).toBe("fix the parser");
+    });
+
+    it("still detects the box: composerReady must stay true, a ghost box is typeable", () => {
+      expect(hasInputBox(fixtureLines("claude--ghost-suggestion.txt"))).toBe(true);
+      expect(hasInputBox(ghostBox("fix it"))).toBe(true);
+    });
+
+    // The queue placeholder keeps its own (content) test above; this pins that the style rule did not
+    // change what an UNSTYLED placeholder line does.
+    it("leaves the queued-messages placeholder handling unchanged", () => {
+      expect(extractInputDraft(boxBuffer("❯ Press up to edit queued messages"))).toBeNull();
+      expect(extractInputDraft(boxBuffer("❯ a perfectly ordinary draft"))).toBe("a perfectly ordinary draft");
+    });
+  });
+
+  it("returns the draft even when a statusline sits below the box", () => {
+    const draft = extractInputDraft(boxBuffer("❯ fix the flaky test", "[Opus 4.8] · ctx:3% · main · 32k tokens"));
+    expect(draft).toBe("fix the flaky test");
+  });
+
+  it("trims leading and trailing whitespace around the draft", () => {
+    expect(extractInputDraft(boxBuffer("❯   spaced out draft   "))).toBe("spaced out draft");
+  });
+
+  // Ground truth for the in-flight self-race (fix: draft-detect). The parse is stateless per snapshot
+  // by design, so it DOES read our own just-typed reply as a "draft" during the bridge's ~350ms
+  // send_text→Enter gap — that's exactly why the cross-poll stabiliser + match-last-sent guard exist
+  // upstream (see use-terminal-draft.ts / composer.tsx). These two pin the parse behaviour those
+  // guards depend on.
+  it("mid-send in-flight frame: reads the just-typed text off the ❯ line (the false positive to suppress)", () => {
+    // The composer typed "/rename"; the bridge hasn't pressed Enter yet, so it sits on the box line.
+    expect(extractInputDraft(fixtureLines("claude--send-inflight.txt"))).toBe("/rename");
+  });
+
+  it("self-resolved rename frame: the box is empty again, so no draft is read", () => {
+    // A poll or two later the command has submitted (spinner up, prompt cleared) — nothing stranded.
+    expect(extractInputDraft(fixtureLines("claude--rename-resolved.txt"))).toBeNull();
+  });
+
+  // Background-agents footer present below the box — the case that regressed on real panes: the extra
+  // footer lines broke locateInputBox, so no draft surfaced. With the footer tolerated, an empty box
+  // is still null (no chip), and a real draft (single-line or wrapped) is recovered as before.
+  it("footer variant (empty box): no draft to recover", () => {
+    expect(extractInputDraft(fixtureLines("claude--draft-footer-empty.txt"))).toBeNull();
+  });
+
+  it("footer variant (single-line draft): recovers the draft above the footer", () => {
+    expect(extractInputDraft(fixtureLines("claude--draft-footer-single.txt"))).toBe(
+      "remember to update the changelog before tagging",
+    );
+  });
+
+  it("footer variant (wrapped draft): folds the continuations back, footer notwithstanding", () => {
+    expect(extractInputDraft(fixtureLines("claude--draft-footer-wrapped.txt"))).toBe(
+      "this stranded draft is long enough that the Claude Code TUI soft-wraps it onto several continuation lines inside the input box while the background-agents footer sits below the box",
+    );
+  });
+
+  // The fixture the 2026-10-08 regression was captured for: the pointer on the active agent's footer
+  // row (`❯ ◯ worker:fix …`) is the lowest frame mark, step 1 of the locator stepped over it, and the
+  // ownership check refused it for sitting below the statusline run — `hasInputBox` answered false,
+  // no draft surfaced, and a guarded send typed the text and then withheld its submit forever.
+  it("footer variant (pointed agent row): the box survives the pointer on the footer", () => {
+    const lines = fixtureLines("claude--footer-pointed-agent.txt");
+    expect(hasInputBox(lines)).toBe(true);
+    expect(extractInputDraft(lines)).toBe("the agents footer hides the input box");
+  });
+
+  it("folds a WRAPPED draft back into one line (real capture)", () => {
+    // A long draft the TUI soft-wrapped across the box — the continuation lines are stitched back on.
+    const draft = extractInputDraft(fixtureLines("claude--draft-wrapped.txt"));
+    expect(draft).toBe(
+      "this stranded draft is long enough that Claude soft-wraps it onto several lines inside the input box which is exactly the case that used to stay visible",
+    );
+  });
+
+  it("joins a synthetic wrapped draft with single spaces (de-indented continuations)", () => {
+    const draft = extractInputDraft(
+      wrappedBoxBuffer("❯ the quick brown fox jumps over", ["  the lazy dog again and", "  again"]),
+    );
+    expect(draft).toBe("the quick brown fox jumps over the lazy dog again and again");
+  });
+
+  // Bug #76 fix: the wrapped-draft scan used to be bounded by MAX_DRAFT_LINES (12), so a draft long
+  // enough to wrap past that many continuation rows made locateInputBox return null — the send guard
+  // then saw no draft at all and stalled forever even though the text had landed. The bound is now
+  // 100 (defense-in-depth, not a correctness bound, now `idle.frame.maxDraftRows` in the Claude profile, read by surface/frame.ts),
+  // comfortably above real wraps, so a draft this long is still found.
+  it("matches a box whose draft wraps past the old 12-line bound", () => {
+    const many = Array.from({ length: 20 }, (_, i) => `  continuation ${i}`);
+    const draft = extractInputDraft(wrappedBoxBuffer("❯ opening line", many));
+    expect(draft).toBe(["opening line", ...many.map((l) => l.trim())].join(" "));
+  });
+
+  // A very long draft (610 chars / 25 logical lines, per the issue) can wrap to ~40 rows at a narrow
+  // pane's column count. Pin that the walk reaches all the way up to the prompt (well past the old
+  // 12-line cap, comfortably under the new 100-line one), and that the resulting join is exactly what
+  // reply-action's draftCarriesSend needs to verify the send actually landed.
+  it("extracts a ~40-row wrapped draft in full, and it verifies a real send via draftCarriesSend", () => {
+    const words = Array.from({ length: 200 }, (_, i) => `word${i}`);
+    const wordsPerRow = 5;
+    const rows: string[] = [];
+    for (let i = 0; i < words.length; i += wordsPerRow) rows.push(words.slice(i, i + wordsPerRow).join(" "));
+    expect(rows.length).toBeGreaterThan(30); // comfortably past the old 12-line cap
+    expect(rows.length).toBeLessThan(100); // and comfortably under the new one
+    const [first, ...continuationRows] = rows;
+    const lines = wrappedBoxBuffer(`❯ ${first}`, continuationRows.map((r) => `  ${r}`));
+
+    const draft = extractInputDraft(lines);
+    expect(draft).toBe(rows.join(" "));
+
+    const sent = words.join(" "); // what the composer actually typed, single-space separated
+    expect(draftCarriesSend(sent, draft)).toBe(true);
+  });
+
+  // The Latin case above wraps at WORD boundaries, so every fold seam extractInputDraft inserts
+  // happens to coincide with a real space in `sent` — draftCarriesSend's "loosen only the fold's own
+  // seam" logic (reply-action.ts) is never actually exercised by it. CJK text wraps mid-run (no spaces
+  // to break at), so EVERY seam in a real CJK draft is fabricated by the fold, never a genuine space —
+  // this is the case that actually needs the loosening.
+  it("extracts a ~40-row wrapped CJK draft (no natural spaces) verified through the fold-seam path", () => {
+    const PHRASE = "これはとても長いテストメッセージですのでどうぞよろしくお願いします"; // no spaces
+    const sentJa = PHRASE.repeat(Math.ceil(640 / PHRASE.length)).slice(0, 640); // exactly 640 chars
+    const CHARS_PER_ROW = 16; // simulates a narrow pane, where 2-cell-wide CJK glyphs wrap often
+    const rows: string[] = [];
+    for (let i = 0; i < sentJa.length; i += CHARS_PER_ROW) rows.push(sentJa.slice(i, i + CHARS_PER_ROW));
+    expect(rows.length).toBe(40);
+    const [first, ...continuationRows] = rows;
+    const lines = wrappedBoxBuffer(`❯ ${first}`, continuationRows.map((r) => `  ${r}`));
+
+    const draft = extractInputDraft(lines);
+    // Every seam here is FABRICATED by the fold (sentJa has no spaces anywhere) — draftCarriesSend
+    // must treat each one as an unknowable-width gap rather than require sentJa to hold a literal
+    // space at every row boundary.
+    expect(draft).toBe(rows.join(" "));
+    expect(draftCarriesSend(sentJa, draft)).toBe(true);
+  });
+
+  // Bug #76 (finding 2, defense-in-depth): the draft-walk cap (100) exists so a stray line that merely
+  // LOOKS like a border can't pair up with a genuinely-quoted "❯" line dozens of rows away to complete
+  // a bogus box shape. Pin that the cap actually stops such a far-apart match — a real top border, a
+  // real "❯" line, then well over 100 lines of ordinary filler before the (stray-looking) bottom
+  // border must NOT locate a box at all.
+  it("does not pair a far-away ❯ line with a border more than the draft cap apart", () => {
+    const filler = Array.from({ length: 105 }, (_, i) => `filler line ${i}`); // > MAX_DRAFT_LINES (100)
+    const lines = wrappedBoxBuffer("❯ this quote is not really the current draft", filler);
+    expect(extractInputDraft(lines)).toBeNull();
+  });
+
+  // Round-3 finding 2: the two blank-line skips inside locateInputBox step (d) used to be UNBOUNDED
+  // (`while (isBlank) i--`), run before/after the counted continuation walk rather than as part of it
+  // — so a wall of blank lines could stand in for the non-blank filler above and reach an arbitrarily
+  // distant border for free, defeating the draft-row bound (`idle.frame.maxDraftRows`) entirely for that shape. Both spots now draw
+  // from the SAME `wrapped` counter as the continuation walk itself.
+  it("does not tolerate 105 blank lines between the ❯ line and the bottom border", () => {
+    // These blanks sit exactly where the old free pre-skip used to run: contiguous with the bottom
+    // border, walked BEFORE the (previously) counted loop ever started.
+    const blanks = Array.from({ length: 105 }, () => "");
+    const lines = wrappedBoxBuffer("❯ this line is far from the border", blanks);
+    expect(extractInputDraft(lines)).toBeNull();
+  });
+
+  it("does not tolerate 105 blank lines between the top border and the ❯ line", () => {
+    // These blanks sit where the old free post-prompt skip used to run: between the prompt and the
+    // top border, walked AFTER the "❯" line was already found.
+    const rule = "─".repeat(40);
+    const blanks = Array.from({ length: 105 }, () => "");
+    const lines = splitLines(parseAnsi([rule, ...blanks, "❯ padded draft", rule].join("\n")));
+    expect(extractInputDraft(lines)).toBeNull();
+  });
+
+  it("still tolerates a few blank padding lines between the top border and the prompt", () => {
+    // Existing (pre-fix) behaviour preserved: a small amount of blank padding is well under the cap,
+    // so it's still just tolerated, not treated as suspicious.
+    const rule = "─".repeat(40);
+    const lines = splitLines(parseAnsi([rule, "", "", "❯ padded draft", rule].join("\n")));
+    expect(extractInputDraft(lines)).toBe("padded draft");
+  });
+});
+
+// Finding 1 (field review): isBoxBorder used to delegate to isHorizontalRule, whose whitespace-
+// stripping let a spaced-out prose separator compact into "nothing but rule glyphs". That let a fake
+// dialog buffer complete the FULL border→❯→border shape locateInputBox looks for and get read as a
+// live composer — meaning a guarded reply could type into (and, on the old code path, submit into) a
+// real permission dialog sitting right below it. Traced repro from the review, verbatim.
+describe("a fake box shape built from spaced-out em-dash separators is not an input box", () => {
+  const lines = splitLines(
+    parseAnsi(
+      [
+        "— — —",
+        "❯ approve deployment now",
+        "— — —",
+        "Do you want to proceed?",
+        " ❯ 1. Yes",
+        "   2. No",
+        "",
+        "Esc to cancel · Tab to amend",
+      ].join("\n"),
+    ),
+  );
+
+  it("extractInputDraft finds no draft", () => {
+    expect(extractInputDraft(lines)).toBeNull();
+  });
+
+  it("hasInputBox reports no composer on screen (the dialog owns the keyboard)", () => {
+    expect(hasInputBox(lines)).toBe(false);
+  });
+});
+
+// Bug #76, first failure mode: isBoxBorder used to require 20+ consecutive rule glyphs, which is
+// width-dependent — Hangar's shared grid follows the narrowest attached client, so a split pane's
+// border can render well under 20 glyphs (19 observed). And Claude sometimes splices a session/job
+// name into the TOP border, splitting its run so neither flank reaches 20 even at a normal width.
+describe("locateInputBox at a narrow pane width / with a labelled top border", () => {
+  it("locates a box whose borders are exactly 19 glyphs wide (below the old 20-glyph floor)", () => {
+    const lines = narrowBoxBuffer("❯ narrow pane draft", 19);
+    expect(extractInputDraft(lines)).toBe("narrow pane draft");
+  });
+
+  it("locates a box whose TOP border carries a spliced label, on a narrow pane", () => {
+    // Observed real capture: flanks 5/2 at 43 columns.
+    const topBorder = "───── japanese technical troubleshooting ──";
+    const bottomBorder = "─".repeat(19);
+    const lines = splitLines(
+      parseAnsi([topBorder, "❯ reply about the troubleshooting doc", bottomBorder].join("\n")),
+    );
+    expect(extractInputDraft(lines)).toBe("reply about the troubleshooting doc");
+  });
+
+  // Round-3 finding 1: traced against the bundled renderer's own label-placement math, a top border's
+  // flank can clamp down to exactly 1 glyph (align:"center", or align:"end" with a zero offset).
+  // locateInputBox's step (e) uses isInputBoxTopBorder specifically so this real shape still locates
+  // the box.
+  it("locates a box whose TOP border has a 1-glyph flank (renderer's align:center/end clamp)", () => {
+    const lines = splitLines(
+      parseAnsi(["──── fast mode ─", "❯ reply while fast mode is on", "─".repeat(19)].join("\n")),
+    );
+    expect(extractInputDraft(lines)).toBe("reply while fast mode is on");
+  });
+
+  // Strictness boundary: the looser top-border floor is specific to the renderer's real clamp — it
+  // must NOT reopen the em-dash-prose hole finding 1 closed. Same box shape as the fake-dialog test
+  // above, but as the TOP border of an otherwise well-formed box; still not a box.
+  it("does NOT locate a box whose TOP border is a spaced em-dash separator", () => {
+    const lines = splitLines(parseAnsi(["— — —", "❯ reply text", "─".repeat(19)].join("\n")));
+    expect(extractInputDraft(lines)).toBeNull();
+    expect(hasInputBox(lines)).toBe(false);
+  });
+});
+
+// Round-4 finding: a labelled top border's per-flank minimums alone don't rule out a total width
+// narrower than any bare border the renderer can actually draw — the renderer draws a box's top and
+// bottom border at the SAME width, and the bare bottom border already requires >= 8 columns. Traced
+// bypass buffer from the review, verbatim: a 5-column "─ x ─" top border, an echoed "❯" line, an
+// 8-column bare bottom border (just wide enough to pass on its own), then a real permission dialog
+// below it. Before the shared width floor, this walked footer → status → 8-glyph bottom → echoed ❯ →
+// "─ x ─" as a (loose) top border and reported a composer on screen over a live dialog.
+describe("a labelled top border narrower than any real bare border is not an input box", () => {
+  const lines = splitLines(
+    parseAnsi(
+      [
+        "─ x ─",
+        "❯ approve deployment now",
+        "────────",
+        "Do you want to proceed?",
+        " ❯ 1. Yes",
+        "   2. No",
+        "",
+        "Esc to cancel · Tab to amend",
+      ].join("\n"),
+    ),
+  );
+
+  it("extractInputDraft finds no draft", () => {
+    expect(extractInputDraft(lines)).toBeNull();
+  });
+
+  it("hasInputBox reports no composer on screen (the dialog owns the keyboard)", () => {
+    expect(hasInputBox(lines)).toBe(false);
+  });
+});
+
+// Round-5 finding: the shared width floor above must be measured in DISPLAY CELLS, not UTF-16
+// `.length` — a combining-mark label can read AT or above the floor in `.length` while actually being
+// narrower in real terminal columns. Same bypass shape as the round-4 buffer above, but the top
+// border's `.length` (8) alone would have cleared the OLD (length-based) floor; only measuring in
+// display cells (7, one short) correctly still rejects it.
+describe("a combining-mark top border whose .length clears the floor but whose display width doesn't", () => {
+  // Explicit decomposed form (base "e" + combining acute U+0301), NOT the precomposed "é" glyph —
+  // that would collapse to a single UTF-16 unit and defeat the point of this fixture.
+  const topBorder = `── e\u0301 ──`; // .length 8, displayWidth 7
+  const lines = splitLines(
+    parseAnsi(
+      [
+        topBorder,
+        "❯ approve deployment now",
+        "────────",
+        "Do you want to proceed?",
+        " ❯ 1. Yes",
+        "   2. No",
+        "",
+        "Esc to cancel · Tab to amend",
+      ].join("\n"),
+    ),
+  );
+
+  it("extractInputDraft finds no draft", () => {
+    expect(topBorder.length).toBe(8);
+    expect(extractInputDraft(lines)).toBeNull();
+  });
+
+  it("hasInputBox reports no composer on screen (the dialog owns the keyboard)", () => {
+    expect(hasInputBox(lines)).toBe(false);
+  });
+});
+
+describe("the statusline run — as tall as a real statusline", () => {
+  const DRAFT = "my draft text here";
+  const statusRows = (n: number) => Array.from({ length: n }, (_, i) => `status row ${i}`);
+
+  it.each([1, 2, 3, 4, 5, 6, 7, 8])("locates the box under %i statusline row(s)", (rows) => {
+    const lines = boxWithStatusRows(`❯ ${DRAFT}`, statusRows(rows));
+    expect(extractInputDraft(lines)).toBe(DRAFT);
+    expect(statusText(lines)).toEqual(statusRows(rows)); // every row, however tall the run
+    expect(stripChrome(lines)).not.toBe(lines);
+  });
+
+  it.each([9, 10])("at %i rows the run is no longer stripped as a statusline, but the box is still found", (rows) => {
+    // ADR 0048 amends ADR 0004: the ceiling bounds what the VIEW strips, not whether the box exists.
+    // A run taller than the ceiling is an `unknown` tail: it stays on the mirror under the transcript,
+    // is not re-surfaced as a statusline, and the send path still sees the box and its draft.
+    const lines = boxWithStatusRows(`❯ ${DRAFT}`, statusRows(rows));
+    expect(extractInputDraft(lines)).toBe(DRAFT);
+    expect(hasInputBox(lines)).toBe(true);
+    expect(extractStatusLines(lines)).toEqual([]);
+    expect(stripChrome(lines).map(lineText)).toEqual(["earlier output", ...statusRows(rows)]);
+  });
+});
+
+describe("dialogs are refused by the border and blank checks — not by the row bound", () => {
+  const DIALOG_FIXTURES = [
+    "claude--permission-bash.txt",
+    "claude--permission-edit.txt",
+    "claude--plan-approval--feedback-focused.txt",
+    "claude--plan-approval--feedback-typed.txt",
+    "claude--plan-approval--feedback-wrapped.txt",
+    "claude--plan-approval--three-row.txt",
+    "claude--plan-approval--three-row-focused.txt",
+    "claude--plan-approval--three-row-typed-focused.txt",
+    "claude--plan-approval--numbered-body.txt",
+    "claude--plan-approval.txt",
+    "claude--select-menu.txt",
+    "claude--select-multi.txt",
+    "claude--select-multiselect-checked.txt",
+    "claude--select-multiselect-review.txt",
+    "claude--select-multiselect-single.txt",
+    "claude--select-preview-note-attached.txt",
+    "claude--select-preview-note-input.txt",
+    "claude--select-preview.txt",
+    "claude--trust-prompt.txt",
+    "claude--trust-prompt-unnumbered.txt",
+    "claude--wizard-preview-note-attached.txt",
+    "claude--wizard-preview-q1.txt",
+    "claude--wizard-q1-revisit.txt",
+    "claude--wizard-q1.txt",
+    "claude--wizard-q2.txt",
+    "claude--wizard-submit-unanswered.txt",
+    "claude--wizard-submit.txt",
+    "claude--v2302-wizard-review-long-q--w140.txt",
+    "claude--v2302-wizard-review-barred--w140.txt",
+  ];
+
+  it.each(DIALOG_FIXTURES)("%s surfaces no box, so no chrome is stripped from it", (name) => {
+    const lines = fixtureLines(name);
+    expect(extractStatusLines(lines)).toEqual([]);
+    expect(extractInputDraft(lines)).toBeNull();
+    expect(stripChrome(lines).length).toBe(keptAboveTail(lines));
+  });
+
+  it.each(DIALOG_FIXTURES)("%s ends its tail run with a blank within 2 rows", (name) => {
+    const texts = fixtureLines(name).map(lineText);
+    let end = texts.length;
+    while (end > 0 && texts[end - 1]!.trim().length === 0) end--;
+    let run = 0;
+    while (end - 1 - run >= 0 && texts[end - 1 - run]!.trim().length > 0) run++;
+    expect(run).toBeGreaterThan(0);
+    expect(run).toBeLessThanOrEqual(2);
+  });
+});
+
+describe("the row bound only decides what is stripped as a statusline", () => {
+  const outputRows = (n: number) => Array.from({ length: n }, (_, i) => `tool output ${i}`);
+
+  it("a complete box above an 8-row blank-free run is found, and the run stays on the mirror", () => {
+    // Before ADR 0048 this screen was refused by the row count alone. The count never guarded the
+    // send (ADR 0004); the box's own frame and the modal checks do, and neither objects here.
+    const lines = boxWithBlankFreeRunBelow(outputRows(8));
+    expect(extractStatusLines(lines)).toEqual([]);
+    expect(extractInputDraft(lines)).toBe("do the earlier thing");
+    expect(stripChrome(lines).map(lineText)).toEqual(["old statusline", ...outputRows(8)]);
+  });
+
+  it("known limitation: a complete box above a 7-row blank-free run reads as live", () => {
+    const lines = boxWithBlankFreeRunBelow(outputRows(7));
+    expect(extractInputDraft(lines)).toBe("do the earlier thing");
+    expect(lines.length - stripChrome(lines).length).toBe(11);
+  });
+});
+
+describe("scrollback echo — a known limitation, pinned on purpose", () => {
+  const SENT = "please run the database migration now";
+
+  it.each([3, 8, 9])("refuses an echo above a dialog of %i numbered rows and a key hint", (rows) => {
+    // Until ADR 0048's statusline check, 3 and 8 rows fit the statusline walk and read as a draft.
+    // A statusline tail is now checked for numbered options and key hints too.
+    expect(extractInputDraft(echoedSendAboveDialog(SENT, rows))).toBeNull();
+  });
+
+  it("still reads an echo as a draft when the rows under it name no menu", () => {
+    const rule = "─".repeat(40);
+    const lines = splitLines(parseAnsi(["earlier output", rule, `❯ ${SENT}`, rule, "  some row", "  another row"].join("\n")));
+    expect(extractInputDraft(lines)).toBe(SENT);
+  });
+
+  it.each(["claude--select-menu.txt", "claude--select-multi.txt"])(
+    "%s: a real ❯ echo with transcript above it is not read as a draft",
+    (name) => {
+      expect(extractInputDraft(fixtureLines(name))).toBeNull();
+    },
+  );
+});
+
+describe("real corpus — pinned so any change to the walk shows up as a diff", () => {
+  // `statusRows` is the HEIGHT of the re-surfaced statusline run, not a boolean: every real capture
+  // in this corpus is 2 rows (statusline + hint), and pinning the count is what would have caught the
+  // first-row-only truncation this table used to tolerate.
+  const PINNED: { fixture: string; statusRows: number; draft: string | null; stripped: number }[] = [
+    // `done` was pinned as a draft ("cat hello.txt to verify") until the ghost rule landed. Its "❯"
+    // line is FAINT on the wire, exactly like the ghost-suggestion capture — so the capture was always
+    // a generated suggestion after the hello.txt turn, read as a stranded draft. It is a NULL draft
+    // and the corpus is unanimous: every genuinely-typed draft in this corpus is unstyled, and the
+    // only two faint ones are this and the ghost capture. `stripped` is unchanged — stripChrome peels
+    // the whole box either way.
+    // The slash-command completion popup below the box (23 rows in the long capture, 3 in the short
+    // one). Both are the regression this table would have caught: before the popup peel the box was
+    // undetectable behind them, so draft was null and stripped was 0.
+    { fixture: "autocomplete-slash-long", statusRows: 0, draft: "/model", stripped: 27 },
+    { fixture: "autocomplete-slash-short", statusRows: 0, draft: "/re", stripped: 7 },
+    // Hand-built from a live 82-column observation: a clipped "…ugin:…" command name inside the popup.
+    // Before the box was found by its own frame, the clipped row hid the box: draft null, stripped 1.
+    { fixture: "autocomplete-slash-clipped", statusRows: 0, draft: "/model", stripped: 32 },
+    // A reply's box table cut out of its screen (table-run.test.ts): no box, nothing to strip.
+    { fixture: "box-table-vs16-emoji", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "done", statusRows: 2, draft: null, stripped: 28 },
+    { fixture: "ghost-suggestion", statusRows: 4, draft: null, stripped: 21 },
+    { fixture: "ghost-typed-over", statusRows: 4, draft: "hello real draft text", stripped: 21 },
+    { fixture: "idle-background-shell", statusRows: 1, draft: null, stripped: 5 },
+    { fixture: "draft-footer-empty", statusRows: 2, draft: null, stripped: 9 },
+    { fixture: "draft-footer-single", statusRows: 2, draft: "remember to update the changelo", stripped: 9 },
+    { fixture: "draft-footer-wrapped", statusRows: 2, draft: "this stranded draft is long eno", stripped: 11 },
+    { fixture: "footer-pointed-agent", statusRows: 1, draft: "the agents footer hides the input", stripped: 8 },
+    { fixture: "draft-paste-placeholder", statusRows: 2, draft: "[Pasted text #3 +3 lines]", stripped: 7 },
+    // The split shape (#110): a token plus the literal tail beside it, captured complete and
+    // half-arrived. Three status rows here — the sandbox pane also carries a transcript warning.
+    { fixture: "draft-paste-split-partial", statusRows: 3, draft: "[Pasted text #3 +5 lines] TAIL-ONE-alpha-bravo TAIL-TWO-charlie-delta", stripped: 7 },
+    { fixture: "draft-paste-split-tail", statusRows: 3, draft: "[Pasted text #3 +5 lines] TAIL-ONE-alpha-bravo TAIL-TWO-charlie-delta TAIL-THREE-echo-foxtrot", stripped: 7 },
+    { fixture: "draft-wrapped", statusRows: 2, draft: "this stranded draft is long eno", stripped: 10 },
+    { fixture: "fresh-idle", statusRows: 2, draft: null, stripped: 47 },
+    { fixture: "permission-bash", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "permission-edit", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "plan-approval", statusRows: 0, draft: null, stripped: 0 },
+    // `/model sonnet` accepted: the acknowledgement row sits in the transcript, the box is empty, and
+    // the statusline below it is three rows (a LIMITS row, the model/cwd row, the mode row).
+    { fixture: "model-alias", statusRows: 3, draft: null, stripped: 55 },
+    { fixture: "menu-model-picker", statusRows: 0, draft: null, stripped: 1 },
+    { fixture: "menu-model-picker-dismissed", statusRows: 3, draft: null, stripped: 7 },
+    { fixture: "menu-model-picker-moved", statusRows: 0, draft: null, stripped: 1 },
+    // The /effort slider: a modal with no input box and no statusline under it, so the walk finds
+    // nothing to re-surface and nothing to peel.
+    { fixture: "menu-effort-slider", statusRows: 0, draft: null, stripped: 0 },
+    // The same slider at 120 columns, the second capture width the Effort grammar is proven against.
+    // Same reading: a modal, no box, nothing under it to re-surface or peel.
+    { fixture: "menu-effort-slider--w120", statusRows: 0, draft: null, stripped: 0 },
+    // The same slider at 132 columns, cropped to the dialog. Same reading again: a modal, no box.
+    { fixture: "menu-effort-slider--w132", statusRows: 0, draft: null, stripped: 0 },
+    // The three narrow captures (2026-09-22). At 40 and 60 columns Claude wraps the dialog — the
+    // labels break onto a second row and the footer onto two or three — and the walk still reads a
+    // modal with no box, so nothing here moves with the width.
+    { fixture: "menu-effort-slider--w40", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "menu-effort-slider--w60", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "menu-effort-slider--w80", statusRows: 0, draft: null, stripped: 0 },
+    // Six more real captures (2026-09-22): `low` and `ultracode` selected at 40, 60 and 80 columns.
+    // Three lift as the Effort grammar and three decline (a soft-wrapped footer at 60/ultracode, no
+    // marker glyph at 40/low, a render glitch at 40/ultracode) — the walk reads the same either way,
+    // a modal with no box and nothing under it.
+    { fixture: "menu-effort-slider--w60-low", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "menu-effort-slider--w80-low", statusRows: 0, draft: null, stripped: 0 },
+    // The /resume session picker (2026-09-22, Claude Code 2.1.278) at 60, 80 and 120 columns, a typed
+    // search, and the all-projects view (sanitized). Measured: a modal with no box and nothing under
+    // it, at every width and in every state.
+    { fixture: "menu-resume-picker--w120-first", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "menu-resume-picker--w120-third", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "menu-resume-picker--w120-search", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "menu-resume-picker--w60-first", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "menu-resume-picker--w80-second", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "menu-resume-picker--w120-all-sanitized", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "menu-effort-slider--w80-ultracode", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "menu-effort-slider--w60-ultracode", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "menu-effort-slider--w40-low", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "menu-effort-slider--w40-ultracode", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "plan-approval--numbered-body", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "plan-approval--feedback-focused", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "plan-approval--feedback-typed", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "plan-approval--feedback-wrapped", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "plan-approval--three-row", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "plan-approval--three-row-focused", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "plan-approval--three-row-typed-focused", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "rename-resolved", statusRows: 2, draft: null, stripped: 6 },
+    { fixture: "select-menu", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "select-multi", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "select-multiselect-checked", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "select-multiselect-review", statusRows: 0, draft: null, stripped: 5 },
+    { fixture: "select-multiselect-single", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "select-preview", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "select-preview-note-attached", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "select-preview-note-input", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "send-inflight", statusRows: 2, draft: "/rename", stripped: 5 },
+    { fixture: "trust-prompt", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "trust-prompt-unnumbered", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-ask-long-question--w50", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-ask-two-line-question", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-ask-type-something-focused", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-ask-type-something-typed-off-row", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-ask-type-something-typed-two-lines", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-multiselect-type-something-focused", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-permission-amend-focused", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-permission-amend-no-off-row", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-permission-amend-typed", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-shell-after-exit", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-shell-before-first-frame", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-trust--w50", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-wizard-two-line-question", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-draft-prompt", statusRows: 2, draft: "my shell said: ❯ ls -la and then nothing", stripped: 7 },
+    {
+      fixture: "v2283-draft-rule",
+      statusRows: 3,
+      draft: "see this output: ──────────────────── some text ──────────────────── end",
+      stripped: 10,
+    },
+    { fixture: "v2283-slash-effort", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-slash-export", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-slash-hooks", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-slash-mcp", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-slash-usage", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplace-detail--w120", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplace-detail--w40", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplace-detail--w82", statusRows: 0, draft: null, stripped: 1 },
+    { fixture: "v2283-fullscreen-plugin-marketplace-detail-short--w120", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplace-detail-short--w40", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplace-detail-short--w82", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-changed--w40", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-changed--w82", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-add--w120", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-add--w40", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-add--w82", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-pending--w120", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-pending--w40", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-pending--w82", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-pointed--w120", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-pointed--w40", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-pointed--w82", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-updated--w120", statusRows: 1, draft: null, stripped: 28 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-updated--w40", statusRows: 1, draft: null, stripped: 25 },
+    { fixture: "v2283-fullscreen-plugin-marketplaces-updated--w82", statusRows: 1, draft: null, stripped: 25 },
+    { fixture: "v2283-plugin-marketplace-detail--w120", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplace-detail--w40", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplace-detail--w82", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplace-detail-remove--w82", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplace-detail-updated--w82", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplaces-add--w120", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplaces-add--w40", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplaces-add--w82", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplaces-add-form--w82", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplaces-pending--w120", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplaces-pending--w40", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplaces-pending--w82", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplaces-pointed--w120", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplaces-pointed--w40", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplaces-pointed--w82", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2283-plugin-marketplaces-updated--w120", statusRows: 1, draft: null, stripped: 5 },
+    { fixture: "v2283-plugin-marketplaces-updated--w40", statusRows: 1, draft: null, stripped: 5 },
+    { fixture: "v2283-plugin-marketplaces-updated--w82", statusRows: 1, draft: null, stripped: 5 },
+    { fixture: "v2289-switch-model-no", statusRows: 0, draft: null, stripped: 1 },
+    { fixture: "v2289-switch-model-no--w50", statusRows: 0, draft: null, stripped: 1 },
+    { fixture: "v2289-switch-model-yes", statusRows: 0, draft: null, stripped: 1 },
+    { fixture: "v2289-switch-model-yes--w50", statusRows: 0, draft: null, stripped: 1 },
+    { fixture: "v2291-permission-bash-subagent", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2299-ask-under-long-task-list", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2299-ask-under-task-list", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2299-wizard-under-task-list", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2301-hold-subagent", statusRows: 1, draft: null, stripped: 8 },
+    // The 2026-10-16 incident on lane 8788: the agents panel under the box while a fork runs. The
+    // panel is the footer, the three rows over it are the statusline; "↓ to view" is a status hint.
+    { fixture: "v2301-fork-running-main-idle", statusRows: 3, draft: null, stripped: 11 },
+    { fixture: "v2301-synth-agents-panel", statusRows: 3, draft: null, stripped: 12 },
+    { fixture: "v2301-synth-agents-panel-walk-fails", statusRows: 3, draft: null, stripped: 14 },
+    // The scratch-bridge lab the same day: the panel under an empty box (the grey suggestion is no
+    // draft), and under a typed draft, where the mode row drops its two hints.
+    { fixture: "v2301-lab-agents-panel-empty", statusRows: 1, draft: null, stripped: 8 },
+    { fixture: "v2301-lab-agents-panel-draft", statusRows: 1, draft: "draft text in the box", stripped: 9 },
+    // The same lab with eleven agents: five rows and "↓ 6 more", the tasks pill focused ("Enter to view
+    // tasks" on the mode row), and the panel itself focused ("↑/↓ to select", "❯ ● main").
+    { fixture: "v2301-lab-agents-panel-more", statusRows: 1, draft: null, stripped: 14 },
+    { fixture: "v2301-lab-agents-panel-tasks-pill", statusRows: 1, draft: null, stripped: 13 },
+    { fixture: "v2301-lab-agents-panel-focused", statusRows: 1, draft: null, stripped: 14 },
+    { fixture: "v2301-idle", statusRows: 1, draft: null, stripped: 6 },
+    // Claude Code 2.1.301 around a running turn (send-queue lab, 2026-10-16): the operator's two-row
+    // statusline plus the mode row; the draft typed during the turn is read as a draft.
+    { fixture: "v2301-done-shell-running--w100", statusRows: 3, draft: null, stripped: 23 },
+    { fixture: "v2301-idle-after-turn--w100", statusRows: 3, draft: null, stripped: 16 },
+    { fixture: "v2301-queued-taken--w100", statusRows: 3, draft: null, stripped: 7 },
+    { fixture: "v2301-spinner-no-timer--w100", statusRows: 2, draft: null, stripped: 6 },
+    // The /cost and /usage panel drawn over a live box (M56 spec 15 review): the box and its footer stay.
+    { fixture: "v2301-usage-panel-over-box--w40", statusRows: 1, draft: null, stripped: 7 },
+    { fixture: "v2301-usage-panel-over-box--w82", statusRows: 1, draft: null, stripped: 10 },
+    { fixture: "v2301-working-draft--w100", statusRows: 3, draft: "then give it a title", stripped: 7 },
+    { fixture: "v2301-working-queued-message--w100", statusRows: 3, draft: null, stripped: 7 },
+    { fixture: "v2301-working-quiet--w100", statusRows: 3, draft: null, stripped: 7 },
+    { fixture: "v2302-preview-wrapped-rule--w141", statusRows: 0, draft: null, stripped: 0 },
+    // Claude Code 2.1.302's slash list under a box holding `/model` (reconstructed from a masked field
+    // capture, 2026-10-17): the command in the left column, its description in a second column. No
+    // statusline while the list is open; the list is stripped with the box, as in autocomplete-slash-long.
+    { fixture: "v2302-slash-model-list--w119", statusRows: 0, draft: "/model", stripped: 23 },
+    // The same list drawn over the box on a tall pane (captured, lane 8788, 2026-10-17), the statusline under it.
+    { fixture: "v2302-slash-model-list-above--w119", statusRows: 2, draft: "/model", stripped: 5 },
+    // The list under the box on the harness lab's 120 x 40 tmux pane (captured 2026-10-17), the screen scrolled up.
+    { fixture: "v2302-slash-model-list--w120--h40", statusRows: 0, draft: "/model", stripped: 24 },
+    { fixture: "v2302-slash-effort-list--w120--h40", statusRows: 0, draft: "/effort", stripped: 24 },
+    { fixture: "v2302-heads-up-above-box--w142", statusRows: 2, draft: null, stripped: 6 },
+    // The fix rig's 120 x 36 Hangar pane (captured 2026-10-17): an empty box on a screen whose rows reach
+    // the bottom, and the same pane with the list under the box, blank rows under the list.
+    { fixture: "v2302-idle-full-screen--w120--h36", statusRows: 1, draft: null, stripped: 5 },
+    { fixture: "v2302-slash-model-list-padded--w120--h36", statusRows: 0, draft: "/model", stripped: 16 },
+    // A multiSelect step with the pointer on its "Type something" field (sanitised field capture, 2026-10-17).
+    { fixture: "v2302-multiselect-field-focused--w160", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2302-notice-over-agents-panel--w69", statusRows: 2, draft: null, stripped: 11 },
+    { fixture: "v2302-turn-ended-yn--w119", statusRows: 3, draft: null, stripped: 7 },
+    { fixture: "v2302-turn-ending-stop-hooks--w119", statusRows: 3, draft: null, stripped: 7 },
+    { fixture: "v2302-wizard-long-question--w54", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2302-wizard-review-barred--w140", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2302-wizard-review-long-q--w140", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "v2302-working-agents-panel--w119", statusRows: 3, draft: null, stripped: 11 },
+    { fixture: "v2302-working-list-echo--w119", statusRows: 3, draft: null, stripped: 7 },
+    { fixture: "v2303-titled-edge-draft--w160", statusRows: 3, draft: "ok merge the five, running the crew update now", stripped: 11 },
+    { fixture: "v2303-titled-edge-idle--w160", statusRows: 3, draft: null, stripped: 11 },
+    { fixture: "v2303-titled-edge-survey--w160", statusRows: 3, draft: null, stripped: 11 },
+    { fixture: "v2303-titled-edge-working--w160", statusRows: 3, draft: null, stripped: 11 },
+    { fixture: "wizard-multiselect-checked", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "wizard-multiselect-final", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "wizard-multiselect-pointer-next", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "wizard-multiselect-q1", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "wizard-preview-note-attached", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "wizard-preview-q1", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "wizard-preview-wrapped-label", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "wizard-q1", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "wizard-q1-revisit", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "wizard-q2", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "wizard-submit", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "wizard-submit-unanswered", statusRows: 0, draft: null, stripped: 3 },
+    // The dynamic-workflow view (discussion #301, ADR 0072). A full-screen TUI: no statusline, no
+    // input box and nothing to strip, because the view replaces the whole screen rather than sitting
+    // under it. All three zeros are the honest reading, not a gap.
+    { fixture: "workflow-view", statusRows: 0, draft: null, stripped: 0 },
+    { fixture: "working", statusRows: 2, draft: null, stripped: 6 },
+    { fixture: "working-esc-to-interrupt", statusRows: 1, draft: null, stripped: 5 },
+  ];
+
+  it("pins every claude fixture on disk, so a new capture can't slip past this table", () => {
+    const onDisk = readdirSync(PANES_DIR)
+      .filter((f) => f.startsWith("claude--") && f.endsWith(".txt"))
+      .map((f) => f.replace("claude--", "").replace(".txt", ""))
+      .toSorted();
+    expect(onDisk).toEqual(PINNED.map((p) => p.fixture).toSorted());
+  });
+
+  it.each(PINNED)("$fixture classifies identically", ({ fixture, statusRows, draft, stripped }) => {
+    const lines = fixtureLines(`claude--${fixture}.txt`);
+    expect(extractStatusLines(lines).length).toBe(statusRows);
+    if (draft === null) {
+      expect(extractInputDraft(lines)).toBeNull();
+    } else {
+      expect(extractInputDraft(lines)).toContain(draft);
+    }
+    expect(lines.length - stripChrome(lines).length).toBe(stripped);
+  });
+});
+
+// Claude Code 2.1.303 writes a named session's name into the box's top edge (`──── 1.23.0 ─`).
+describe("a session name in the box's top edge (2.1.303, 160 columns)", () => {
+  it("strips the titled box with its statusline and agents panel, and never keeps the name as transcript", () => {
+    for (const state of ["working", "idle", "draft", "survey"]) {
+      const lines = fixtureLines(`claude--v2303-titled-edge-${state}--w160.txt`);
+      const kept = joined(stripChrome(lines));
+      expect(hasInputBox(lines), state).toBe(true);
+      expect(kept, state).not.toContain("1.23.0");
+      expect(kept, state).not.toContain("bypass permissions");
+      expect(kept, state).toContain("Update installed");
+      expect(statusText(lines), state).toHaveLength(3);
+      expect(extractAgentsFooter(lines), state).toHaveLength(4);
+    }
+  });
+
+  it("reads the draft under the titled edge, without the name", () => {
+    expect(extractInputDraft(fixtureLines("claude--v2303-titled-edge-draft--w160.txt"))).toBe("ok merge the five, running the crew update now");
+    expect(extractInputDraft(fixtureLines("claude--v2303-titled-edge-idle--w160.txt"))).toBeNull();
+  });
+});
