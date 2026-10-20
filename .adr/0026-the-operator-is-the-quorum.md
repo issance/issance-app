@@ -72,7 +72,7 @@ demoting itself buys no safety and costs an outage of that machine's agents.
 ## Consequences
 
 - **Recovery is bounded by the operator's availability, and that is the trade, stated once.** A pack
-  whose lead dies while nobody is looking stays down until somebody looks. issance's answer is to make
+  whose lead dies while nobody is looking stays down until somebody looks. issance answer is to make
   that look cheap — a phone, a page, one button (ADR 0028) — not to remove the human.
 - **A two-machine pack is fully supported and has no witness.** Its takeover rests on the operator's
   own judgement, and the surface says so at the point of decision instead of implying a check it

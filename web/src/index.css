@@ -313,7 +313,7 @@
      stand on the page. */
   --chrome: light-dark(oklch(0.94 0 0), oklch(0.205 0 0));
   /* Pinned to --card, not a value of its own. `bg-popover` / `text-popover-foreground` appear ZERO
-     times in src/ — issance's floating layer is the BottomSheet (ui/sheet.tsx), which is
+     times in src/ — issance floating layer is the BottomSheet (ui/sheet.tsx), which is
      `bg-background` over a `bg-black/50` scrim. The pair is kept rather than deleted only so a
      future `npx shadcn add` of a Popover/Tooltip primitive lands on a issance surface instead of
      stock white; it is an alias, and there is no third paper behind it. */
@@ -1211,7 +1211,7 @@
    row part reads (`--row-top`, `--row-bottom`, ui/list-group.tsx LIST_ROW_CORNERS) follow each row's
    own corner. In the components layer, so a row's own utilities (a marked row's inset shadow, a
    border of its own, a margin) still win, as they did over `divide-y`. Cards keep the square-corner
-   rule: under `sharp` a card row has issance's 2px corner and a marked row its left bar; under soft or
+   rule: under `sharp` a card row has issance 2px corner and a marked row its left bar; under soft or
    round the radius word's ring replaces the bar. A list without a frame of its own sits flush in a
    card or a sheet, so under `cards` its rows get `--row-inset` of air from the card's edges and from
    its rounded corners; ui/list-group.tsx and the key board editor draw their own frame and opt out
@@ -1225,7 +1225,7 @@
     --row-bottom: max(0px, calc(var(--row-corner) - 2px));
     border-width: var(--row-edge);
     /* A card row's own corner; under rules, the group's inner corner on the first and last row (0 at
-       issance's 2px), so a row that paints itself does not cover the frame's rounded corner. */
+       issance 2px), so a row that paints itself does not cover the frame's rounded corner. */
     border-radius:
       max(var(--row-corner), var(--row-top)) max(var(--row-corner), var(--row-top))
       max(var(--row-corner), var(--row-bottom)) max(var(--row-corner), var(--row-bottom));

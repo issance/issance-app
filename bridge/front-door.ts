@@ -268,7 +268,7 @@ function removeHandler(deps: FrontDoorDeps, record: OwnershipRecord): boolean {
   if (output.trim() !== "") deps.io.err(output.trimEnd());
   const protocol = record.mode === "http" ? "HTTP" : "HTTPS";
   const description = `${protocol} :${record.port} ${mountName(record.path)}`;
-  deps.io.err(`error: failed to remove issance's ${description} mapping`);
+  deps.io.err(`error: failed to remove issance ${description} mapping`);
   return false;
 }
 
@@ -340,7 +340,7 @@ export function releaseManagedFrontDoor(deps: FrontDoorDeps): boolean {
     deps.io.err("error: Tailscale root was removed but ownership state could not be removed");
     return false;
   }
-  deps.io.out(`tailscale serve: removed issance's managed ${handlerName(record)} mapping`);
+  deps.io.out(`tailscale serve: removed issance managed ${handlerName(record)} mapping`);
   return true;
 }
 

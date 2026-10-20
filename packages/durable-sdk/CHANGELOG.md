@@ -1,6 +1,6 @@
 # Changelog
 
-`@colliepwa/durable-sdk` has its own version, apart from issance's, and follows [Semantic Versioning](https://semver.org/).
+`@colliepwa/durable-sdk` has its own version, apart from issance, and follows [Semantic Versioning](https://semver.org/).
 Each version names the durable wire version it speaks. Until the package leaves the `experimental` dist-tag, a minor
 release may change the API.
 

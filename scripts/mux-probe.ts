@@ -45,7 +45,7 @@ const endpointVar = muxEndpointVar;
 /**
  * Where this adapter's multiplexer lives.
  *
- * The env var wins, then — for the DEFAULT adapter only — issance's own configured socket path, so
+ * The env var wins, then — for the DEFAULT adapter only — issance own configured socket path, so
  * running the probe on the deployment host needs no arguments at all. Anything else falls to the
  * empty string, which every adapter reads as "your own default target": tmux's default server, and
  * for an adapter that has no such thing, a `reachable()` of false and a loud skip below.

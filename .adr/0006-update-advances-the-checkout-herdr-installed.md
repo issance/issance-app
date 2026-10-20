@@ -31,7 +31,7 @@ re-detach onto it for a managed one, the way Hangar got there.
 **We do not defer to `hangar plugin install` as the refresh path for managed installs.** Reinstall
 doesn't restart the bridge, so it is a two-command dance with a version-skew window in the middle:
 `web/dist` is served off disk at request time, so the new UI goes live against the old bridge process
-the instant the swap lands. The one-command action is the thing issance's banner, README and update
+the instant the swap lands. The one-command action is the thing issance banner, README and update
 notice all point at.
 
 **`--depth 1` only when the checkout is already shallow**, so an update can never truncate the history

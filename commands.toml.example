@@ -1,4 +1,4 @@
-# Your own rows for issance's Agent-commands palette. Copy to your plugin config dir, next to `.env`:
+# Your own rows for issance Agent-commands palette. Copy to your plugin config dir, next to `.env`:
 #   cp commands.toml.example "$(herdr plugin config-dir herdr.issance)/commands.toml"
 #
 # On a pane your rows address, YOUR rows are the whole palette — the shipped catalog is replaced,

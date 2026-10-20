@@ -57,7 +57,7 @@ process.stdout.write(${JSON.stringify(out)});
 const wav = (): SttAudio => ({ audio: encodeWav16(new Float32Array(1600)), mimeType: "audio/wav", filename: "recording.wav" });
 
 describe("the whistle provider", () => {
-  test("spawns issance's own CLI with the fixed argv, and only the two ISSANCE_ variables it sets", async () => {
+  test("spawns issance own CLI with the fixed argv, and only the two ISSANCE_ variables it sets", async () => {
     const provider = createWhistleSttProvider({
       stateDir,
       root: checkout,
@@ -87,7 +87,7 @@ describe("the whistle provider", () => {
     });
   });
 
-  test("an empty transcript and a failing child are issance's own sentences", async () => {
+  test("an empty transcript and a failing child are issance own sentences", async () => {
     const quiet = createWhistleSttProvider({ stateDir, root: checkout, self: fakeCollie(""), tmpRoot });
     await expect(quiet.transcribe(wav())).rejects.toBeInstanceOf(LocalCliEmptyTranscriptError);
     await expect(quiet.transcribe(wav())).rejects.toThrow("the Whistle engine printed no transcript");

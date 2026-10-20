@@ -34,7 +34,7 @@ The instance file wins key by key, never file by file: a key absent from it keep
 value. There is no `config.<instance>.toml`, because on a Hangar-managed install the config dir is
 already per instance, and on a binary install it is `~/.config/issance`. A second issance on one host
 therefore puts its own settings in its own config dir, see
-[docs/deployment.md → Several Collies on one host](deployment.md#several-collies-on-one-host). A
+[docs/deployment.md → Several issance on one host](deployment.md#several-collies-on-one-host). A
 `.issance/` inside a project directory is not read at all.
 
 Three verbs drive the file:
@@ -81,7 +81,7 @@ The [`.env.example`](../.env.example) file lists all options, and so does
 
 It includes `ISSANCE_PORT`, `ISSANCE_SERVE_MODE=http` (for Headscale or `.internal` domains), and
 `ISSANCE_SERVE_PORT` (to expose HTTPS on a port other than `:443`; see
-[docs/deployment.md → Several Collies on one host](deployment.md#several-collies-on-one-host)). The
+[docs/deployment.md → Several issance on one host](deployment.md#several-collies-on-one-host)). The
 CLI reads the serve parameters to configure `tailscale serve`, rather than passing them to the
 bridge.
 
@@ -172,7 +172,7 @@ To verify, open a pane and tap **/**; your rows appear on the first screen.
 row is still an ordinary palette row, so it appears on both surfaces. `bar_label` is the button's
 text and defaults to the command name without its slash.
 
-The actions row is a belt, one full-bleed band above the keyboard. issance's own controls sit
+The actions row is a belt, one full-bleed band above the keyboard. issance own controls sit
 directly on the band: Keys, Type, Quick, Agent and the display gear. The running harness's own
 commands sit beside them, in a section tinted with the harness's brand colour, so you can see at a
 glance which buttons type into the agent. A sideways drag scrolls the belt; nothing is dropped.
@@ -225,7 +225,7 @@ device and applies the next time you open a pane.
 
 To verify, open a pane running Claude Code, Codex, pi or omp; the tinted segment sits at the right
 of the row above the keyboard. Turn that segment off per device in **Settings → Appearance → Harness shortcuts**;
-issance's own controls stay.
+issance own controls stay.
 
 ## Your own key presets
 
@@ -400,7 +400,7 @@ appears.
 On a crew (several machines, one phone-facing lead), each machine reads its own copy of this file —
 a row launches on whichever machine's dashboard or pane you tapped it from, not on the lead.
 
-The **Agent** select on the New page is issance's own list: Claude Code, Codex, opencode, pi, omp,
+The **Agent** select on the New page is issance own list: Claude Code, Codex, opencode, pi, omp,
 Grok, Hermes, Muse and Antigravity. One that is not on the machine's login `PATH` stays in the list,
 disabled, marked "not installed". For another terminal agent, declare a row for it as above: it shows
 in the **Command** select under **Shell**, starts in a pane like any command, and issance shows no status for it.
@@ -570,7 +570,7 @@ Three behaviors to note:
   at build time.
 - **Cold-load delay.** A cold load fetches the file with a brief delay; a cached client paints
   immediately.
-- **Chrome only.** The selected font applies only to issance's chrome. The terminal mirror,
+- **Chrome only.** The selected font applies only to issance chrome. The terminal mirror,
   transcript, and rendered markdown retain their own typography.
 - **Live on next reload.** Changes do not require a restart, taking effect on the next page reload.
   Invalid configurations log errors visible via `journalctl --user -u issance -n 20`.
@@ -750,7 +750,7 @@ nearest folder that does (`~/src`) and lists only the names that start with the 
 So typing in the field narrows the list. A path outside your home shows "Nothing to browse here".
 
 Browse reads folder names only, under your home folder, with the limits of the Files view. It hides
-dot-folders unless you type the dot, never lists `.git` or issance's own state and config folders,
+dot-folders unless you type the dot, never lists `.git` or issance own state and config folders,
 does not follow a link out of home, and shows at most 200 folders. It creates nothing, and it needs
 a paired device, as Files does.
 
@@ -873,7 +873,7 @@ cannot work this out.
 | Multiplexer | What reports the session | Chat works for |
 | --- | --- | --- |
 | Hangar | The matching Hangar integration for that agent, installed once with `hangar integration install <agent>` (for example `claude`, `codex`, `opencode`, `pi`, `omp`, `grok`, `hermes`), then restart the agent | Every agent that has an integration and a session log issance reads |
-| tmux, zellij, Tern (experimental) | issance's [beacon hooks](multiplexers.md#agent-beacons-optional-linux) | Claude Code only, after `issance hooks install claude` |
+| tmux, zellij, Tern (experimental) | issance [beacon hooks](multiplexers.md#agent-beacons-optional-linux) | Claude Code only, after `issance hooks install claude` |
 | tuios | The tuios daemon | The agents the daemon reports |
 
 OpenClaw needs no Hangar integration for Chat. Hangar does not pass an OpenClaw session on, so issance
@@ -965,7 +965,7 @@ See [Which folder, and which repos](changes.md#which-folder-and-which-repos) for
 
 ## Language
 
-issance's interface is available in twelve languages. Configure this under **Settings → Appearance → Language**.
+issance interface is available in twelve languages. Configure this under **Settings → Appearance → Language**.
 
 - English
 - Deutsch

@@ -1281,7 +1281,7 @@ the proxy's health-check aggressiveness are one tuning decision, not two. The ar
 formula for exactly this reason (RFC §6.3; RFC §16, decision 1) — but the proxy half is the
 operator's, so **tune the health check to the arming threshold, not the reverse.**
 
-Nothing in this config is issance's to write. issance publishes no mapping and owns no ingress record
+Nothing in this config is issance to write. issance publishes no mapping and owns no ingress record
 for either backend (ADR 0001, ADR 0013).
 
 ### 14.3 The six-step phone flow, on the bad day
@@ -1593,7 +1593,7 @@ demoting itself buys no safety and costs an outage of that machine's agents.
 #### Consequences
 
 - **Recovery is bounded by the operator's availability, and that is the trade, stated once.** A pack
-  whose lead dies while nobody is looking stays down until somebody looks. issance's answer is to make
+  whose lead dies while nobody is looking stays down until somebody looks. issance answer is to make
   that look cheap — a phone, a page, one button (ADR 0028) — not to remove the human.
 - **A two-machine pack is fully supported and has no witness.** Its takeover rests on the operator's
   own judgement, and the surface says so at the point of decision instead of implying a check it

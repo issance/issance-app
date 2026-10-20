@@ -13,7 +13,7 @@ describe("the embedded installer", () => {
 
   test("is the script it claims to be — a POSIX sh installer steered by ISSANCE_TAG", () => {
     expect(INSTALLER_SH.startsWith("#!/bin/sh\n")).toBe(true);
-    expect(INSTALLER_SH).toContain("issance's installer");
+    expect(INSTALLER_SH).toContain("issance installer");
     expect(INSTALLER_SH).toContain('PIN="${ISSANCE_TAG:-}"');
   });
 });

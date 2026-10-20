@@ -90,7 +90,7 @@ interface Recorded {
   host: string;
   leg: Leg;
   script: string;
-  /** What rode the leg's stdin — the bundle, or issance's own installer on the release route. */
+  /** What rode the leg's stdin — the bundle, or issance own installer on the release route. */
   stdin: string | null;
 }
 
@@ -1135,7 +1135,7 @@ describe("the release route", () => {
     const install = h.calls.find((c) => c.leg === "install")!;
     expect(install.script).toContain(`ISSANCE_TAG='v${VERSION}'`);
     expect(install.script).toContain(`DIR='${MEMBER_INSTALL_ROOT}'`);
-    // The payload IS issance's own installer, out of this binary — never fetched on the far machine.
+    // The payload IS issance own installer, out of this binary — never fetched on the far machine.
     expect(install.stdin?.startsWith("#!/bin/sh\n")).toBe(true);
     // The restart addresses the binary behind `current`, which is the one that will be running.
     expect(h.calls.find((c) => c.leg === "restart")!.script).toContain(MEMBER_CURRENT);

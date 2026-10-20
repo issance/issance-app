@@ -96,7 +96,7 @@ What it costs:
   The NEVER rule exists because `dark:` is backwards in inverted space; this surface is
   never inverted. The comment on `MUSE_MIRROR` says so, and the className tests pin both
   halves.
-- **Light-palette bytes stay dim in issance's dark theme** — the pre-existing 0002
+- **Light-palette bytes stay dim in issance dark theme** — the pre-existing 0002
   limitation class (agent-on-light is dim on dark). Verified terminal-faithful in a
   headless render: dark shows exactly what a dark terminal shows for these bytes, pixel
   for pixel with the old path. Fixing that class (a light ground in dark mode) is out

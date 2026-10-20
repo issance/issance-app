@@ -89,7 +89,7 @@ describe("the repair scope", () => {
     expect(scope("D:\\Projects\\issance-state", ["photo.jpg"], true)).toEqual({ allowed: true });
   });
 
-  test("(c) an existing custom folder that is empty or holds only issance's names", () => {
+  test("(c) an existing custom folder that is empty or holds only issance names", () => {
     expect(scope("D:\\data\\issance", [])).toEqual({ allowed: true });
     const uploads: EntryKind = { kind: "folder", names: [] };
     expect(scope("D:\\data\\issance", ["crew-trust.json", "audit.log.1", "uploads", "acl-backup-2026-1.sddl", ".env"], false, { uploads })).toEqual({
@@ -97,9 +97,9 @@ describe("the repair scope", () => {
     });
   });
 
-  test("any other existing folder is checked only, and the reason names what is not issance's", () => {
+  test("any other existing folder is checked only, and the reason names what is not issance", () => {
     const s = scope("D:\\Projects", ["crew-trust.json", "src", "README.md", "package.json", "x"]);
-    expect(s).toEqual({ allowed: false, why: "it also holds files that are not issance's (src, README.md, package.json and more)" });
+    expect(s).toEqual({ allowed: false, why: "it also holds files that are not issance (src, README.md, package.json and more)" });
     expect(scope("D:\\Projects", null).allowed).toBe(false);
   });
 
@@ -114,7 +114,7 @@ describe("the repair scope", () => {
 });
 
 describe("names", () => {
-  test("a state secret name, in any case and with issance's own suffix, is a state secret; config names are not", () => {
+  test("a state secret name, in any case and with issance own suffix, is a state secret; config names are not", () => {
     for (const name of PRIVATE_ROOTS.find((r) => r.id === "state")!.secrets) {
       expect(isStateSecretName(name)).toBe(true);
       expect(isStateSecretName(name.toUpperCase())).toBe(true);
@@ -148,7 +148,7 @@ describe("names", () => {
     }
   });
 
-  test("only issance's own suffixes follow a issance name: a rotation and its temporary files", () => {
+  test("only issance own suffixes follow a issance name: a rotation and its temporary files", () => {
     for (const name of ["audit.log.1", "crew-trust.json.tmp", "issance-processes.4242.tmp", "paired-devices.json.4242.7.tmp", "stt.json.4242.7.tmp", ".env.issance-tmp", ".env.push-keys.tmp"]) {
       expect(isCollieName(name)).toBe(true);
     }
@@ -157,7 +157,7 @@ describe("names", () => {
     }
   });
 
-  test("a folder is issance's only by its name AND its contents, one level deep; a link never is", () => {
+  test("a folder is issance only by its name AND its contents, one level deep; a link never is", () => {
     const at = (kinds: Record<string, EntryKind>) => (rel: readonly string[]) => kinds[rel.join("/")] ?? null;
     const folder = (names: string[]): EntryKind => ({ kind: "folder", names });
     const file: EntryKind = { kind: "file" };
@@ -179,7 +179,7 @@ describe("names", () => {
     expect(isCollieEntry("whistle", at({ whistle: folder(["whistle.cact", "notes.txt"]), "whistle/whistle.cact": file, "whistle/notes.txt": file }))).toBe(false);
     expect(isCollieEntry("whistle", at({ whistle: folder(["whistle.cact.bak"]), "whistle/whistle.cact.bak": file }))).toBe(false);
     expect(isCollieEntry("whistle", at({ whistle: folder(["whistle.cact"]), "whistle/whistle.cact": folder([]) }))).toBe(false);
-    // The old home, `stt/` holding the `whistle` subfolder, is not issance's: one level too deep.
+    // The old home, `stt/` holding the `whistle` subfolder, is not issance: one level too deep.
     expect(isCollieEntry("stt", at({ stt: folder(["whistle"]), "stt/whistle": folder(["whistle.cact"]) }))).toBe(false);
     // The operator's own things under one of those names.
     expect(isCollieEntry("fonts", at({ fonts: folder(["Arial.ttf"]), "fonts/Arial.ttf": file }))).toBe(false);
@@ -190,7 +190,7 @@ describe("names", () => {
     expect(isCollieEntry("uploads", at({ uploads: { kind: "folder", names: null } }))).toBe(false);
     expect(isCollieEntry("audit.log", at({ "audit.log": folder([]) }))).toBe(false);
     expect(isCollieEntry("uploads", at({ uploads: file }))).toBe(false);
-    // A junction named like issance's folder, and a link named like issance's file.
+    // A junction named like issance folder, and a link named like issance file.
     expect(isCollieEntry("uploads", at({ uploads: { kind: "link" } }))).toBe(false);
     expect(isCollieEntry(".env", at({ ".env": { kind: "link" } }))).toBe(false);
     // Unreadable.
@@ -199,10 +199,10 @@ describe("names", () => {
 
   test("rule (c) names the stranger: a `.env.production`, a `fonts` of photos, a junction", () => {
     const shared = "D:\\work\\issance-cfg";
-    expect(scope(shared, [".env", ".env.production"])).toEqual({ allowed: false, why: "it also holds files that are not issance's (.env.production)" });
+    expect(scope(shared, [".env", ".env.production"])).toEqual({ allowed: false, why: "it also holds files that are not issance (.env.production)" });
     expect(scope(shared, [".env", "fonts"], false, { fonts: { kind: "folder", names: ["me.jpg"] } })).toEqual({
       allowed: false,
-      why: "it also holds files that are not issance's (fonts)",
+      why: "it also holds files that are not issance (fonts)",
     });
     expect(scope(shared, [".env", "uploads"], false, { uploads: { kind: "link" } }).allowed).toBe(false);
     expect(scope(shared, [".env", "audit.log.1", "fonts"], false, { fonts: { kind: "folder", names: [] } })).toEqual({ allowed: true });

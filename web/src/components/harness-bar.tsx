@@ -28,10 +28,10 @@ import { cn } from "@/lib/utils";
 // rather than three taps down inside the Agent palette.
 //
 // IT IS THE ONE DRAWN SECTION OF THE BELT. These buttons do not do what their neighbours do: a
-// general action opens one of issance's own docks, and one of these types into somebody else's
+// general action opens one of issance own docks, and one of these types into somebody else's
 // program. So this run sits in a SECTION of the band (BELT_SECTION) — square corners, spanning the
 // belt's full inner height, tinted with the harness's brand and drawing its icons in that colour.
-// issance's own controls stand on the belt's bare ground beside it, so the tint boundary alone is
+// issance own controls stand on the belt's bare ground beside it, so the tint boundary alone is
 // what tells the two apart. No divider, and never a thick left border.
 //
 // THE BLACK-BRANDED FALLBACK IS THE ONE CASE THAT NEEDS A HAIRLINE, AND IT IS MEASURED. A brand
@@ -45,7 +45,7 @@ import { cn } from "@/lib/utils";
 //
 // IT OPENS WITH THE HARNESS'S OWN MARK. The first thing inside the section is the agent's icon, and
 // it is decoration: no hit box, no name in the accessibility tree, which already names the group.
-// The tint alone said "not issance's"; the mark says WHOSE, at a glance and before a word is read.
+// The tint alone said "not issance"; the mark says WHOSE, at a glance and before a word is read.
 // Altan asked for exactly that after the two rows were merged into one — the row he tested "lacks
 // some structure", five identical glyphs and then a coloured blob with no owner on it.
 //

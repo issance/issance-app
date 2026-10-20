@@ -6,7 +6,7 @@
 - **Amends in scope:** [ADR 0029](./0029-speech-to-text-is-a-provider-seam-issance-owns.md), whose
   *What would justify revisiting* names this case: "an on-device transcription path good enough on
   a phone". The provider seam, the lead-only rule and the hands-free rule all stand. Two things
-  change: the seam gains a fourth provider, `whistle`, which is issance's own code and not an
+  change: the seam gains a fourth provider, `whistle`, which is issance own code and not an
   operator's command, and **the setup-is-a-CLI-act rule gains one named exception**: Whistle may be
   set up from Settings, for the reasons in Decision 3. On acceptance, 0029 gains the `Amended in
   scope by 0096` pointer.
@@ -68,7 +68,7 @@ NixOS included.
 
 Four things make this harder than "add a library":
 
-1. **The engine is third-party code running in issance's origin**, and on the host as the bridge
+1. **The engine is third-party code running in issance origin**, and on the host as the bridge
    user. The origin holds the pairing token and can type into real terminals (`CLAUDE.md`: treat a
    issance as remote shell access). A wasm binary cannot be reviewed by reading it the way the
    vendored lint plugin can.
@@ -85,7 +85,7 @@ Four things make this harder than "add a library":
 **A person may choose, per device, to turn speech into text on the phone or on the host. Both run
 the same engine code, vendored at a pinned version inside issance. On the phone it runs only in a
 dedicated worker whose own response carries the one CSP that allows wasm; on the host it runs in a
-short-lived child of issance's own binary. The model reaches the host by one deliberate act, a tap in
+short-lived child of issance own binary. The model reaches the host by one deliberate act, a tap in
 Settings or `issance stt whistle`, and a phone by its own tap, always from the host, never from a third
 party and never by itself. The transcript lands where every transcript lands.**
 
@@ -122,7 +122,7 @@ party and never by itself. The transcript lands where every transcript lands.**
 3. **Setting up Whistle from Settings is allowed, and is the one exception to "setup is a CLI act".**
    ADR 0029 kept setup in the terminal because setup can store a credential, name a command the
    bridge will spawn, or open a path that carries room audio off the host. Whistle does none of
-   those: it has no credential; its child is issance's own binary with arguments issance wrote; and its
+   those: it has no credential; its child is issance own binary with arguments issance wrote; and its
    audio stays on the host. What a setup tap adds to the bridge is one outbound download to a fixed,
    hash-pinned address and 17 MB at a fixed path. A stolen write token already types into terminals,
    runs one-off commands (ADR 0095) and starts an update that fetches and builds code, so the tap
@@ -132,8 +132,8 @@ party and never by itself. The transcript lands where every transcript lands.**
    beside the update check.** It does not claim "no outbound call" any more, because that was
    already not literal.
 
-4. **The host engine is a provider of issance's own: `whistle`.** It runs the vendored wasm in a child
-   of issance's binary, one per dictation, through a hidden verb, `issance _whistle-transcribe
+4. **The host engine is a provider of issance own: `whistle`.** It runs the vendored wasm in a child
+   of issance binary, one per dictation, through a hidden verb, `issance _whistle-transcribe
    <recording>`. The child reads the glue and the wasm from the served `web/dist/stt/needle-<v>/`
    and the model from the state dir, checks all three against the pins in its own source before it
    compiles anything, transcribes, and prints the text. The provider reuses the `local-cli`
@@ -161,8 +161,8 @@ party and never by itself. The transcript lands where every transcript lands.**
 
 5. **The model is never in a release artifact, and issance publishes no copy.** Altan's call,
    2026-10-11: 17 MB is large for an install that may never use it, and issance does not know its
-   operators' links or disks. No copy goes on issance's release page either. The engine code (about
-   1 MB) does ship in every release, because both engines may load code from issance's own build and
+   operators' links or disks. No copy goes on issance release page either. The engine code (about
+   1 MB) does ship in every release, because both engines may load code from issance own build and
    nowhere else.
 
 6. **The engine code is vendored, pinned and read.** `web/public/stt/needle-<version>/` holds
@@ -179,7 +179,7 @@ party and never by itself. The transcript lands where every transcript lands.**
    readable names is recorded beside it.
 
 7. **The phone gets everything from the host, nothing from a third party.** No CDN, no Hugging Face,
-   no fallback URL. The engine comes from issance's own static files, the model from the bridge. The
+   no fallback URL. The engine comes from issance own static files, the model from the bridge. The
    reasons, in the order they carry weight:
    - **The phone talks to one origin.** Hugging Face never sees a phone or its address (ADR 0034).
    - **One internet download per host**, not one per phone over whatever link that phone is on.
@@ -209,7 +209,7 @@ party and never by itself. The transcript lands where every transcript lands.**
    `blob:`, `file:` or opaque). A worker made from a `blob:` URL inherits the document's policy, so the
    worker is never a blob.
    - **The worker has no network.** `default-src 'none'` covers `connect-src`, so the glue cannot
-     fetch, XHR or open a socket, and `importScripts` reaches only issance's origin. The page fetches
+     fetch, XHR or open a socket, and `importScripts` reaches only issance origin. The page fetches
      the wasm and the model, checks both hashes, and transfers the bytes in. The glue's own `fetch`
      of the wasm never runs, because `wasmBinary` is always passed.
    - **The worker cannot read the pairing token**, which lives in `localStorage`, which workers do
@@ -262,7 +262,7 @@ party and never by itself. The transcript lands where every transcript lands.**
 
 ## Consequences
 
-- **Third-party code runs in issance's origin and as the bridge user.** Its reach is bounded, not
+- **Third-party code runs in issance origin and as the bridge user.** Its reach is bounded, not
   removed. On the phone the worker has no network, no DOM, no token and no way to load code from
   elsewhere; it can still read and write this origin's IndexedDB (`issance-store` holds recent session
   text, ADR 0087) and Cache Storage. On the host the wasm runs in a child with none of the bridge's `ISSANCE_*`

@@ -77,7 +77,7 @@ function written(d: Deps): SttDocument {
   const text = d.files.entries.get(CONFIG_PATH)?.text;
   expect(text).toBeString();
   // SAFETY: `text` is what `cmdSttSetup` serialised one call ago with `JSON.stringify` over exactly
-  // this shape, and the assertion above proves the file is there — this is issance's own output being
+  // this shape, and the assertion above proves the file is there — this is issance own output being
   // read back, not an external payload.
   return JSON.parse(text!) as SttDocument;
 }

@@ -2,7 +2,7 @@
 
 The wire contract for **crew federation**: several machines each running a full issance, one of them
 holding the phone-facing front door. Sibling to [`HERDR_API.md`](./HERDR_API.md), which documents the
-contract *below* issance (the Hangar socket); this documents the contract *between* Collies.
+contract *below* issance (the Hangar socket); this documents the contract *between* issance.
 
 **Provenance convention**, mirroring `HERDR_API.md`:
 
@@ -1377,7 +1377,7 @@ contribution changes, and it says nothing about whether a given peer's snapshot 
 
 **v1 is polling. The lead polls each peer's `GET /crew/v1/snapshot` on its own adaptive interval** —
 the cadence it already runs (`ISSANCE_POLL_MS` 1500 / `ISSANCE_POLL_IDLE_MS` 12000,
-`bridge/config.ts:212-213`; `ARCHITECTURE.md` §5). There is no events endpoint on issance's HTTP API
+`bridge/config.ts:212-213`; `ARCHITECTURE.md` §5). There is no events endpoint on issance HTTP API
 today and v1 does not add one; `events.subscribe` is a *Hangar socket* method (`HERDR_API.md`) and
 never crosses a crew link.
 
@@ -1607,7 +1607,7 @@ and it backs off instead of being retried on the poll (§7, §10.2).
 
 ## 11. The solo zero-tax contract
 
-**With zero peers enrolled, issance's observable behaviour is byte-for-byte what it is today.** This is
+**With zero peers enrolled, issance observable behaviour is byte-for-byte what it is today.** This is
 a gate, not an aspiration — M2/05 lands the characterization tests that enforce it before any
 federation code exists to break it.
 
@@ -2103,7 +2103,7 @@ section before running it; its costs are not summarised here.
 - **A multiplexer's own machine linking.** Whatever a multiplexer can reach on another box is
   **not a crew transport**, and its adapter reports only panes whose terminal runs on its own machine.
   This is the same refusal as the overlay-network one, one layer down: the map of machines is
-  issance's, a crew member is a full issance, and a pane's journal, uploads and audit log sit on the
+  issance, a crew member is a full issance, and a pane's journal, uploads and audit log sit on the
   machine that runs it
   ([ADR 0036](./.adr/0036-the-map-of-machines-is-collies-a-mux-reports-one-machine.md)). Such a
   multiplexer may offer the operator a list of candidate hosts for `crew add`, and nothing else.

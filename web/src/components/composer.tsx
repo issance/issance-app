@@ -1924,7 +1924,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             `agent-chat.tsx`, because the swipe handle stands on that same ground and the boundary
             against the terminal is drawn once, above everything the thumb operates. */}
         {/* ── THE ACTIONS ROW ──────────────────────────────────────────────────────────────────
-            One row, two segments: issance's own controls, then the running harness's own commands in
+            One row, two segments: issance own controls, then the running harness's own commands in
             the harness's own colour. It replaced the Controls row and the separate harness bar,
             which were two rows of a phone's glass answering one question. The row itself is
             actions-row.tsx; everything below is only what each action DOES.

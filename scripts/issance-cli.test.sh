@@ -845,7 +845,7 @@ assert_contains "$STDERR" "unowned root mount on :8787"
 # tracking is in exactly this state, so refusing here would brick start/restart/update on upgrade.
 status_is "$ISSANCE_HTTP_ROOT"
 rm -f "$RECORD"
-fd ISSANCE_SERVE_MODE=http "$BIN" serve || fail "serve refused to adopt issance's own root mount"
+fd ISSANCE_SERVE_MODE=http "$BIN" serve || fail "serve refused to adopt issance own root mount"
 assert_contains "$STDOUT" "adopting the existing issance root mount on :8787"
 assert_eq "$(cat "$RECORD")" "http:8787|host.example:8787|http://127.0.0.1:8787"
 
@@ -853,7 +853,7 @@ assert_eq "$(cat "$RECORD")" "http:8787|host.example:8787|http://127.0.0.1:8787"
 fd "$BIN" unserve || fail "\`issance unserve\` failed on a mapping we own"
 assert_contains "$(cat "$FD_CALLS")" "tailscale serve --http=8787 --set-path=/ off"
 [ ! -e "$RECORD" ] || fail "teardown left the ownership record behind"
-assert_contains "$STDOUT" "removed issance's managed http:8787 mapping"
+assert_contains "$STDOUT" "removed issance managed http:8787 mapping"
 
 # No record at all: success, and nothing is touched.
 fd "$BIN" unserve || fail "unserve failed with no record"
@@ -903,7 +903,7 @@ esac
 
 # ── uninstall ────────────────────────────────────────────────────────────────
 # The inverse of `start`, and no more: stop + disable, remove the service definition, remove
-# issance's own mapping, drop the pidfile — and KEEP .env and the checkout.
+# issance own mapping, drop the pidfile — and KEEP .env and the checkout.
 FD_UNIT="${FD_HOME}/.config/systemd/user/issance.service"
 mkdir -p "${FD_HOME}/.config/systemd/user"
 printf '[Unit]\n' > "$FD_UNIT"

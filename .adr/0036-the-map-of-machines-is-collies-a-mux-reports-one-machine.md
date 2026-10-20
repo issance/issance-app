@@ -1,4 +1,4 @@
-# 0036 — The map of machines is issance's, a mux reports one machine
+# 0036 — The map of machines is issance, a mux reports one machine
 
 Status: **Accepted** (2026-09-08)
 
@@ -12,7 +12,7 @@ must never grow a host)
 
 issance has two axes and has had them since M2. The **host axis** is the pack: the lead's list of
 machines, each one a full issance dialled over mTLS, merged into one view for the phone. The **pane
-axis** is the multiplexer port: one adapter, one machine, panes and spaces in issance's own
+axis** is the multiplexer port: one adapter, one machine, panes and spaces in issance own
 vocabulary. ADR 0011 put the host axis above the seam. ADR 0022 put the pane axis below it and said
 in as many words that the port takes no host and may not grow one.
 
@@ -59,7 +59,7 @@ None of this is pressing. That is why the rule is written now, while nothing is 
 
 ## Decision
 
-**The map of machines is issance's. A multiplexer adapter reports one machine, and that machine is
+**The map of machines is issance. A multiplexer adapter reports one machine, and that machine is
 this one.**
 
 - **Two axes, never mixed.** The host axis lives in the pack. The pane axis lives in the adapter. A

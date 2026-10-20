@@ -223,7 +223,7 @@ function collapseVersionDir(path: string): string {
  *
  * And, since two instances can run out of ONE checkout, plus the instance marker `bridgeCommand`
  * puts there. It is checked in both directions: a suffixed instance demands its own `--instance
- * <name>`, and the unsuffixed one demands the absence of any marker — otherwise the stable issance's
+ * <name>`, and the unsuffixed one demands the absence of any marker — otherwise the stable issance
  * `start` would look at v1's pidfile entry, recognise the shared binary path, and kill it.
  */
 export function isOurBridge(
@@ -626,7 +626,7 @@ const TASK_PROCESS_NAMES = ["issance.exe", "bun.exe", "powershell.exe"] as const
 /** How long `stop` lets a just-killed launcher's last spawn settle before its final sweep. */
 export const STOP_SETTLE_MS = 500;
 
-/** A launcher of this install, issance's own or the community script's. */
+/** A launcher of this install, issance own or the community script's. */
 const isOurLauncher = (deps: LifecycleDeps, command: string): boolean =>
   isTaskLauncher(command, 2, deps.ctx.root, deps.ctx.instance, deps.host) ||
   isTaskLauncher(command, 1, deps.ctx.root, deps.ctx.instance, deps.host);
@@ -731,14 +731,14 @@ async function startTaskScheduler(deps: LifecycleDeps): Promise<number> {
   stopPidfileProcess(deps);
   // A launcher of ours that is already running stays: `/Run` on a running task does nothing, so
   // `start` is idempotent, as `systemctl enable --now` is. The community script's launcher is
-  // replaced now, so from here on the record and both processes are issance's own.
+  // replaced now, so from here on the record and both processes are issance own.
   const { path, record } = readTaskRecord(deps);
   if (record?.format === 1) {
     deps.exec.capture("schtasks", ["/End", "/TN", name]);
     const stopped = await stopTaskProcesses(deps, record);
     if (stopped.kind !== "done") return stopFailed(deps, "start", stopped);
     // Said only when there was a launcher to replace: a record left by a reboot names dead pids.
-    if (stopped.launcherAlive) deps.io.out("replaced the contrib\\windows\\issance-ctl.ps1 launcher with issance's own");
+    if (stopped.launcherAlive) deps.io.out("replaced the contrib\\windows\\issance-ctl.ps1 launcher with issance own");
     deps.files.remove(path);
   }
   const r = deps.exec.capture("schtasks", ["/Run", "/TN", name]);
@@ -813,7 +813,7 @@ function tableUnreadable(deps: LifecycleDeps, why: string): number {
  * `null` when there is no live launcher to lean on (no record, a stale one, a reboot without a
  * logon): the caller then takes `stop` + `start`, which registers the task and starts it. When the
  * launcher is the community script's, the task is registered again first, so its next logon runs
- * issance's launcher and not a script this release deleted; the running loop keeps the bridge up.
+ * issance launcher and not a script this release deleted; the running loop keeps the bridge up.
  */
 async function restartTaskScheduler(deps: LifecycleDeps): Promise<number | null> {
   const { path, raw, record } = readTaskRecord(deps);
@@ -831,7 +831,7 @@ async function restartTaskScheduler(deps: LifecycleDeps): Promise<number | null>
   if (launcher.kind === "unknown") return tableUnreadable(deps, launcher.why);
   if (launcher.kind === "gone" || !isTaskLauncher(launcher.command, record.format, root, instance, deps.host)) return null;
   if (record.format === 1 && registerTask(deps)) {
-    deps.io.out("the task now runs issance's own launcher from the next logon; until then the old one keeps the bridge up");
+    deps.io.out("the task now runs issance own launcher from the next logon; until then the old one keeps the bridge up");
   } else if (record.format !== 1) {
     renewTaskPriority(deps);
   }
@@ -926,7 +926,7 @@ function taskBridgeSilent(deps: LifecycleDeps, waitS: number): number {
 
 /**
  * The task's state as Task Scheduler names it (`Ready`, `Running`, `Disabled`), and whose launcher
- * runs: issance's, the community script's loop still alive from before `issance start`, or a task that
+ * runs: issance, the community script's loop still alive from before `issance start`, or a task that
  * still points at the old script, whose file this release deleted.
  */
 function describeTaskScheduler(deps: LifecycleDeps): string {
@@ -947,7 +947,7 @@ function describeTaskScheduler(deps: LifecycleDeps): string {
     case "issance":
       return readTaskRecord(deps).record?.format === 1
         ? `${status} · launcher: the legacy issance-ctl.ps1 loop, until \`issance start\``
-        : `${status} · launcher: issance's`;
+        : `${status} · launcher: issance`;
   }
 }
 
@@ -1114,7 +1114,7 @@ export async function cmdStop(deps: LifecycleDeps, verb: StopVerb = "stop"): Pro
 
 /**
  * The inverse of `start`, and NO MORE (the pre-shim issance-ctl.sh): stop + disable the service,
- * remove the service definition, remove issance's own tailscale serve mapping, drop the pidfile.
+ * remove the service definition, remove issance own tailscale serve mapping, drop the pidfile.
  *
  * It deliberately keeps `${CONFIG_DIR}/.env` and the checkout — an operator uninstalling the
  * service has not asked to lose their config, and the closing summary says so. To remove the plugin
@@ -1132,7 +1132,7 @@ export async function cmdUninstall(deps: LifecycleDeps): Promise<number> {
   serviceBackend(deps).remove(deps);
   deps.files.remove(pidFilePath(deps.ctx.configDir, deps.ctx.instance));
   deps.io.out(
-    "✓ uninstalled: service stopped & disabled, service definition removed, issance's tailscale serve mapping removed",
+    "✓ uninstalled: service stopped & disabled, service definition removed, issance tailscale serve mapping removed",
   );
   deps.io.out(
     `  kept: ${join(deps.ctx.configDir, ".env")} and the checkout — delete those to remove every trace`,

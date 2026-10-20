@@ -2740,7 +2740,7 @@ describe("isReservedAuthPath — the namespace a fronting proxy owns", () => {
     expect(isReservedAuthPath("/auth/oidc/callback")).toBe(true);
   });
 
-  test("leaves issance's own routes alone, including a mere prefix match", () => {
+  test("leaves issance own routes alone, including a mere prefix match", () => {
     for (const path of ["/", "/settings", "/pane/w1:p1", "/authors", "/api/snapshot"]) {
       expect(isReservedAuthPath(path)).toBe(false);
     }

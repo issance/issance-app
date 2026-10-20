@@ -62,13 +62,13 @@ by then the translation would have to be bug-compatible with a socket contract t
 engineered in `HERDR_API.md`.
 
 This is not a bet on #67. The clause costs nothing today: the lead is calling *some* API over the
-link either way, and issance's own HTTP API is the one the phone already exercises on every request,
+link either way, and issance own HTTP API is the one the phone already exercises on every request,
 so it is the best-tested surface in the product. The seam is free; it is only free *if it is written
 down before the first line of federation code*.
 
 ### The socket is a bigger gun than the API
 
-issance's HTTP API is a deliberately narrow, gated, audited projection of the Hangar socket. A
+issance HTTP API is a deliberately narrow, gated, audited projection of the Hangar socket. A
 forwarded socket hands the lead the **whole** RPC surface of a second machine with no gate chain in
 front of it and no audit line behind it. "The lead can do to a peer exactly what a phone can do to
 that peer" is a security property worth having, and it is only available if the lead speaks the API.
@@ -82,15 +82,15 @@ lead consumes a peer's *issance* HTTP API, and never a peer's Hangar socket.**
   directory, its own audit log, its own state. It is responsible for whatever it fronts; the lead
   does not know or care.
 - **No Hangar method name, type, status value or error code crosses a pack link.** The wire vocabulary
-  is issance's own domain model (`bridge/types.ts`), which is what makes a non-Hangar peer invisible to
+  is issance own domain model (`bridge/types.ts`), which is what makes a non-Hangar peer invisible to
   the lead, to the phone, and to the protocol. The contract is
   [`PACK_PROTOCOL.md`](../CREW_PROTOCOL.md); this ADR is the reason it may not mention Hangar.
 - **The Hangar socket is never dialled across a machine boundary.** `ISSANCE_HERDR_DIAL` stays a
   *dialer selector* for a local endpoint and never grows a `host:port` form. If someone needs the
   Windows branch exercised, that is what `net` is for; if someone needs a remote pane, that is what a
   pack is for.
-- **A capability that exists in Hangar but not in issance's own HTTP API is unreachable across a pack
-  link** until issance's API grows it. This is a feature: it keeps the API honest and makes every new
+- **A capability that exists in Hangar but not in issance own HTTP API is unreachable across a pack
+  link** until issance API grows it. This is a feature: it keeps the API honest and makes every new
   federated capability a deliberate, gated, audited addition rather than a socket passthrough.
 
 **This ADR does not decide graduation.** It does not commit issance to tmux, to standing alone from
@@ -107,7 +107,7 @@ blast-radius rule are independent of it.
 - **The lead cannot exceed the phone's reach.** Anything the lead can do to a peer, a phone plugged
   directly into that peer could also do. That bound is the point, and it is only true while this ADR
   holds.
-- **Pressure lands on issance's API instead of on the socket.** When a federated feature needs
+- **Pressure lands on issance API instead of on the socket.** When a federated feature needs
   something the API doesn't expose, the fix is a route on the peer — reviewed, gated, audited — not a
   new method name on the wire. Slower, and correct.
 - **This is a promise, not a verified property.** Nothing in v1 exercises the seam with a non-Hangar
@@ -118,7 +118,7 @@ blast-radius rule are independent of it.
      `session.snapshot` shapes). They are opaque labels from the lead's side.
   2. **Pane identity.** Assuming a peer's pane id is a Hangar pane id — re-derivable, session-scoped,
      numeric, or stable across a peer restart in the way Hangar's happen to be.
-  3. **Status vocabulary.** Pinning the wire to Hangar's agent-status values rather than to issance's
+  3. **Status vocabulary.** Pinning the wire to Hangar's agent-status values rather than to issance
      own `AgentStatus` domain type.
   4. **Journal assumed present.** `/history` may legitimately not exist on a peer. The local
      precedent is already the right shape: `bridge/journal/registry.ts` maps a pane's harness to an

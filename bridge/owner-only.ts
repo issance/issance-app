@@ -16,7 +16,7 @@
 // only `loose` can make the config loader withhold a secret.
 //
 // THE REPAIR runs in the bridge process at start and nowhere else (a CLI command only verifies and
-// warns), only on a folder `acl-policy.ts` calls issance's own, and never with `/T`. It changes the
+// warns), only on a folder `acl-policy.ts` calls issance own, and never with `/T`. It changes the
 // folder in ONE `icacls` call, grants first and the end of inheritance after (so the list is never
 // empty for a moment: proven on the VM with a reader in another process, 0 failed reads), then
 // resets to "inherit" only the entries a second check still finds loose, after a fresh `lstat` of
@@ -180,7 +180,7 @@ const notChecked = (reason: string): Reading => ({ verdict: { state: "not-checke
  * Read `path` with `icacls /save` (with `/T`, everything below it too) and judge it.
  *
  * `/T` FOLLOWS a junction (VM, 2026-10-02: `state\link\shared.txt` was listed through a junction to
- * a folder outside). An entry that is a link, or sits below one, is not issance's: it is left out,
+ * a folder outside). An entry that is a link, or sits below one, is not issance: it is left out,
  * so the check never blames the folder for it and the repair never touches it.
  */
 function readPath(path: string, tree: boolean, host: Host, deps: OwnerOnlyDeps): Reading {
@@ -545,7 +545,7 @@ const toldNotChecked = new Set<string>();
  * The file's own list decides. Not checked: no claim, said once, and the secret is used. Loose and
  * `repair` off (every CLI command): a warning that says how to fix it, and `ok: false`, so the
  * loader withholds a `config.toml` secret exactly as POSIX does for a file it could not tighten.
- * Loose and `repair` on (the bridge at start), when the file's folder is issance's own and the file is
+ * Loose and `repair` on (the bridge at start), when the file's folder is issance own and the file is
  * neither a link nor a hard link ({@link safeToReset}): the old list saved, the file changed in one
  * grant-first call, and "private" said only when a second read passes.
  */

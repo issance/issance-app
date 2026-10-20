@@ -27,7 +27,7 @@ not disabled. Four providers:
 | **`openai-compatible`** | Any endpoint that speaks `POST /audio/transcriptions` — the public OpenAI API, a cloud Whisper clone, or **a local engine on the same machine, which is the zero-egress choice** ([below](#zero-egress--point-it-at-your-own-engine)). |
 | **`codex`** | Borrows the `codex` binary you already trust for a short-lived token. No new account and no new key, but a **private, unsupported** endpoint that carries a consent step: you type `yes` in the terminal, or tap **I accept** in Settings ([below](#the-codex-provider--what-you-are-accepting)). |
 | **`local-cli`** | Runs a transcription command already on the host, such as `whisper-cli` or `muesli-cli`, once per recording, and reads the transcript from its stdout. No HTTP server needed ([below](#run-your-own-command-the-local-cli-provider)). |
-| **`whistle`** | issance's own engine, [Whistle](#whistle-speech-to-text-on-your-phone-or-your-host). No key and no command to configure. A recording of up to 4 minutes goes to it as a WAV file, and the audio stays on the host. A phone can also run Whistle on itself, with no upload. |
+| **`whistle`** | issance own engine, [Whistle](#whistle-speech-to-text-on-your-phone-or-your-host). No key and no command to configure. A recording of up to 4 minutes goes to it as a WAV file, and the audio stays on the host. A phone can also run Whistle on itself, with no upload. |
 
 Setup is a CLI act for the reason [pairing](security.md#pair-a-device--the-write-credential) is one: this
 surface accepts a credential, so it belongs on the host's keyboard. There is no web form for a key, an
@@ -56,7 +56,7 @@ The API base, INCLUDING its version prefix — the provider appends /audio/trans
   local  http://127.0.0.1:8080/v1     (whisper.cpp / parakeet.cpp — nothing leaves the host)
   cloud  https://api.openai.com/v1    (room audio leaves this machine)
 base URL: http://127.0.0.1:8080/v1
-The model the endpoint understands. Empty takes issance's default, gpt-transcribe.
+The model the endpoint understands. Empty takes issance default, gpt-transcribe.
 model [gpt-transcribe]: whisper-1
 API key [none]:
 The language you speak, as a two-letter ISO-639-1 code — en, de, tr, ja.
@@ -124,7 +124,7 @@ Whistle can run in two places. You choose per phone.
 
 | Engine | Where the words are made | Pick it when |
 | --- | --- | --- |
-| **Host** | On the computer that runs issance, in a short-lived child process of issance's own binary. | The phone is weak or old. A recording goes up as a WAV file, and a clip takes a second or two. |
+| **Host** | On the computer that runs issance, in a short-lived child process of issance own binary. | The phone is weak or old. A recording goes up as a WAV file, and a clip takes a second or two. |
 | **This phone** | In the phone's browser, in a worker. | The phone is recent. There is no upload, so the audio never leaves the phone, and it works offline once the model is on the phone. |
 
 Both engines read the same model. The host keeps one copy. A phone that wants to run Whistle itself
@@ -218,7 +218,7 @@ The engine is live at once, with no restart. Check it with `issance stt test`.
 address, follows the redirect to its CDN (at most five, HTTPS only, and never to a local or private
 address), and keeps the file only when its sha256 equals a hash that this release carries. A mismatch deletes the file and reports both hashes. The download is capped at
 32 MiB and has a 10-minute deadline. The file sits in the `whistle` folder of the state folder. The
-engine code (about 1 MB) is part of every issance release and comes from issance's own files.
+engine code (about 1 MB) is part of every issance release and comes from issance own files.
 
 **Nothing downloads on its own.** Not on install, not on an update, not when you pick an engine. The
 model arrives when a person taps **Download to host**, **Set up**, or runs `issance stt whistle`. A

@@ -281,7 +281,7 @@ describe("a transport that dies during the call", () => {
 
 // WHICH SESSION THE OPERATOR IS LOOKING AT — a question only tmux poses this way, because only tmux
 // lets this adapter attach clients of its own. Conformance asks whether focus is reported and whether
-// `setFocus` moves it; it has no vocabulary for "and issance's own control client is not a person",
+// `setFocus` moves it; it has no vocabulary for "and issance own control client is not a person",
 // which is the mistake the old activity-only heuristic was written around rather than fixed.
 describe("focus follows a real terminal, not this adapter's own watch", () => {
   test("a session with a non-control client attached is the focused space", async () => {
@@ -452,7 +452,7 @@ describe("a blank cwd never becomes a `-c` flag", () => {
 
 
 // tmux 3.7 REFUSES `send-keys` THAT LANDS ON A READ-ONLY CLIENT, and the client it picks is the most
-// recently active one of the pane's session, which is issance's own watcher (always `read-only`).
+// recently active one of the pane's session, which is issance own watcher (always `read-only`).
 // Lab, tmux 3.7c: `send-keys -t %0 -- a` with the watcher attached exits 1 with "client is
 // read-only" and sends nothing, while paste-buffer still works. Conformance cannot express it: the
 // world contract has no read-only client, and no other multiplexer has this rule.

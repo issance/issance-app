@@ -44,7 +44,7 @@ requirement of the product, not a habit, and framework mode takes the seam each 
    so the instance keeps the location across that remount and loaders re-run fresh. Framework mode
    owns the entry (`HydratedRouter`); the trick has no place to live.
 
-4. **The service worker is issance's own `sw.ts`**, built through `vite-plugin-pwa` in `injectManifest`
+4. **The service worker is issance own `sw.ts`**, built through `vite-plugin-pwa` in `injectManifest`
    mode with `createHandlerBoundToURL` and `NavigationRoute`. The PWA plugin has a separate integration
    for framework mode. That is new ground for the one file that decides whether a phone opens the app
    at all when the bridge is down.

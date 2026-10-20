@@ -35,7 +35,7 @@ breath, not because either needed the other.
 
 ## Decision
 
-**oxlint is issance's linter — the only one — and `bun run lint` is how you run it.** All 15
+**oxlint is issance linter — the only one — and `bun run lint` is how you run it.** All 15
 anti-slop rules run at `error`, alongside oxlint's own `correctness` / `suspicious` / `perf`
 catalog and the typescript, react, import, promise, node, unicorn, oxc and jsx-a11y plugins, in one
 pass.

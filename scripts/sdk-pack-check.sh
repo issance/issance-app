@@ -6,7 +6,7 @@
 #      README.md, CHANGELOG.md and LICENSE, and nothing else (no src/, no tsconfig, no test).
 #   2. `npm pack` into a temp folder, and `npm install <tarball>` into a fresh project there. The Pi peers are
 #      optional, so nothing else is installed.
-#   3. A program in that project imports `@colliepwa/durable-sdk`, raises one requireApproval card, and issance's own
+#   3. A program in that project imports `@colliepwa/durable-sdk`, raises one requireApproval card, and issance own
 #      adapter answers Allow; the receipt must say `decidedBy: "phone"`. Once under Node, once under Bun
 #      (scripts/sdk-pack-check.ts).
 #

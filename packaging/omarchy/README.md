@@ -36,7 +36,7 @@ hash by hand:
   publishes `issance-<version>.manifest.json` and a `.sha256` beside every asset, but GitHub's
   digest needs no extra fetch and no format agreement.
 
-No `min_release_age`: issance's release job publishes only after CI is green on the tagged commit,
+No `min_release_age`: issance release job publishes only after CI is green on the tagged commit,
 and a delay would put Omarchy hosts behind every other channel for no gain.
 
 ## After it is merged

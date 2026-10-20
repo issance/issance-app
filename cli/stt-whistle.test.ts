@@ -370,7 +370,7 @@ describe("issance stt status and off, with Whistle", () => {
     const d = deps({ seed: ON() });
     expect(await cmdSttStatus(d)).toBe(EXIT.OK);
     expect(said(d)).toContain("engine");
-    expect(said(d)).toContain("issance's own");
+    expect(said(d)).toContain("issance own");
     expect(said(d)).toMatch(/model +ready — \d+\.\d MB, sha256 [0-9a-f]{8}…, revision ca528760/);
   });
 

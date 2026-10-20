@@ -143,7 +143,7 @@ if [ -f "$drift_script" ] && command -v bun >/dev/null 2>&1; then
   [ -z "$accept" ] || gate_flags+=(--accept-drift "$accept")
   if ! gate_out="$(bun "$drift_script" "${gate_flags[@]}" 2>&1 >/dev/null)"; then
     {
-      echo "✗ not tagging: an installed agent is newer than the version issance's readers were verified on:"
+      echo "✗ not tagging: an installed agent is newer than the version issance readers were verified on:"
       echo
       printf '%s\n' "$gate_out" | sed 's/^harness-drift: /    /'
       echo

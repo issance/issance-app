@@ -2,7 +2,7 @@
 //
 // Two kinds of evidence, kept apart on purpose. WHETHER a screen was reached is judged without
 // issance: Hangar's own agent state and the screen's plain text (did the typed words appear at all).
-// WHAT the phone makes of that screen is judged with issance's readers only. So a reader that has
+// WHAT the phone makes of that screen is judged with issance readers only. So a reader that has
 // gone blind reads as `fail`, and a screen that never came reads as `not-reached`, never the other
 // way round. Nothing here compares bytes: every check is a reader's answer or a phrase on screen.
 //

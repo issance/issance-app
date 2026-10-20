@@ -43,7 +43,7 @@ bridge, through the Files routes.**
 3. **No line suffix reaches the bridge.** `:12`, `:12:5` and `(12,5)` become `&line=` in the app's
    own URL. The Files screen reads it, opens Source and marks that row. The read is the same read.
 4. **No `file://` support.** A `file:///` URI names a path on the machine of whoever reads the text,
-   with no root, and a phone has none of that machine's files. issance's file reader lives on the
+   with no root, and a phone has none of that machine's files. issance file reader lives on the
    bridge, behind a root. A `file:` link would be an absolute path by another name, which point 2
    refuses.
 

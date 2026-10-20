@@ -1,6 +1,6 @@
 # Daylight: the palette and why
 
-Daylight is for direct sun and for low vision. It keeps issance's layout and status meaning and
+Daylight is for direct sun and for low vision. It keeps issance layout and status meaning and
 changes the colour, the face and the shape (see "The whole sheet" at the end). Every value is oklch. The numbers below are measured with
 `contrastReport` from `lib/theme/schema.ts` (plain sRGB alpha, the pessimistic side of the browser's
 oklab mix) and a scratch script that uses the same arithmetic for the pairs the report does not
@@ -84,7 +84,7 @@ is a real drawn weight, so `font-synthesis-weight: none` costs it nothing.
 
 - Spec 18 gives the mirror its own palette with a warm ground `#1a1612`. In dark that is 1.13 on
   the page, a terminal well a shade above the black; in light it inverts to a warm near-white
-  `#ece8e4`, 1.17 on the page. issance's own mirror sat at 1.02 and 1.04 here.
+  `#ece8e4`, 1.17 on the page. issance own mirror sat at 1.02 and 1.04 here.
 
 ## Measured table
 
@@ -132,7 +132,7 @@ Every one of the twelve tokens is named in the file.
 | shadow    | lifted                 | lifted  | Cards rise off a near-white page that has little tone of its own.   |
 | density   | roomy                  | roomy   | More air and larger targets for a thumb in sun.                     |
 | weight    | default                | default | The colour already holds body text at 7:1; no need for a heavier face. |
-| border    | default                | default | The lines are already a step stronger than issance's.                |
+| border    | default                | default | The lines are already a step stronger than issance.                |
 | ground    | gradient               | flat    | The page deepens toward the foot, so white cards stand out below.   |
 | chrome    | page                   | page    | The bars stay the page colour, so the gradient is the one effect on the page. |
 | rows      | cards                  | rules   | Every row is its own lifted card, filled with `card`, with a gap, the playful look. |

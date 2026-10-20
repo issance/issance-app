@@ -130,7 +130,7 @@ export function subscribeArgs(paneIds: readonly string[]): string[] {
 
 // ── The pane id ───────────────────────────────────────────────────────────────
 
-/** zellij's own namespace for a terminal pane. Plugin panes are `plugin_<n>` and are not issance's. */
+/** zellij's own namespace for a terminal pane. Plugin panes are `plugin_<n>` and are not issance. */
 export const TERMINAL_PREFIX = "terminal_";
 
 /** The issance id for a zellij terminal pane. Carried through unchanged — identity rule 1. */
@@ -139,7 +139,7 @@ export function terminalPaneId(numericId: number): string {
 }
 
 /**
- * issance's id for a zellij tab: its STABLE id, prefixed.
+ * issance id for a zellij tab: its STABLE id, prefixed.
  *
  * The prefix is not decoration. zellij's `tab_id` is a bare integer and so is a pane's, so an
  * unprefixed tab id would read identically to a pane id in a log, a route parameter and a test —

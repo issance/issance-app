@@ -279,7 +279,7 @@ function openDraftEnd(texts: string[], end: number): number {
  * mirroring omp's would draw it twice. That catalog is the load-bearing half of the sentence, and it
  * had to be added alongside this strip: while `commandsFor("omp")` still returned `[]` the button was
  * hidden, so cutting here took omp's own palette off the mirror and handed the user nothing back.
- * issance's catalog is curated from the WHOLE corpus rather than mirroring this one pane's palette —
+ * issance catalog is curated from the WHOLE corpus rather than mirroring this one pane's palette —
  * that palette is only what omp fuzzy-matched for one search string — and the rows omp assembles from
  * the user's own machine (its `skill:…` entries) are not in it.
  */

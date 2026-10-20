@@ -29,7 +29,7 @@ import { jsonRecord, jsonStringField } from "./json.ts";
 export const STT_FILENAME = "stt.json";
 
 /**
- * issance's default model once an OpenAI-compatible endpoint is configured.
+ * issance default model once an OpenAI-compatible endpoint is configured.
  *
  * It is a DEFAULT, not a pin: `issance stt setup` writes the model into `stt.json` only when the
  * operator named one, so an install that took the default follows this constant when it moves. That
@@ -134,8 +134,8 @@ export interface LocalCliSttSettings {
 
 /**
  * The `whistle` provider, configured (ADR 0096 Decision 4). Naming it is the whole configuration:
- * the engine is issance's own vendored code, the model sits at a fixed path in the state dir, and the
- * child is issance's own binary with arguments issance wrote. There is nothing for an operator to set.
+ * the engine is issance own vendored code, the model sits at a fixed path in the state dir, and the
+ * child is issance own binary with arguments issance wrote. There is nothing for an operator to set.
  */
 export interface WhistleSttSettings {
   provider: "whistle";

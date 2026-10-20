@@ -74,7 +74,7 @@ describe("the versions", () => {
     expect(SDK_VERSION).toBe(pkg.version);
   });
 
-  test("WIRE_VERSION is 1, the top of the range the core speaks and the version issance's adapter sends", () => {
+  test("WIRE_VERSION is 1, the top of the range the core speaks and the version issance adapter sends", () => {
     expect(WIRE_VERSION).toBe(1);
     expect(WIRE_VERSION).toBe(PROTOCOL_RANGE.max);
     const bridge = readFileSync(new URL("../../../bridge/mux/durable/protocol.ts", import.meta.url), "utf8");

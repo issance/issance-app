@@ -6,7 +6,7 @@
 //
 // Two targets:
 //   scratch  this checkout's bridge, started by the leg on the lab's tmux server (phone-bridge.ts).
-//            The phone panes carry issance's beacon hooks, so the bridge names the agent and every
+//            The phone panes carry issance beacon hooks, so the bridge names the agent and every
 //            prompt edge reaches it: a send can end `effective`, and the stream rule asks for it.
 //   bridge   a bridge that already runs (`--bridge URL --token-file PATH`), with a device token the
 //            operator paired by hand. The leg makes its own panes through `POST /api/workspace`,
@@ -190,7 +190,7 @@ export function otherScreenIn(plain: readonly string[], harness: string): string
 // ── The phone panes' own config ──────────────────────────────────────────────
 
 /**
- * Write issance's beacon hooks into the phone panes' own `settings.json`, the way `issance hooks install
+ * Write issance beacon hooks into the phone panes' own `settings.json`, the way `issance hooks install
  * claude` writes them, with this checkout's CLI as the emitter. Only in the scratch target: the hooks
  * write their edges to `ISSANCE_STATE_DIR`, which is the scratch bridge's. The walk's config folder is a
  * different one and never gets a hook, so its Claude never writes an edge anywhere.

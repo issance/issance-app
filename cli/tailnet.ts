@@ -74,7 +74,7 @@ export function tailnetHosts(exec: Exec): string[] {
 /**
  * The operator's own answer to "what do I type on my phone", or null when they haven't given one.
  * `ISSANCE_PUBLIC_URL` is the only truth about the front door whenever issance didn't publish it —
- * a reverse proxy (Variants C/E), or a `tailscale serve` the operator runs by hand. issance's own
+ * a reverse proxy (Variants C/E), or a `tailscale serve` the operator runs by hand. issance own
  * record (`tailscale-managed-handler`) can't answer that: `cmdServe` publishes only the one door it
  * manages — https on 443, or on `ISSANCE_SERVE_PORT` — and under `ISSANCE_SKIP_SERVE=1` it publishes,
  * and records, nothing at all.

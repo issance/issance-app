@@ -283,7 +283,7 @@ export const en = {
   "settings.typeface.family": "Family",
   "settings.typeface.system": "System default",
   "settings.typeface.note.system": "Your phone's own face. Downloads nothing.",
-  "settings.typeface.note.grotesk": "issance's own voice, drawn to match the mark.",
+  "settings.typeface.note.grotesk": "issance own voice, drawn to match the mark.",
   // Says the cost out loud rather than letting it be discovered: Aldrich ships one weight, and the
   // app suppresses synthesized bold, so bold text under it is not heavier than the rest.
   "settings.typeface.note.aldrich": "One weight, so bold text looks the same as regular.",
@@ -1636,7 +1636,7 @@ export const en = {
   // a code with no key here is a COMPILE error, and a code a newer bridge invents falls back to the
   // English sentence that body already carries.
   //
-  // `{reason}` is NEVER issance's text: it is the multiplexer's own refusal, passed through byte for
+  // `{reason}` is NEVER issance text: it is the multiplexer's own refusal, passed through byte for
   // byte (bridge/error-codes.ts). Those messages are a translated FRAME around a raw remainder —
   // translate the frame, leave the slot where the sentence reads naturally in your language.
   "apiError.unknown": "Something went wrong. Try again.",
@@ -2440,7 +2440,7 @@ export const en = {
   // `issance stt setup`'s words, byte for byte: bridge/stt/codex-setup.test.ts fails when they differ.
   "settings.speech.provider.status.unavailable": "Not working right now.",
   "settings.speech.provider.identity.honest": "issance names itself to the endpoint.",
-  "settings.speech.provider.identity.codexCli": "issance wears the Codex CLI's headers, because the endpoint refused issance's own name. This was accepted at setup.",
+  "settings.speech.provider.identity.codexCli": "issance wears the Codex CLI's headers, because the endpoint refused issance own name. This was accepted at setup.",
   "settings.speech.provider.option.off": "Off",
   "settings.speech.provider.locked.terminal": "This provider was set up in a terminal on the host, with a key, an endpoint or a command. Settings does not change it. To change it, run this on the host:",
   "settings.speech.provider.locked.off": "To turn it off:",
@@ -2452,7 +2452,7 @@ export const en = {
   "settings.speech.provider.consent.p3": "issance asks the endpoint under its OWN name first. If that is refused, the fallback wears the Codex CLI's headers. That is impersonation, and accepting here is what permits it. Whichever identity is accepted gets written into the config, in a word you can read back with `issance stt status`.",
   "settings.speech.provider.consent.p4": "Nothing has run yet. Nothing is written unless you accept.",
   "settings.speech.provider.consent.accept": "I accept",
-  "settings.speech.provider.consent.probing": "Your host is checking the Codex sign-in and asking the endpoint, under issance's own name first.",
+  "settings.speech.provider.consent.probing": "Your host is checking the Codex sign-in and asking the endpoint, under issance own name first.",
   "settings.speech.host.remove": "Remove from host",
   "settings.speech.host.remove.confirm":
     "Remove the model from your host? Speech on the host stops until you download it again.",

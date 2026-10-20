@@ -62,9 +62,9 @@ import type { AgentStatus } from "../types.ts";
 export type BeaconTrust = "definitive-via-hook" | "unknown";
 
 /**
- * The beacon vocabulary, in issance's words. One place, and the only place.
+ * The beacon vocabulary, in issance words. One place, and the only place.
  *
- * The beacon's three words are paseo's event map; issance's {@link AgentStatus} is a five-word TRIAGE
+ * The beacon's three words are paseo's event map; issance {@link AgentStatus} is a five-word TRIAGE
  * vocabulary and has no `waiting` in it, so the third row is a real decision rather than a rename.
  */
 const BEACON_STATUS = {

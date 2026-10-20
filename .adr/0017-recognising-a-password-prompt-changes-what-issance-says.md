@@ -86,7 +86,7 @@ Concretely:
 - issance has no "send a secret" feature, and requests for one should be answered with Type unless
   something changes below.
 - A password still ends up typed into a real terminal, and issance still mirrors, polls and stores
-  history for that pane. Nothing here changes that; what it establishes is that issance's own copy of
+  history for that pane. Nothing here changes that; what it establishes is that issance own copy of
   the secret ends at the keystroke — direct-typing state is component-local and cleared per batch, and
   the draft store is closed for the duration.
 - **What would justify revisiting.** Not a nicer heuristic — a *source of truth*. If Hangar ever

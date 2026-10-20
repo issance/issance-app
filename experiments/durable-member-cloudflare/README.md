@@ -1,14 +1,14 @@
 # Durable member on Cloudflare: a Pi Durable program behind a token
 
 > **Experimental. Verified on 2026-10-13 with agents 0.28.0. Not in CI.** This example lives under `experiments/`, not
-> `examples/`. Nothing in issance's CI builds or tests it, so it may break without a failing check. Cloudflare's
+> `examples/`. Nothing in issance CI builds or tests it, so it may break without a failing check. Cloudflare's
 > PiHarness is beta, and the plain local example, `examples/durable-member`, is where to start.
 
 A Cloudflare Worker with one Durable Object that runs the same support desk as
 [`examples/durable-member`](../../examples/durable-member/README.md). Cloudflare's
 [PiHarness](https://developers.cloudflare.com/agents/harnesses/pi/) hosts
 [Pi Durable](https://www.npmjs.com/package/@earendil-works/pi-durable) in the object and keeps its
-conversations in the object's SQLite storage. It serves issance's durable wire over HTTPS, and a bearer token is the only
+conversations in the object's SQLite storage. It serves issance durable wire over HTTPS, and a bearer token is the only
 gate. A issance peer with `ISSANCE_MUX=durable` and `ISSANCE_DURABLE_URL` lists the conversations as panes, and
 you answer their questions from the phone. The wire is experimental and may change in any minor release of
 issance ([`WIRE.md` section 1B](../../bridge/mux/durable/WIRE.md#1b-tls-with-a-bearer-token)). Once deployed,

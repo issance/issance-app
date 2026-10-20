@@ -37,7 +37,7 @@ confirmed once per device, and can be turned off by the operator.**
    agent row, its source (`recipe` or `text`), the recipe's option ids, the line, the label, whether
    it skips prompts, the adding device's pairing label, whether the add came over the crew link, and
    the time. A file that is not version 1 reads as empty and refuses every write until the operator
-   moves it away, so a newer issance's file survives a downgrade.
+   moves it away, so a newer issance file survives a downgrade.
 2. **Checked again at every read.** The same rule as the add: the character rule on the line and the
    label, and a recipe row must equal what the bridge's table builds today. A row that fails is
    dropped alone. So a hand edit, or a renamed CLI flag, can never type a line nobody added.

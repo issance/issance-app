@@ -1110,7 +1110,7 @@ export function AgentChat({
   // a menu row above a chat stream.
   //
   // The multiplexer's own words come first where it has any, because a multiplexer that keeps no
-  // agent session log at all is not issance's fault and issance does not say it is. A device on the
+  // agent session log at all is not issance fault and issance does not say it is. A device on the
   // terminal reads exactly the row it read before the gate existed.
   // The bridge refused to guess this pane's session because another pane runs the same harness in
   // its folder (#508). Said wherever the pane says why it has no Chat, in place of "no transcript
@@ -2711,7 +2711,7 @@ export function AgentChat({
               bottom edge for every card kind on every harness. Renders nothing without a card.
 
               OUTSIDE the bottom region's zen `Collapse`, on purpose. The card is the pane's own
-              dialog, not issance's chrome, and zen hides only chrome; inside that row a dialog would
+              dialog, not issance chrome, and zen hides only chrome; inside that row a dialog would
               vanish with the belt. Nothing comes between it and the chrome block while it shows:
               the statusline strip and the agents footer both need a live input box at the tail, and
               every card means there is none (the completion popup's box has a popup under it, not

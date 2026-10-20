@@ -1,4 +1,4 @@
-// THE MUX PORT — everything issance needs from a multiplexer, in issance's words.
+// THE MUX PORT — everything issance needs from a multiplexer, in issance words.
 //
 // A *multiplexer* is what owns the pane. A *harness* is what runs inside it (claude, codex, pi, omp).
 // Two axes, two registries, and they never key off each other — see registry.ts.
@@ -170,7 +170,7 @@ export function isUnsupported<T>(outcome: MuxOutcome<T>): boolean {
  * Deliberately smaller than the bridge's `AgentView`: everything issance adds on top — when you last
  * looked at a pane, whether it is unseen, the session name read out of the pane's own text — is the
  * bridge's knowledge, not the multiplexer's. Keeping the two apart is what stops a future adapter
- * being asked to invent a field only issance's ledger could ever fill.
+ * being asked to invent a field only issance ledger could ever fill.
  */
 export interface MuxPane extends MuxIdentity {
   readonly paneId: string;
@@ -216,7 +216,7 @@ export interface MuxPane extends MuxIdentity {
   /** How that agent is doing. `"unknown"` is the honest answer without `agentDetection`. */
   readonly status: AgentStatus;
   /**
-   * The operator's own label for this pane — ONLY a name given through issance's {@link
+   * The operator's own label for this pane — ONLY a name given through issance {@link
    * MuxAdapter.renamePane}, and never a title the pane's program printed.
    *
    * A multiplexer with one title slot (tmux, zellij) cannot tell the two apart from its listing, so
@@ -314,7 +314,7 @@ export interface MuxPane extends MuxIdentity {
   readonly revision?: number;
 }
 
-/** One space — a project-scoped container of tabs. issance's word; the port never uses another. */
+/** One space — a project-scoped container of tabs. issance word; the port never uses another. */
 export interface MuxSpace {
   readonly spaceId: string;
   readonly number: number;
@@ -631,7 +631,7 @@ export type MuxStarterOutcome =
 // ── The port ──────────────────────────────────────────────────────────────────
 
 /**
- * One multiplexer, behind issance's contract.
+ * One multiplexer, behind issance contract.
  *
  * Every method that a multiplexer may not have returns {@link MuxOutcome} and answers `unsupported`
  * with the capability it needs. The two that do not — {@link reachable} and {@link snapshot} — are

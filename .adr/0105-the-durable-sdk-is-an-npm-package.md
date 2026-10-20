@@ -41,7 +41,7 @@ published by Altan alone.**
    `npm publish --access public --tag experimental`, after `bun run sdk:build`, `scripts/sdk-pack-check.sh`, a clean
    tree, and the version bumped in the package's `package.json` and `CHANGELOG.md`. CI holds no npm token and the
    release workflow does not publish. The pack check never publishes.
-6. **Its own version.** The package follows semver apart from issance's. `SDK_VERSION` is that version, written into
+6. **Its own version.** The package follows semver apart from issance. `SDK_VERSION` is that version, written into
    the build from `package.json`, and `WIRE_VERSION` is the wire version it speaks.
 7. **The repo imports the source.** The example and the parked Cloudflare example import `packages/durable-sdk/src`
    by relative path, so the tests need no build and no install of the package. In the repo the SDK's Pi imports

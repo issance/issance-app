@@ -28,11 +28,11 @@ this tree with no page behind it is therefore not a number, it is a rumour with 
 plugin and its claim contract is the part worth taking. Four of its decisions carry over untouched: a
 TTL is a sourced claim, rules live in code, the verdict is read from the harness's own transcript, and
 the clock runs from the last outbound request. Two of its mechanisms cannot come across at all,
-because issance's bridge is not where cache-alert runs.
+because issance bridge is not where cache-alert runs.
 
 **The bridge cannot see the agent's environment, and that is load-bearing.** cache-alert reads
 `ENABLE_PROMPT_CACHING_1H` and `FORCE_PROMPT_CACHING_5M` straight out of `process.env`, because it
-runs inside Hangar's plugin host in the operator's own shell. issance's bridge is a `systemd --user`
+runs inside Hangar's plugin host in the operator's own shell. issance bridge is a `systemd --user`
 unit started by the launcher, which passes `HERDR_PLUGIN_CONFIG_DIR` in precisely so the bridge never
 shells out (`bridge/config.ts`). Its `process.env` belongs to the unit, not to the terminal the agent
 is running in, so every one of those reads would answer a question about the wrong process.

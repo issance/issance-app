@@ -258,7 +258,7 @@ function versionRefusal(state: CoreState, version: number | undefined): Pick<Pro
   return { refusal };
 }
 
-/** The line a program writes for a refusal: issance's version first, then the program's own, as issance's notice row words it. */
+/** The line a program writes for a refusal: issance version first, then the program's own, as issance notice row words it. */
 export function versionLine(refusal: VersionRefusal): string {
   return `issance speaks wire v${refusal.issance[1]}, this durable agent speaks v${refusal.program[1]}. Update the agent's SDK, or issance.`;
 }

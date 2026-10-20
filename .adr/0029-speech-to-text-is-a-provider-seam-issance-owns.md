@@ -150,11 +150,11 @@ in the module header, and in short:
 - **The operator's words only.** `command` and `args` come from `stt.json` (0600, written by
   `issance stt setup`) or the deployment's environment (`ISSANCE_STT_COMMAND`; `args` is file-only). A
   request contributes the recording's bytes and nothing else. The temp file's name and extension are
-  issance's, and the extension is narrowed again before it becomes part of a path.
+  issance, and the extension is narrowed again before it becomes part of a path.
 - **A private temp dir** (0700, the file 0600), removed in `finally` whatever happened.
 - **The same 60 s deadline** as `openai-compatible`, enforced with SIGKILL, a 256 KiB stdout cap,
   and **no stderr, command line or path ever reaches the phone**: an `SttStatus.reason` or a
-  refusal is issance's own sentence and, at most, an exit status.
+  refusal is issance own sentence and, at most, an exit status.
 - **No `ISSANCE_*` variable is passed to the child**, so the push keys and another provider's key do
   not ride along. Everything else in the bridge's environment IS passed: `PATH`, `HOME`, the locale,
   and any other key the service runs with. That is deliberate, because it is the operator's own

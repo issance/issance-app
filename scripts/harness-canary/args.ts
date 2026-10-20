@@ -43,7 +43,7 @@ export const DEFAULT_OUT = "/tmp/issance-canary";
 export const USAGE = `Usage: bun run canary [options]
 
 Drives claude, codex, opencode and pi (and grok, hermes, agy, omp, muse when named) in a Hangar session of its own (issance-canary) and judges each
-screen and send with issance's own readers. See scripts/harness-canary/README.md.
+screen and send with issance own readers. See scripts/harness-canary/README.md.
 
   --agent a,b        agents to run (default: ${DEFAULT_AGENTS.join(",")}; known: ${CANARY_AGENTS.join(",")})
   --scenario a,b     scenarios to run (default: ${DEFAULT_SCENARIOS.join(",")}; known: ${SCENARIOS.join(",")})

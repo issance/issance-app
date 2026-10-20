@@ -1714,7 +1714,7 @@ function flipJunction(deps: UpdateDeps, layout: BinaryLayout, version: string): 
     deps.io.err(`error: could not point ${layout.currentLink} at versions/${version} — ${why}`);
   const before = deps.link.probe(layout.currentLink);
   if (before.kind === "other") {
-    // A real folder or a file has the name: it is not issance's link, so it is not issance's to remove.
+    // A real folder or a file has the name: it is not issance link, so it is not issance to remove.
     said(`it is ${before.what}, not a junction`);
     return false;
   }

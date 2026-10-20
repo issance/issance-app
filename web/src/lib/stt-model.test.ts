@@ -454,7 +454,7 @@ describe("getEngineBytes", () => {
     expect(await code(getEngineBytes(h.deps))).toBe("missing");
   });
 
-  it("fetches the wasm from issance's own files when the cache has no copy, checks it, and keeps it", async () => {
+  it("fetches the wasm from issance own files when the cache has no copy, checks it, and keeps it", async () => {
     const h = await downloaded();
     const cache = h.storage.caches.get("issance-stt");
     cache?.entries.delete(`${ORIGIN}${sttEnginePath("needle.wasm")}`);

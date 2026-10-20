@@ -1,4 +1,4 @@
-// issance's own readers, loaded from a checkout at run time.
+// issance own readers, loaded from a checkout at run time.
 //
 // The canary judges a screen with exactly the code the phone runs: `parseAnsi` + `splitLines`, the
 // agent's adapter (`composerReady`, `extractInputDraft`, `draftCarriesSend`), `buildBlocks`, and the

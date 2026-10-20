@@ -241,7 +241,7 @@ open like any other row.
 
 - Only files under the workspace's folder. A path that leads out of it, also through a symlink,
   is refused. A symlink is listed as a link and opens only when it points inside the folder.
-- Never a `.git` folder, and never issance's own state folder or config folder, also when they sit
+- Never a `.git` folder, and never issance own state folder or config folder, also when they sit
   inside the workspace's folder. They are left out of the list, and a request for them is refused.
 - Never a file named like a issance state secret, such as `paired-devices.json` or
   `crew-trust.json`, wherever it sits. This hides the secrets of a second issance on the same machine.

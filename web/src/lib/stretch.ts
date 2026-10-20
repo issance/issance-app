@@ -1,13 +1,13 @@
 // Stretchtext in a reply: `{{short|long}}` marks a stretch, which the reader sees as `short` and can
 // open to put `long` in its place. `long` may hold further stretches. Code spans and fences are copied
 // as written, so braces in code never open a stretch. Replies written with the cc-stretch Claude Code
-// plugin carry this markup, and issance's journal shows it as Markdown.
+// plugin carry this markup, and issance journal shows it as Markdown.
 //
 // `parse` and its helpers are ported from cc-stretch 0.3.4 `hooks/parse.ts`, and `grown`, `anchorsOf`,
 // `bare` and `isMarkup` from its `hooks/grow.ts` and `hooks/layout.ts`
 // (https://github.com/pro-vi/cc-stretch, MIT, Copyright (c) 2026 pro-vi), with the same semantics.
 //
-// HOW A STRETCH REACHES THE RENDERER. issance's Markdown parser knows nothing of stretches, so
+// HOW A STRETCH REACHES THE RENDERER. issance Markdown parser knows nothing of stretches, so
 // `composeStretches` writes the reply as Markdown with each stretch bracketed by private-use
 // characters (the markers below), `parseMarkdown` parses that, and `liftStretches` turns each
 // bracketed run back into a stretch span. A reply never writes these characters, and every public

@@ -298,7 +298,7 @@ function writeBeacon(deps: BeaconEmitDeps, record: BeaconRecord): void {
 const TOOL_FIELD = /^[\x20-\x7e]{1,128}$/u;
 
 /**
- * Whether the settings this agent reads hold issance's permission hook right now (M56 spec 12): the
+ * Whether the settings this agent reads hold issance permission hook right now (M56 spec 12): the
  * user file, the project's two files under the folder the hook reports (`cwd`), and the managed file.
  * Any of them can turn hooks off (`disableAllHooks`, or `allowManagedHooksOnly` in the managed one).
  * The harness reloads hooks from these files while it runs (seen 2026-10-16 on 2.1.301), so the files

@@ -62,7 +62,7 @@ to, so pick from that list rather than typing the host a second way
 `crew add` takes the route its own install kind names. A lead that runs from a git checkout, as the
 Hangar plugin install does, pushes its own commit to the member and builds it there, so that member
 needs `git` and Bun. A lead from the [standalone install](install.md#standalone) or from a package
-has no commit, so it installs the member from the release it runs itself, with issance's own
+has no commit, so it installs the member from the release it runs itself, with issance own
 installer sent over the same ssh, and that member needs `curl`, `tar` and `sha256sum` or `shasum`
 instead. `--path` names the remote checkout on the first route and the install root on the second.
 A member that already runs the other kind of install is refused rather than written over, and the
@@ -131,7 +131,7 @@ prints a warning, because process listings expose arguments to all local users
 ([`CREW_PROTOCOL.md` §8.3](../CREW_PROTOCOL.md)).
 
 Set the lead address to any hostname or `host:port` reachable from this node. An address without a
-scheme and port resolves to `https://<host>:8787`, the port issance's own listener binds.
+scheme and port resolves to `https://<host>:8787`, the port issance own listener binds.
 
 What `crew invite` prints depends on how the lead is published. In the default HTTPS mode, the lead
 listens on loopback and `tailscale serve` publishes it on port 443. So `invite` prints
@@ -172,7 +172,7 @@ Hangar's machine list belongs to your Hangar window. Hangar 0.9.0 keeps saved ss
 client and opens each one over ssh every time you use it. You get terminals on those machines, in
 that window, on the machine you are sitting at.
 
-A crew is issance on every machine, and the lead reaches each member over issance's own encrypted
+A crew is issance on every machine, and the lead reaches each member over issance own encrypted
 link, set up once by an install that rides your ssh. A crew shows terminals too, and it carries more
 than terminals. It moves uploads. It keeps each machine's journal and audit log on the machine that
 ran the pane. It updates the whole crew from one confirm on the phone. It can hand the front door to
@@ -182,7 +182,7 @@ list at all.
 | what | Hangar's machine list | a issance crew |
 | --- | --- | --- |
 | Who makes the link | your Hangar client | the lead issance |
-| What carries it | ssh, on every use | issance's own encrypted link |
+| What carries it | ssh, on every use | issance own encrypted link |
 | What you see | terminals | terminals, uploads, journal, audit log, updates, failover |
 | Where you see it | your Hangar window | your phone |
 | Works with tmux and zellij | no | yes |
@@ -319,7 +319,7 @@ each machine, for 24 hours. A issance with no crew keeps the same day for its ow
 | Disks | yes | yes | yes |
 
 **Disks are the ones that hold your files.** issance reads the filesystem that holds your home folder,
-the one that holds the root (on Windows, the system drive), and the one that holds issance's state
+the one that holds the root (on Windows, the system drive), and the one that holds issance state
 folder. Two of them on one device count once, and issance shows at most four. It leaves out a
 filesystem under 1 GiB, and one that is read-only with no free space at all. The root of an image-based
 system, such as Fedora Atomic, is such a filesystem: it is always 100% full, and it is not a disk that

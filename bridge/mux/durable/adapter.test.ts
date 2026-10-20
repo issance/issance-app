@@ -330,7 +330,7 @@ describe("version negotiation", () => {
       expect(verdict(await adapter.poll())).toBe("unreachable: incompatible: the durable agent speaks 2..3, this issance speaks 1..1");
       clock.advance(MIN_SNAPSHOT_GAP_MS);
     }
-    // The second hello is the one telling call of this epoch (WIRE.md section 2): it carries this issance's version.
+    // The second hello is the one telling call of this epoch (WIRE.md section 2): it carries this issance version.
     expect(paths(program)).toEqual(["/hello", "/hello", "/hello", "/hello"]);
     expect(program.requests.map((request) => request.version)).toEqual([null, "1", null, null]);
     expect(await adapter.reachable()).toBe(false);

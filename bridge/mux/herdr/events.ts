@@ -1,7 +1,7 @@
 // Which Hangar events issance subscribes to, and which half of the contract's watch each one is.
 //
 // Lifted verbatim out of `bridge/event-poker.ts` when Hangar moved behind the port: the poker owns
-// the stream LIFECYCLE (debounce, backoff, health) in issance's words, and the subscription list is
+// the stream LIFECYCLE (debounce, backoff, health) in issance words, and the subscription list is
 // Hangar vocabulary, so it belongs on this side of the seam. Nothing about the set changed.
 
 import { eventPaneId, type EventData } from "../../wire.ts";
@@ -9,7 +9,7 @@ import { eventPaneId, type EventData } from "../../wire.ts";
 /** A subscription request entry: global (just `type`) or pane-scoped (needs `pane_id`). */
 export type Subscription = { type: string; pane_id?: string };
 
-// Global events that change what issance's snapshot renders. We deliberately DROP layout.*,
+// Global events that change what issance snapshot renders. We deliberately DROP layout.*,
 // worktree.*, pane.scroll_changed and pane.output_matched — none of them alter the herd view we
 // poll for, so subscribing would only add pokes that re-fetch identical state. Also NO
 // workspace.moved / tab.moved: they're new in herdr 0.7.2, and one unknown subscription type

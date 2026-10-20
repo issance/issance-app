@@ -1,6 +1,6 @@
 // The one place issance asks what the runtime it landed in can actually do.
 //
-// issance's bundle evaluates in four places that are NOT the same environment: a modern phone
+// issance bundle evaluates in four places that are NOT the same environment: a modern phone
 // browser, an older WebView, the service worker (`sw.ts` — no `window`, no `document`), and jsdom
 // under Vitest (no `ResizeObserver`). Every one of those questions used to be answered inline with
 // a bare `typeof X === "undefined"` scattered across the module that cared, which is the shape

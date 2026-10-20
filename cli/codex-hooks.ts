@@ -210,7 +210,7 @@ function linesOf(text: string): FileLines {
 /** The text of these lines, with the line break after the last one only where the file had it. */
 const textOf = (lines: readonly string[], finalBreak: boolean): string => (lines.length === 0 ? "" : `${lines.join("\n")}${finalBreak ? "\n" : ""}`);
 
-/** The config text with issance's notify line in it, or a refusal. */
+/** The config text with issance notify line in it, or a refusal. */
 export function installNotify(text: string, binary: string): { readonly text: string } | { readonly refuse: string } {
   const { lines, finalBreak } = linesOf(text);
   const state = notifyState(lines);
@@ -231,7 +231,7 @@ export function installNotify(text: string, binary: string): { readonly text: st
   }
 }
 
-/** The config text without issance's notify line. Text with no line of ours comes back unchanged. */
+/** The config text without issance notify line. Text with no line of ours comes back unchanged. */
 export function uninstallNotify(text: string): string {
   const { lines, finalBreak } = linesOf(text);
   const state = notifyState(lines);
@@ -287,7 +287,7 @@ export function cmdCodexHooksInstall(deps: HooksDeps, binary: string, pinnedNote
   return EXIT.OK;
 }
 
-/** `issance hooks uninstall codex`: removes issance's notify line and nothing else. */
+/** `issance hooks uninstall codex`: removes issance notify line and nothing else. */
 export function cmdCodexHooksUninstall(deps: HooksDeps): number {
   const path = codexConfigPath(deps.ctx);
   const previous = deps.files.read(path);

@@ -262,7 +262,7 @@ export class SentStore implements SentSurface {
     return this.serial<number | "unwritable">(async () => {
       const text = await this.io.read();
       if (text === null) return 0;
-      // Every other row stays as it is, a newer issance's record and a row that does not parse too.
+      // Every other row stays as it is, a newer issance record and a row that does not parse too.
       let removed = 0;
       const kept: string[] = [];
       for (const row of text.split("\n")) {

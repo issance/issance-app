@@ -41,7 +41,7 @@ the grammar, `nav-tray.tsx:75` makes repeat opt-in per button.
 
 **Three multiplexers spell one keystroke three ways.** Hangar `ctrl+c`, tmux `C-c`, zellij
 `"Ctrl c"` (all probed; see MUX_CONTRACT.md). Whoever owns the spelling owns the seam. If the
-contract is Hangar's client, then Hangar's grammar is issance's grammar, two adapters translate into a
+contract is Hangar's client, then Hangar's grammar is issance grammar, two adapters translate into a
 third party's dialect, and every future key question is settled by what Hangar happens to accept.
 
 The same argument settles the second-cheapest route, **making tmux speak Hangar's wire** behind a
@@ -51,7 +51,7 @@ issance to Hangar forever". This is that argument one layer down.
 
 ## Decision
 
-**issance owns a multiplexer port, in issance's vocabulary, and Hangar is one adapter behind it.**
+**issance owns a multiplexer port, in issance vocabulary, and Hangar is one adapter behind it.**
 
 - The port is [`bridge/mux/types.ts`](../bridge/mux/types.ts). It speaks pane, space, agent session
   and grid — never a wire name.

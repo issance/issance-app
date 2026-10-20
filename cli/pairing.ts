@@ -30,7 +30,7 @@ import { renderQr } from "../scripts/qr.ts";
 // ── WHY THE TERMINAL MINTS THE CODE, AND NOT THE WEB UI ──────────────────────
 // Enrolment is a bootstrap problem: the phone asking to be paired is, by definition, the one party
 // that cannot yet prove anything — it holds no token, and the header gate (if configured at all) only
-// says what the network asserts about it. A "pair this device" button in issance's own UI would
+// says what the network asserts about it. A "pair this device" button in issance own UI would
 // therefore be authorised by nothing, and would hand a write credential to whoever loaded the page.
 // The operator's shell on the host IS the proof: reaching it already implies the access pairing is
 // there to fence off. So the code is minted where that proof already exists and carried out of band —

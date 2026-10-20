@@ -11,7 +11,7 @@ import type { MuxPane } from "./types.ts";
 // import one another in production code, so this file imports across the boundary on purpose, as
 // crew-level-contract.test.ts does: the list must be exactly what the two readers answer to.
 
-describe("the contract's agent names are the names issance's readers answer to", () => {
+describe("the contract's agent names are the names issance readers answer to", () => {
   test("the list is the screen readers, the journal readers, the journal's aliases and the profile-only names", () => {
     const readers = new Set([...registeredAgents(), ...KNOWN_HARNESS_NAMES, ...Object.keys(AGENT_ALIASES)]);
     expect([...MUX_AGENT_NAMES]).toEqual([...readers, ...MUX_PROFILE_ONLY_AGENT_NAMES].toSorted());
@@ -59,7 +59,7 @@ describe("the conformance check applies the rule", () => {
     ]);
   });
 
-  test("issance's own names and a shell are not", () => {
+  test("issance own names and a shell are not", () => {
     expect(agentNameProblems([pane("claude"), pane("pi"), pane("shell")])).toEqual([]);
   });
 

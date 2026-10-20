@@ -1,6 +1,6 @@
 // The round trip of the pack check (scripts/sdk-pack-check.sh, M55 spec 10). It runs a small program that imports the
 // INSTALLED package, `@colliepwa/durable-sdk` from a fresh project's node_modules, on Node or on Bun, and dials it with
-// issance's own adapter (`DurableMux`): hello, the snapshot, one `requireApproval` card, Allow, and the receipt the
+// issance own adapter (`DurableMux`): hello, the snapshot, one `requireApproval` card, Allow, and the receipt the
 // program prints, which must say `decidedBy: "phone"`. The shape is examples/durable-member/tests/node-child.ts.
 //
 //   bun scripts/sdk-pack-check.ts <project-dir> node|bun

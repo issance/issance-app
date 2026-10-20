@@ -115,7 +115,7 @@ When a pairing ends, the phone deletes what issance stored under it. This happen
 phone from Settings, and when the bridge refuses its token with `device not paired` or `device expired`.
 
 The phone deletes the token, every unsent draft, the saved pane text and herd, the push subscription,
-the "No prompts" confirms, and issance's caches except the app shell. Your settings stay: theme, language, pins and other
+the "No prompts" confirms, and issance caches except the app shell. Your settings stay: theme, language, pins and other
 preferences hold no session text. Settings asks you to confirm before it revokes any device.
 
 The phone's own wipe is the only one. The bridge sends no `Clear-Site-Data` header, because that
@@ -183,7 +183,7 @@ Key security boundaries and risks:
   never answers a request whose dialog is not on the screen
   ([Permissions held for the phone](multiplexers.md#permissions-held-for-the-phone)).
 - **The Files view reads files off your disk.** It shows any file under a workspace's folder, except
-  a `.git` folder, issance's own state and config folders, and files named like a issance state
+  a `.git` folder, issance own state and config folders, and files named like a issance state
   secret. So it asks for an authorised device, like a write
   ([ADR 0083](../.adr/0083-the-files-view-reads-the-changes-root.md)).
 - **The New page's Browse lists folder names under your home.** Names only, with the Files view's
@@ -305,7 +305,7 @@ entirely.
   ([What the phone keeps](#what-the-phone-keeps)). That text was already masked, but it is readable.
   This reach is accepted, and named in the ADR. If it starts to matter, the next step is a sandboxed
   frame around the worker.
-- **On the host, a child of issance's own binary.** One short-lived child per dictation runs
+- **On the host, a child of issance own binary.** One short-lived child per dictation runs
   `_whistle-transcribe` with a fixed argument list that issance wrote. It checks the engine, the wasm
   and the model against their pins before it compiles anything. It has a 60-second deadline, killed
   with SIGKILL, a 256 KiB output cap and at most two at once. It gets none of the bridge's `ISSANCE_*`
@@ -487,7 +487,7 @@ user profile are already closed to other standard users. The check matters most 
 folder with `ISSANCE_STATE_DIR` or another setting.
 
 At start, the bridge checks both folders and their secret files. If other accounts can read one,
-the bridge repairs it, but only in issance's own folders. It saves the old list first, in
+the bridge repairs it, but only in issance own folders. It saves the old list first, in
 `acl-backups` in the state folder, and prints the `icacls /restore` command that puts it back.
 Run that command in a terminal run as administrator. A
 folder that also holds other files is checked, not changed: issance prints the `icacls` command

@@ -944,7 +944,7 @@ export interface MachineSample {
   rxBps?: number;
   txBps?: number;
   /**
-   * The filesystems that hold the home folder, the root (on Windows the system drive) and issance's
+   * The filesystems that hold the home folder, the root (on Windows the system drive) and issance
    * state folder, one per device, at most four, read at most once a minute (bridge/machine-disks.ts).
    * Absent: not reported (an older member, or no filesystem qualified).
    */
@@ -1133,7 +1133,7 @@ export interface UpdateStatus {
   /**
    * The issance on disk is no longer the issance this process is running.
    *
-   * Only a package manager can produce it: every other kind swaps files through issance's own
+   * Only a package manager can produce it: every other kind swaps files through issance own
    * updater, which restarts the service as its last act. `pacman -Syu` replaces the root under a
    * live process, and `collieVersion()` re-reads from disk on every call — so without this the
    * bridge would answer with the NEW version while running the OLD code, on `/api/health`, on

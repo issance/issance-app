@@ -331,7 +331,7 @@ describe("where updates come from", () => {
     expect(parseGithubRemote("")).toBeNull();
   });
 
-  test("ISSANCE_UPDATE_REPO is the one override, and issance's own repo is the default", () => {
+  test("ISSANCE_UPDATE_REPO is the one override, and issance own repo is the default", () => {
     expect(updateRepoOf({})).toBe("issance/issance-app");
     expect(updateRepoOf({ ISSANCE_UPDATE_REPO: "  my/issance  " })).toBe("my/issance");
     expect(updateRepoOf({ ISSANCE_UPDATE_REPO: "" })).toBe("issance/issance-app");

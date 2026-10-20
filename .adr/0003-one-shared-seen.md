@@ -45,7 +45,7 @@ doesn't notify for agents that were already blocked.
 - **A second device agrees with the first.** An alert cleared on the phone is cleared on the laptop.
   This is the whole point, and it's why per-device storage was rejected: the failure mode there is
   an alert you already dealt with still shouting at you somewhere else.
-- **Two people sharing one issance share one "seen".** Accepted. issance's threat model is a personal
+- **Two people sharing one issance share one "seen".** Accepted. issance threat model is a personal
   tailnet with one operator; a issance is remote shell access, not a multi-tenant service.
 - **Working in a pane at the desk does not clear its issance alert.** This is the deliberate cost.
   Counting a Hangar focus would let a pane you merely clicked past silently clear an alert you never
@@ -62,9 +62,9 @@ doesn't notify for agents that were already blocked.
 ### Hangar 0.9 compatibility
 
 Hangar 0.9's API reports settled agents as `idle`; its terminal client projects `done` using
-client-local acknowledgements (`EndpointAgentPresentation::projected_status`). issance's classifier
+client-local acknowledgements (`EndpointAgentPresentation::projected_status`). issance classifier
 therefore accepts **`idle` or `done`**, still gated by `activeAt > seenAt` and excluding bare shells.
-The ownership decision is unchanged: issance's ledger supplies the read receipt, first sightings
+The ownership decision is unchanged: issance ledger supplies the read receipt, first sightings
 remain seen, and opening the pane in Hangar does not clear its issance alert. When an observed agent
 exits to a shell, `bridge/activity-tracking.ts` forgets its activity before reseeding that shell;
 a new idle agent in the same terminal must not inherit unread work from the previous one. For a
@@ -75,7 +75,7 @@ leave `activeAt` where it was.
 ### What would justify revisiting
 
 - Hangar starts reporting real per-pane activity timestamps — then `activeAt` should come from the
-  source rather than from issance's own observation, and a bridge restart would stop being a
+  source rather than from issance own observation, and a bridge restart would stop being a
   re-seed.
 - issance grows genuine multi-user support (distinct identities, not just distinct devices). Then
   "seen" becomes per-identity, and this ADR is superseded rather than amended.

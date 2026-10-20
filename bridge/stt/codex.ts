@@ -288,7 +288,7 @@ function isRedirect(response: Response): boolean {
   return response.status >= 300 && response.status < 400;
 }
 
-/** One sentence per refusal status. issance's own words — never the endpoint's body. */
+/** One sentence per refusal status. issance own words — never the endpoint's body. */
 function codexRefusal(status: number): string {
   if (status === 401) return "the Codex sign-in was rejected (401) — try `codex login`";
   if (status === 403) return "the Codex transcription endpoint refused this request (403)";

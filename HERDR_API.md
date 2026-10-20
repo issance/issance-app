@@ -22,7 +22,7 @@ the socket assumptions behind the design in [`ARCHITECTURE.md`](./ARCHITECTURE.m
   1 048 575 bytes (newline included) still gets a normal reply; 1 048 576 gets no reply at all —
   the server drops the connection or simply never answers. Nothing issance sends is near that, but
   it is the ceiling to design against, and a hang at that size is the server, not the client. (The
-  client-side hazard at large sizes was issance's own: Bun's `socket.write()` accepts only what the
+  client-side hazard at large sizes was issance own: Bun's `socket.write()` accepts only what the
   socket has room for, and the unwritten tail must be resumed on `drain` — see
   [`bridge/write-drain.ts`](./bridge/write-drain.ts).)
 
@@ -164,7 +164,7 @@ Docs-blessed pattern: **bootstrap with `session.snapshot` → `events.subscribe`
 on reconnect or staleness.** CLI mirror: `hangar api snapshot` prints the raw reply — handy for
 diffing shapes without writing a client.
 
-issance's bridge polls this method (one RPC per tick instead of the `workspace.list` + `pane.list`
+issance bridge polls this method (one RPC per tick instead of the `workspace.list` + `pane.list`
 + `tab.list` trio) and falls back to the trio on older servers that don't know the method. Old-server
 detection: the error reply is
 ``{"id":"","error":{"code":"invalid_request","message":"invalid request: unknown variant `session.snapshot`, expected one of ..."}}``
@@ -180,7 +180,7 @@ against a real pane). Empirically enumerated against Hangar 0.7.0 — it is **NO
 - **Special keys (bare, case-insensitive):** `Up` `Down` `Left` `Right` `Tab` `Enter` `Escape`
   `Space` `Backspace` (alias `BS`), and function keys `F1`…`F12`.
 - **Literal single characters:** a one-character string is typed as that character — digits (`"1"`,
-  `"2"`, …), letters, punctuation (live-verified 2026-07-04). This is what issance's prompt-select
+  `"2"`, …), letters, punctuation (live-verified 2026-07-04). This is what issance prompt-select
   taps send: `{keys:["1"]}` answers a permission dialog; `{keys:["2","Enter"]}` picks option 2 of an
   AskUserQuestion select.
 - **Modifier chords (join with `+`):** `ctrl+c`, `ctrl+u`, `ctrl+d`, `ctrl+l`, `ctrl+r`,
@@ -297,7 +297,7 @@ Two sibling structural ops reorder objects. Both live-verified 2026-07-20 on the
 `idle` on the API while the terminal client shows `done`: the client projects that from its own
 acknowledgements and `state_change_seq` (v0.9.0,
 [`endpoint_agent_state.rs`](https://github.com/herdrdev/herdr/blob/v0.9.0/src/client/shell/endpoint_agent_state.rs)).
-issance's Ready · unseen section must recognise both settled statuses using its own activity ledger,
+issance Ready · unseen section must recognise both settled statuses using its own activity ledger,
 not require a literal `done` from Hangar. See [ADR 0003](.adr/0003-one-shared-seen.md#herdr-09-compatibility).
 
 > **`agent_session` has TWO kinds, and it can outlive the agent that reported it** (live-verified
@@ -329,7 +329,7 @@ not require a literal `done` from Hangar. See [ADR 0003](.adr/0003-one-shared-se
 > **`revision` is a stub on Hangar 0.7.x** (live-verified 2026-07-05 on 0.7.0; reconfirmed unchanged
 > on 0.7.2, live-verified 2026-07-07): `pane.read`, `pane.list`, and `session.snapshot` all return
 > `revision: 0` for every pane, including actively-changing ones. Treat it as advisory /
-> future-proofing only — never as a load-bearing change detector (issance's prompt-select race
+> future-proofing only — never as a load-bearing change detector (issance prompt-select race
 > guard re-derives the menu from content for exactly this reason).
 
 ## Event stream (now wired: event-poked polling)

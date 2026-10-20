@@ -32,7 +32,7 @@ export interface HerdSummary {
   title: string;
   /**
    * The catalogue code `title` was rendered from, so the phone can say it in its own language. Absent
-   * when the title carries a program's own words (an ask's push title), which are not issance's to translate.
+   * when the title carries a program's own words (an ask's push title), which are not issance to translate.
    */
   titleCode?: PushTitleCode;
   /** The values `title` was filled with — the agent's name, or the digest's count. */
@@ -288,7 +288,7 @@ export class NotificationCoordinator<H = unknown> {
       //
       // The program MAY choose the words (`askText`, already cleaned and cut). Its title goes after the pane's
       // push name, so the push still says where it comes from, and carries no code: those words are not
-      // issance's to translate. Its line replaces the place as the body. Either part alone is used alone.
+      // issance to translate. Its line replaces the place as the body. Either part alone is used alone.
       const title: Pick<HerdSummary, "title" | "titleCode" | "titleDetail"> =
         a.ask !== true
           ? pushTitle(a.status === "blocked" ? "agent.blocked" : "agent.done", { agent: a.agent })

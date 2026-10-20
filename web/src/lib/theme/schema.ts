@@ -953,7 +953,7 @@ export function contrastReport(theme: Theme, base: Theme): Finding[] {
     // urgent mark, which the pairs above did not reach. `text-destructive` is text in the action
     // sheet rows and the ask card; `text-status-blocked` is the urgent countdown in the cache chip.
     //   * destructive on the page and on a card is held at 3:1 as the icon colour, and at 4.5:1 as
-    //     text. issance's own light `destructive` on `background` is 4.38, a known value of the look the
+    //     text. issance own light `destructive` on `background` is 4.38, a known value of the look the
     //     app always had (it does not change). A theme that keeps both colours of a pair as the
     //     base has them is held to what the base measures, so the default and an untouched export
     //     do not warn, and never below 3; any theme that moves either colour is held to 4.5. Every other shipped

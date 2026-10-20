@@ -247,7 +247,7 @@ describe("PUT /api/stt/host", () => {
     }
   });
 
-  test("a probe that fails is 502 with issance's own sentence, and nothing is written", async () => {
+  test("a probe that fails is 502 with issance own sentence, and nothing is written", async () => {
     seed({ provider: "whistle" });
     const h = harness({
       probe: async () => {

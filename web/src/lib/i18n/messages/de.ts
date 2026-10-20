@@ -2269,7 +2269,7 @@ export const de: Dictionary = {
   // `issance stt setup`'s words, byte for byte: bridge/stt/codex-setup.test.ts fails when they differ.
   "settings.speech.provider.status.unavailable": "Funktioniert gerade nicht.",
   "settings.speech.provider.identity.honest": "issance nennt dem Endpunkt seinen eigenen Namen.",
-  "settings.speech.provider.identity.codexCli": "issance trägt die Header der Codex-CLI, weil der Endpunkt Collies eigenen Namen abgelehnt hat. Das wurde bei der Einrichtung akzeptiert.",
+  "settings.speech.provider.identity.codexCli": "issance trägt die Header der Codex-CLI, weil der Endpunkt issance eigenen Namen abgelehnt hat. Das wurde bei der Einrichtung akzeptiert.",
   "settings.speech.provider.option.off": "Aus",
   "settings.speech.provider.locked.terminal": "Dieser Anbieter wurde in einem Terminal auf dem Host eingerichtet, mit einem Schlüssel, einem Endpunkt oder einem Befehl. Die Einstellungen ändern ihn nicht. Um ihn zu ändern, führe dies auf dem Host aus:",
   "settings.speech.provider.locked.off": "Zum Ausschalten:",
@@ -2281,7 +2281,7 @@ export const de: Dictionary = {
   "settings.speech.provider.consent.p3": "issance fragt den Endpunkt zuerst unter seinem EIGENEN Namen an. Wird das abgelehnt, trägt der Ersatzweg die Header der Codex-CLI. Das ist Vortäuschen einer fremden Identität, und mit dem Akzeptieren hier erlaubst du es. Welche Identität auch akzeptiert wird, sie wird als ein Wort in die Konfiguration geschrieben, das du mit `issance stt status` zurücklesen kannst.",
   "settings.speech.provider.consent.p4": "Bisher wurde nichts ausgeführt. Es wird nichts geschrieben, solange du nicht akzeptierst.",
   "settings.speech.provider.consent.accept": "Ich akzeptiere",
-  "settings.speech.provider.consent.probing": "Dein Host prüft die Codex-Anmeldung und fragt den Endpunkt an, zuerst unter Collies eigenem Namen.",
+  "settings.speech.provider.consent.probing": "Dein Host prüft die Codex-Anmeldung und fragt den Endpunkt an, zuerst unter issance eigenem Namen.",
   "settings.speech.host.remove": "Vom Host entfernen",
   "settings.speech.host.remove.confirm":
     "Das Modell von deinem Host entfernen? Die Spracheingabe auf dem Host endet, bis du es wieder lädst.",

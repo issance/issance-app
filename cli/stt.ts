@@ -270,7 +270,7 @@ async function setupOpenAi(
   }
 
   const model = await ask(deps, flags.model, {
-    lead: [`The model the endpoint understands. Empty takes issance's default, ${DEFAULT_STT_MODEL}.`],
+    lead: [`The model the endpoint understands. Empty takes issance default, ${DEFAULT_STT_MODEL}.`],
     question: `model [${DEFAULT_STT_MODEL}]: `,
     missing: `the model — \`issance stt setup --model <name>\` (default ${DEFAULT_STT_MODEL})`,
     optional: true,
@@ -771,7 +771,7 @@ function describeProvider(settings: SttSettings): string {
   if (settings.provider === "local-cli") {
     return `local-cli (${settings.command}, ${settings.args.length} argument(s) before the recording)`;
   }
-  if (settings.provider === "whistle") return "whistle (issance's own engine, the model in the state dir)";
+  if (settings.provider === "whistle") return "whistle (issance own engine, the model in the state dir)";
   const language = settings.language === undefined ? "auto-detect" : settings.language;
   return `openai-compatible (${settings.baseUrl}, model ${settings.model}, language ${language})`;
 }
@@ -853,7 +853,7 @@ export async function cmdSttStatus(deps: SttDeps): Promise<number> {
       return EXIT.FAIL;
     }
   } else if (settings.provider === "whistle") {
-    row("engine", "issance's own, in a child of this binary", "fixed");
+    row("engine", "issance own, in a child of this binary", "fixed");
     row("model", (await modelStatus(deps)).line, "state dir");
   } else {
     row("endpoint", settings.baseUrl, source("baseUrl"));

@@ -35,7 +35,7 @@
 // which is also exactly what it does offline, forever, without losing the preference.
 //
 // IT NOW DOES A THIRD THING: the colour theme (M57). A device that picked a theme must not watch the
-// app paint in issance's colours first. The id is the `theme` field of the same design blob.
+// app paint in issance colours first. The id is the `theme` field of the same design blob.
 //   * A shipped id sets `data-theme`, and the value written is the entry of SHIPPED below, never the
 //     stored string. `issance` is not in the list: the default theme writes nothing at all.
 //   * An imported id is looked up in the library (`issance:themes:v1`). Each name in TOKENS, the closed

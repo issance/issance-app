@@ -973,7 +973,7 @@ function ToolCardBody({
     case "delete":
     case "move": {
       // `tool.name` is the tool's own name, reported by the harness — the one label here that is
-      // not issance's word and therefore not a key.
+      // not issance word and therefore not a key.
       const label =
         tool.kind === "search"
           ? t("chat.card.search")

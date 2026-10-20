@@ -1624,7 +1624,7 @@ describe("Composer — the machine opens the actions belt, and no band stands ab
     const scrollerClass = actions().querySelector(".overflow-x-auto")!.className;
     expect(scrollerClass).toMatch(/(?:^|\s)pl-3(?=\s|$)/);
     expect(scrollerClass).toMatch(/(?:^|\s)pr-3(?=\s|$)/);
-    // The group's GUTTER is the scroller's and nothing else: with the capsule gone, issance's
+    // The group's GUTTER is the scroller's and nothing else: with the capsule gone, issance
     // controls stand on the belt's own ground and own no padding at all.
     expect(row().className).not.toMatch(/(?:^|\s)px-/);
   });

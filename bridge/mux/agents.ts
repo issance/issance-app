@@ -20,7 +20,7 @@
  */
 export const MUX_PROFILE_ONLY_AGENT_NAMES: readonly string[] = ["cursor"];
 
-/** Every agent name a harness reader or an input profile of issance's answers to, sorted. */
+/** Every agent name a harness reader or an input profile of issance answers to, sorted. */
 export const MUX_AGENT_NAMES: readonly string[] = [
   "agy",
   "antigravity",

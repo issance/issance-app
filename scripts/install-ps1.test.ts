@@ -1241,7 +1241,7 @@ describe.skipIf(!IS_WINDOWS)("scripts/install.ps1 on Windows, against a local mi
     expect(existsSync(join(b.dir, "versions", v1, "bin", "sentinel.txt"))).toBe(true);
   }, 60_000);
 
-  test("a real folder named `current` is not issance's to remove", async () => {
+  test("a real folder named `current` is not issance to remove", async () => {
     const b = box();
     twoVersions(b);
     mkdirSync(join(b.dir, "current"));

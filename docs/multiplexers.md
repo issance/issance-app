@@ -87,7 +87,7 @@ With `ISSANCE_MUX` unset, `start` probes for Hangar, tmux, and zellij, prompts f
 writes the answer to `.env`. For the full configuration reference, see
 [`MUX_CONTRACT.md` → Pointing a issance at a multiplexer](../MUX_CONTRACT.md#pointing-a-issance-at-a-multiplexer).
 
-`issance hooks install claude` installs issance's [beacon](#agent-beacons-optional-linux) hooks, which
+`issance hooks install claude` installs issance [beacon](#agent-beacons-optional-linux) hooks, which
 tmux, zellij and tern require. They expose panes as generic shells, so without hooks every pane appears as
 `bash`.
 
@@ -234,7 +234,7 @@ would install: /home/you/issance/bin/issance beacon emit  (this checkout)
 ```
 
 Because tmux, zellij and tern expose panes as generic shells, agents must announce themselves. This
-requires installing issance's [beacon](#agent-beacons-optional-linux) hooks into Claude Code's
+requires installing issance [beacon](#agent-beacons-optional-linux) hooks into Claude Code's
 configuration. On Hangar, the same hooks give [hook edges](#hook-edges) only.
 
 The output references the `bin/issance` path from this repository. Package installs use the installed
@@ -389,7 +389,7 @@ The edge carries a salted hash of the prompt, never the text itself.
 Claude Code and Codex take a message or a command during a turn. issance types it at once, and the
 harness runs it after the turn. A harness that cannot take a send during its turn gets a held send
 instead. So does a message that finds the input box not free, for example under a popup, or on a
-screen that changes between issance's two reads, or a probe character that failed and that one
+screen that changes between issance two reads, or a probe character that failed and that one
 Backspace took back out of a box issance read clean again. Such a message goes after five free polls over ten
 seconds, or after a turn issance sees. A command there is still refused, and so is a send on a
 screen you confirmed with Type here. A send on a pane with no profile is never held. issance keeps the text and shows a card that floats over the bottom of the terminal view: "Queued.

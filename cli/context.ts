@@ -421,7 +421,7 @@ export function effectiveServePort(env: Environment): number {
 }
 
 // ── The instance suffix ──────────────────────────────────────────────────────
-// Two Collies on one host — a stable one and a next-major one being shaken out beside it — need two
+// Two issance on one host — a stable one and a next-major one being shaken out beside it — need two
 // of everything the CLI names: a unit, a launchd label, a pidfile, a log, an ownership record. One
 // knob supplies the suffix for all of them, and NOTHING else: ports and state dirs stay explicitly
 // configured, because a knob that INVENTS those would be inventing where a second service writes.

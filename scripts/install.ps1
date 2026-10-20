@@ -1,4 +1,4 @@
-# issance's installer for Windows. It downloads the Windows release, checks its sha256, lays it down,
+# issance installer for Windows. It downloads the Windows release, checks its sha256, lays it down,
 # and puts `issance` on your user PATH. It is the Windows twin of install.sh.
 #
 # Run it like this, in PowerShell:
@@ -319,7 +319,7 @@ function Set-CollieCurrent([string]$Dir, [string]$Target) {
     return
   }
   if ($state -eq "other") {
-    Stop-CollieInstall "$current is a real folder or file, not a junction, so it is not issance's to remove." "Move $current aside, then run the installer again."
+    Stop-CollieInstall "$current is a real folder or file, not a junction, so it is not issance to remove." "Move $current aside, then run the installer again."
   }
   $old = Get-CollieLinkTarget $current
   switch (Get-CollieLinkState $staged) {
@@ -412,7 +412,7 @@ function Invoke-CollieInstall {
   $repo = "$env:ISSANCE_UPDATE_REPO".Trim()
   if ($repo -eq '') { $repo = "issance/issance-app" }
   if (-not (Test-CollieRepo $repo)) {
-    Stop-CollieInstall "ISSANCE_UPDATE_REPO='$repo' is not a GitHub repository name like issance/issance-app." "Set ISSANCE_UPDATE_REPO to owner/name, or remove it to take issance's own releases."
+    Stop-CollieInstall "ISSANCE_UPDATE_REPO='$repo' is not a GitHub repository name like issance/issance-app." "Set ISSANCE_UPDATE_REPO to owner/name, or remove it to take issance own releases."
   }
   if ($repo -cne "issance/issance-app") {
     Write-CollieLine "WARNING: ISSANCE_UPDATE_REPO is set. This installs issance from github.com/$repo, not from issance/issance-app."
@@ -537,7 +537,7 @@ function Invoke-CollieInstall {
       }
     }
     if ((Get-CollieLinkState $current) -eq "other") {
-      Stop-CollieInstall "$current is a real folder or file, not a junction, so it is not issance's to remove." "Move $current aside, then run the installer again."
+      Stop-CollieInstall "$current is a real folder or file, not a junction, so it is not issance to remove." "Move $current aside, then run the installer again."
     }
   }
   if ($rescue -and (Test-Path -LiteralPath $versionDir)) {

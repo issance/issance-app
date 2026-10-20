@@ -38,7 +38,7 @@ function midnight(id = "midnight", extra: Partial<Theme> = {}): Theme {
   };
 }
 
-/** issance's own index.css palette on its own ground: a palette that passes the gate. */
+/** issance own index.css palette on its own ground: a palette that passes the gate. */
 const PALETTE = {
   "0": "#000000", "1": "#cd3131", "2": "#0dbc79", "3": "#e5e510", "4": "#2472c8", "5": "#bc3fbc",
   "6": "#11a8cd", "7": "#e5e5e5", "8": "#666666", "9": "#f14c4c", "10": "#23d18b", "11": "#f5f543",

@@ -156,7 +156,7 @@ describe("isOwnerOnly: three answers", () => {
     expect(isOwnerOnly(STATE, WIN, noUser.deps).state).toBe("not-checked");
   });
 
-  test("an entry reached through a junction is not issance's and not counted", () => {
+  test("an entry reached through a junction is not issance and not counted", () => {
     const tree = `${PROTECTED_DIR("issance")}issance\\link\r\nD:AI(A;ID;FA;;;SY)\r\ncollie\\link\\x.txt\r\nD:AI(A;;FR;;;WD)\r\n`;
     const f = fake({ saves: { [`${STATE} /T`]: [tree] }, files: { [STATE]: { dir: true } }, links: new Set([`${STATE}\\link`]) });
     expect(isOwnerOnly(STATE, WIN, f.deps)).toEqual({ state: "private" });
@@ -244,13 +244,13 @@ describe("ensureOwnerOnlyDir at bridge start", () => {
         { path: dir, sid: "S-1-5-32-545", what: "read" },
         { path: dir, sid: "S-1-5-11", what: "change" },
       ],
-      why: "it also holds files that are not issance's (src, package.json)",
+      why: "it also holds files that are not issance (src, package.json)",
     });
     expect(f.sets).toEqual([]);
     expect(f.resets).toEqual([]);
     expect(dirOutcomeLine(dir, outcome, f.deps)).toBe(
       `[secrets] ${dir} can be read by other accounts on this PC (Users [S-1-5-32-545], Authenticated Users [S-1-5-11]). ` +
-        "issance did not change it, because it also holds files that are not issance's (src, package.json). To make it private, run: " +
+        "issance did not change it, because it also holds files that are not issance (src, package.json). To make it private, run: " +
         `icacls "${dir}" /grant:r "*${SID}:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /inheritance:r /remove:g *S-1-5-32-545 *S-1-5-11`,
     );
   });
@@ -394,12 +394,12 @@ describe("secretFileVerdict", () => {
     expect(f.sets).toEqual([]);
   });
 
-  test("a secret in a folder that is not issance's: checked, not changed, and withheld", () => {
+  test("a secret in a folder that is not issance: checked, not changed, and withheld", () => {
     const toml = "D:\\shared\\config.toml";
     const f = fake({ saves: { [toml]: [EVERYONE_FILE("config.toml")] }, files: { [toml]: {} }, lists: { "D:\\shared": ["config.toml", "notes.txt"] } });
     const v = secretFileVerdict(toml, { repair: true }, f.deps);
     expect(v.ok).toBe(false);
-    expect(v.warning).toContain("issance did not change it, because it also holds files that are not issance's (notes.txt). Fix it yourself, or run: icacls");
+    expect(v.warning).toContain("issance did not change it, because it also holds files that are not issance (notes.txt). Fix it yourself, or run: icacls");
     expect(f.sets).toEqual([]);
   });
 

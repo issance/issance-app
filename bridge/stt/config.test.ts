@@ -65,7 +65,7 @@ describe("stt settings — the file", () => {
     expect(lines).toEqual([]);
   });
 
-  test("an absent model resolves to issance's default rather than becoming a second switch", () => {
+  test("an absent model resolves to issance default rather than becoming a second switch", () => {
     const { warn } = collectWarnings();
     const settings = resolveSttSettings(
       coerceSttFile({ baseUrl: "http://box.tailnet.ts.net:9000/v1" }),

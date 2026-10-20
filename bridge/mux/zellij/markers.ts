@@ -15,7 +15,7 @@
 //
 // zellij numbers TERMINAL panes and PLUGIN panes in separate namespaces: `plugin_0` and `terminal_0`
 // both exist, at the same time, in the same tab (protocol.ts § the pane id). A join that compared the
-// bare integer would therefore be comparing a number that names two different panes — and issance's
+// bare integer would therefore be comparing a number that names two different panes — and issance
 // ids carry the namespace precisely so `terminal_1` and a plugin's `1` can never be confused.
 //
 // ── THE SCOPE CHECK IS LOAD-BEARING, NOT DEFENSIVE ────────────────────────────────────────────────

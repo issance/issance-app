@@ -84,7 +84,7 @@ Facts that shaped it:
    contract: the web asks on open.
 8. **JSON only, never a document.** File bytes travel as a string inside a JSON body with
    `application/json` and `nosniff`, so a browser never renders a file the agent wrote as HTML or
-   SVG under issance's origin. A preview that renders is the web's job, inside a sandbox it owns.
+   SVG under issance origin. A preview that renders is the web's job, inside a sandbox it owns.
 9. **The gate: a read that needs an authorised device.** `files` asks its caller's gate at a third
    level, `device-read`. In the browser's `guard` it is checked for access as a read, so the
    `Origin` rule for writes does not apply (a browser sends no `Origin` on a same-origin GET, and a
@@ -159,7 +159,7 @@ that holds a linked state folder, would list the sibling's pairing records and c
 So a file is also refused and hidden when its basename is one of the state folder's secrets, the
 `state` entry of `PRIVATE_ROOTS` (`crew-trust.json`, `paired-devices.json`,
 `pairing-pending.json`, `push-subscriptions.json`, `standby-devices.json`, `stt.json`), plus
-`pack-trust.json`, the trust store's 1.7.0 name, alone or followed by one of issance's own
+`pack-trust.json`, the trust store's 1.7.0 name, alone or followed by one of issance own
 temporary or rotation suffixes (`crew-trust.json.tmp`). One function decides it,
 `isStateSecretName` in `bridge/acl-policy.ts`, and it reads that list, so a new state secret is
 covered the day it is named there. The rule is checked on the real path's basename, so a link with

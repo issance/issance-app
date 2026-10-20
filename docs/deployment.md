@@ -11,7 +11,7 @@ lives in the README. Security requirements in [docs/security.md](security.md) ap
 - [Front doors, one product at a time](#front-doors-one-product-at-a-time): Tailscale, Cloudflare Tunnel,
   Nginx Proxy Manager, NetBird, Caddy
 - [Serving issance under a path](#serving-issance-under-a-path)
-- [Several Collies on one host](#several-collies-on-one-host)
+- [Several issance on one host](#several-collies-on-one-host)
 - [Multiple issance instances on one host](#multiple-issance-instances-on-one-host)
 - [The standby door — a crew's failover path](#the-standby-door--a-crews-failover-path)
 
@@ -293,7 +293,7 @@ fixed hostname, forwarded to `127.0.0.1:$ISSANCE_PORT` on this host.
 > the phone trusts. Over plain HTTP, issance still reads and replies in a browser tab, and those
 > three stay off ([Voice input and Web Push](voice-and-push.md)).
 
-Every front door except Tailscale uses the same three lines in issance's `.env`, then a restart:
+Every front door except Tailscale uses the same three lines in issance `.env`, then a restart:
 
 ```bash
 ISSANCE_SKIP_SERVE=1                                 # you own the door, not issance
@@ -539,7 +539,7 @@ on its own: it tears down the mapping its record names before it publishes the n
 
 ---
 
-## Several Collies on one host
+## Several issance on one host
 
 To host independent instances per user on a shared system ([ADR 0001](../.adr/0001-one-managed-front-door.md)):
 
@@ -572,7 +572,7 @@ instance with its own service unit and config on the same host
 Use this setup to run a second, distinct issance on the same machine. Examples include running a
 stable release alongside a working copy, or running a second multiplexer (`tmux`/`zellij`) next to
 the Hangar-managed default. Each instance gets a dedicated port, config, state directory, and
-service unit. This differs from [Several Collies on one host](#several-collies-on-one-host), which
+service unit. This differs from [Several issance on one host](#several-collies-on-one-host), which
 allocates one instance per Unix user. Here, one user runs multiple instances.
 
 ### Create the second instance

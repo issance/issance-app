@@ -44,7 +44,7 @@ describe("the version table", () => {
     expect(versionRefusal({ min: 2, max: 3 })).toEqual({ code: "version", issance: [1, 1], program: [2, 3] });
   });
 
-  test("the version notice row is one line naming the program's newest and this issance's own", () => {
+  test("the version notice row is one line naming the program's newest and this issance own", () => {
     const refusal = versionRefusal({ min: 2, max: 3 });
     expect(refusal).not.toBeNull();
     expect(versionNotice(refusal!)).toBe("The durable agent speaks wire v3, this issance speaks v1. Update issance, or the agent's SDK.");
@@ -63,7 +63,7 @@ describe("a version refusal, both sides", () => {
     return { program, clock, lines, adapter };
   }
 
-  test("issance's side: one log line, the refusal kept for the notice row, the census never empty", async () => {
+  test("issance side: one log line, the refusal kept for the notice row, the census never empty", async () => {
     const { adapter, clock, lines } = await rig({ min: 2, max: 3 });
     for (let poll = 0; poll < 3; poll += 1) {
       const outcome = await adapter.poll();
@@ -75,7 +75,7 @@ describe("a version refusal, both sides", () => {
     expect(await adapter.reachable()).toBe(false);
   });
 
-  test("the program's side: one telling hello per start carries this issance's version and gets the 409 with the refusal", async () => {
+  test("the program's side: one telling hello per start carries this issance version and gets the 409 with the refusal", async () => {
     const { adapter, program, clock } = await rig({ min: 2, max: 3 });
     await adapter.poll();
     clock.advance(MIN_SNAPSHOT_GAP_MS);

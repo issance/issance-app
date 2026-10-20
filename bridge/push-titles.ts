@@ -10,7 +10,7 @@
 // {@link pushTitle} renders the sentence from THIS table.
 //
 // ONLY THE TITLE. A body is the pane's place, the names in a digest, or a release's own notes — the
-// operator's words and issance's history, not issance's UI — so it travels as it always has.
+// operator's words and issance history, not issance UI — so it travels as it always has.
 //
 // THE CLIENT MIRROR is `web/src/lib/push-title-codes.ts`. The two trees are type-checked separately,
 // so the code list is restated there rather than imported; `bridge/push-titles.test.ts` reads both

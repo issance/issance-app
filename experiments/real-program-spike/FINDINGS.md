@@ -81,7 +81,7 @@ task, the deploy is cancelled, the ask closes), subtitle, progress and push word
 
 1. **A Node transport.** `server.ts`, `conn.ts`, `peer.ts` need Bun. The port carries its own
    `node:http` server and drops the descendant check. The core ran on Node unchanged.
-2. **The Pi helper imports issance's example words** from `../script.ts`; a program must stub it.
+2. **The Pi helper imports issance example words** from `../script.ts`; a program must stub it.
 3. **The Pi helper targets pi-durable 1.1.0** (`order` on `entries` and `scanConversations`): three
    type errors on 1.0.3. It runs; history order on 1.0.3 not checked.
 4. **No `requireApproval`** (spec 03 not in this base). The ask was built by hand.
@@ -103,7 +103,7 @@ Host clock: start 23:27, approval end to end at about 23:33, report 23:35 on 202
 
 ## Draft to the author (not sent)
 
-> Thanks @disler, I ported the proactive demo to issance's durable wire on a local branch, and the
+> Thanks @disler, I ported the proactive demo to issance durable wire on a local branch, and the
 > deploy that waits for approval now shows on the phone as one card whose Approve commits the same
 > decision as your Approve button. The change is one new file of about 160 lines and six lines in
 > the demo, and I can open it as a pull request if you want it.

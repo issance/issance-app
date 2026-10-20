@@ -2,7 +2,7 @@
 
 `bun run canary` starts claude, codex, opencode and pi, and grok, hermes, agy, omp and muse when `--agent`
 names them, in a Hangar session of its own, types drafts
-and a few real sends, and checks with issance's own code what the phone would read and whether each
+and a few real sends, and checks with issance own code what the phone would read and whether each
 send lands. It then reads the session each agent WROTE, with the bridge's own journal adapter, and
 fails on a row or content type the reader does not recognise. With `--dialogs` it also opens real
 dialogs and sends to a busy agent, and with `--scenario options` it starts each New-sheet option once.
@@ -117,7 +117,7 @@ OpenCode restarts. Plan approval is read and never answered. A dialog the model 
 ## Verdicts
 
 Whether a screen was reached is judged without issance: Hangar's agent state and the screen's plain
-text. What the phone makes of that screen is judged with issance's readers only.
+text. What the phone makes of that screen is judged with issance readers only.
 
 - `pass`: the screen came, and issance read it right.
 - `fail`: the screen came, and issance read it wrong. The run exits 1.
@@ -240,7 +240,7 @@ The lab starts `bridge/index.ts` of this checkout as a child process. It binds `
 It never takes a port from 8787 to 8799. The bridge gets a temporary `HOME` and `ISSANCE_STATE_DIR` inside the run folder,
 the lab's tmux server, and the lab's installed agent binary first on its `PATH`.
 The lab writes one paired device into that state folder and keeps the token in memory only.
-The phone panes use a second login copy with issance's beacon hooks, so a send can end `effective`.
+The phone panes use a second login copy with issance beacon hooks, so a send can end `effective`.
 The bridge starts with a fresh state folder every time, so no counter or daily cap of an earlier run reaches it.
 At the end the lab stops the bridge and deletes its folder. The bridge log goes into the captures folder, redacted.
 

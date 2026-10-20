@@ -68,7 +68,7 @@ import {
 // WHAT A LOADED MACHINE DOES TO THIS FILE. Every case that asserts an activation is bounded by the
 // app's own eight-second guard: past it the operator's tap reloads from the ACTIVE worker, on the
 // old bundle, by design. So a runner that cannot install and activate a worker inside eight seconds
-// fails these cases, and the number it misses is issance's promise rather than this file's budget.
+// fails these cases, and the number it misses is issance promise rather than this file's budget.
 // Seen on 2026-09-09 at a load average of 30 on sixteen cores, with the suite green either side of
 // it. If CI turns out to sit that close to the edge, the constant to move is `STUCK_GUARD_MS` in
 // `src/lib/pwa.ts`, not a timeout here.

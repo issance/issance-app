@@ -394,7 +394,7 @@ async function errorDetail(res: Response): Promise<string> {
 
 // `redirect: "manual"` is intentionally local to the API client rather than a global fetch patch.
 // Browsers expose a manual redirect as `opaqueredirect` (status 0); test/runtime implementations may
-// expose the actual 3xx. issance's own API has no redirect contract, and 304 is a normal pane ETag hit,
+// expose the actual 3xx. issance own API has no redirect contract, and 304 is a normal pane ETag hit,
 // so only these redirect statuses are authentication-front-door territory.
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 

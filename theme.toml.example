@@ -1,7 +1,7 @@
 # Your own UI typefaces for issance. Copy to your plugin config dir, next to `.env`:
 #   cp theme.toml.example "$(herdr plugin config-dir herdr.issance)/theme.toml"
 #
-# This file adds faces to the Typeface picker in Settings. Unlike issance's other three operator
+# This file adds faces to the Typeface picker in Settings. Unlike issance other three operator
 # files, your rows ADD to the shipped list — they never replace it (ADR 0033). Space Grotesk,
 # Aldrich and "System default" stay where they are; yours appear underneath them.
 #
@@ -37,7 +37,7 @@
 #   * On a cold load, your face is applied a beat after the shipped ones would have been. A device
 #     that has already chosen it remembers enough to paint it immediately from then on.
 #
-# One more: the chosen face dresses issance's own chrome and NEVER an agent's words. The pane mirror,
+# One more: the chosen face dresses issance own chrome and NEVER an agent's words. The pane mirror,
 # the transcript and rendered markdown keep their own faces whatever you put here.
 
 # [[font]]

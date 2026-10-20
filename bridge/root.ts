@@ -82,7 +82,7 @@ export function pluginRoot(): string {
 }
 
 /**
- * The argv prefix that runs THIS issance's own CLI, for a child that must be the same code as the
+ * The argv prefix that runs THIS issance own CLI, for a child that must be the same code as the
  * bridge that spawns it (the Whistle provider's `_whistle-transcribe`, ADR 0096 Decision 4).
  *
  * Compiled, it is the running binary itself, which has one entrypoint, the CLI. From source

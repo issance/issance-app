@@ -339,9 +339,9 @@ describe("Tab actions — renameTab and closeTab", () => {
   });
 
   it("explains when neither is", async () => {
-    declares({ renameTab: false, closeTab: false }, { closeTab: "tabs are not issance's to change here." });
+    declares({ renameTab: false, closeTab: false }, { closeTab: "tabs are not issance to change here." });
     tabSheet();
-    expect(await screen.findByText(/not issance's to change here/i)).toBeInTheDocument();
+    expect(await screen.findByText(/not issance to change here/i)).toBeInTheDocument();
     expect(screen.queryByText("Close tab")).toBeNull();
   });
 });

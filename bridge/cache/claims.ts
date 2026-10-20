@@ -105,7 +105,7 @@ export interface ResetRule {
   harness: string;
   /**
    * What happened, as the pane sheet names it: a clause that reads on its own, "The model changed".
-   * issance's words rather than a vendor's, and still not translated: it rides the pane wire from the
+   * issance words rather than a vendor's, and still not translated: it rides the pane wire from the
    * machine that detected it, and the phone slots it into a translated sentence.
    */
   label: string;

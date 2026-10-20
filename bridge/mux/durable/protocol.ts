@@ -96,7 +96,7 @@ export function versionRefusal(program: ProtocolRange, speaks: ProtocolRange = S
   return { code: "version", issance: [speaks.min, speaks.max], program: [program.min, program.max] };
 }
 
-/** The one line a refusal is shown as: in issance's log, and as the notice row of the program's pane list. */
+/** The one line a refusal is shown as: in issance log, and as the notice row of the program's pane list. */
 export function versionNotice(refusal: VersionRefusal): string {
   return `The durable agent speaks wire v${String(refusal.program[1])}, this issance speaks v${String(refusal.issance[1])}. Update issance, or the agent's SDK.`;
 }

@@ -44,7 +44,7 @@ export const BEACON_TTL_MS = 12 * 60 * 60 * 1000;
 /**
  * The beacon's OWN status vocabulary — three words, taken from paseo's event map.
  *
- * Deliberately NOT `AgentStatus`. issance's five words are a triage vocabulary with no `waiting` in
+ * Deliberately NOT `AgentStatus`. issance five words are a triage vocabulary with no `waiting` in
  * them, and mapping into it (`waiting → blocked`, because `STATUS_RANK.blocked = 0`) is a decision
  * about how issance sorts, which belongs to the decorator (M11/03) and not to the file format.
  */
@@ -193,7 +193,7 @@ export interface EdgeRecord {
   /** The salted SHA-256 of the prompt a `UserPromptSubmit`-like event carried, or null. */
   readonly promptHash: string | null;
   /**
-   * Whether the settings the harness reads hold issance's permission hook (M56 spec 12), so the pane
+   * Whether the settings the harness reads hold issance permission hook (M56 spec 12), so the pane
    * info can say "holds permissions". Absent from an older emitter, which reads as false.
    */
   readonly holds?: boolean;

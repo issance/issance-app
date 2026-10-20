@@ -290,7 +290,7 @@ A package is a standalone install managed by your package manager: it installs, 
 removes. Commands for each manager appear above and under [Package details](#package-details),
 along with [mise](#mise) for Linux and macOS.
 
-A package is not a Hangar plugin. To show issance's buttons in Hangar, link the installed tree once:
+A package is not a Hangar plugin. To show issance buttons in Hangar, link the installed tree once:
 
 ```bash
 hangar plugin link /opt/issance
@@ -431,7 +431,7 @@ menus. If you see **Open as Web App**, keep it selected.
 
 ![The Install card on iOS or iPadOS: installing goes through the share sheet.](images/updates/settings-install-ios-hint.png)
 
-Safari does not provide an install button. issance's Settings shows an Install card with these steps
+Safari does not provide an install button. issance Settings shows an Install card with these steps
 instead until you complete them.
 
 > **Note.** On iPhone or iPad, Web Push requires iOS 16.4 or newer and works only from the home
@@ -440,7 +440,7 @@ instead until you complete them.
 ### Android
 
 1. Open the issance URL in Chrome.
-2. Go to issance's Settings and tap **Install** on the top card.
+2. Go to issance Settings and tap **Install** on the top card.
 
 This card appears once Chrome offers the install. If it does not appear, open Chrome's menu (⋮)
 and tap **Add to home screen**, then **Install**. Some Chrome builds label this **Install app**.
@@ -519,7 +519,7 @@ update sticks, see **[Manage & update](upgrading.md)**.
 Three steps, in this order. Each one removes one layer and nothing else.
 
 **1. Remove the service and the port mapping.** This stops the bridge, deletes the `systemd --user`
-unit (the launchd agent on macOS) and takes down issance's own `tailscale serve` mapping. The
+unit (the launchd agent on macOS) and takes down issance own `tailscale serve` mapping. The
 program files and your `.env` stay.
 
 ```bash
@@ -619,7 +619,7 @@ ISSANCE_MUX=hangar issance start
 
 Omarchy ships tmux and Hangar both, and issance mirrors one multiplexer per install, so the first
 start has to name the one to drive: it refuses to guess between two it can see. `start` writes
-that name into issance's `.env`, which on a host with Hangar is
+that name into issance `.env`, which on a host with Hangar is
 `~/.config/hangar/plugins/config/herdr.issance/.env`, and later starts are `issance start`.
 
 That works once `issance-bin` is in Omarchy's own package repository, and the pull request adding it
@@ -711,7 +711,7 @@ For a named instance, use the label `hangar.issance-<name>` and the same `ISSANC
 
 > **Note.** Home Manager owns the service lifecycle. Update or remove its declaration and
 > activate Home Manager rather than running `issance start`, `stop`, `restart`, or `uninstall`.
-> Those commands still manage issance's GUI-domain agent; status discovery does not transfer
+> Those commands still manage issance GUI-domain agent; status discovery does not transfer
 > ownership. Continue using `issance pair`, `devices`, `url`, and `logs` normally.
 
 #### mise

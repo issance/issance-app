@@ -171,7 +171,7 @@ cd "$EXAMPLE" && REAL_PROVIDER=openai REAL_MODEL=gpt-5-nano bun run app
 No menu appears. The login starts the browser flow at once and prints a URL to open. The browser must run on the
 same machine as the login, because the callback is `127.0.0.1:1455`, the port the Codex CLI login also uses.
 Close a Codex CLI login first, or the port is taken. Which models a ChatGPT plan reaches is OpenAI's list, not
-issance's. `gpt-5-nano` is the model the API-key test used, so change it if your plan does not include it.
+issance. `gpt-5-nano` is the model the API-key test used, so change it if your plan does not include it.
 
 The login writes `auth.json` with mode 0644, so run the `chmod 600` right after it. The app keeps the mode 0600
 when it refreshes the tokens. The app reads `auth.json` from its data folder, and Pi keeps the tokens fresh
@@ -197,7 +197,7 @@ stop, a belt action, a rename, a close, a reopen or a starter) from itself and f
 the process tree, with `403 caller-refused`.
 Reads stay open. To find the caller, the app reads its pid from the socket (`SO_PEERCRED`, through
 `bun:ffi`) and walks the parent links in `/proc`. A caller whose process is gone, or whose chain of
-parents breaks, is refused too. issance's adapter reports the 403 as a refusal that names the code, and
+parents breaks, is refused too. issance adapter reports the 403 as a refusal that names the code, and
 never retries it ([`WIRE.md` section 3, error codes](../../bridge/mux/durable/WIRE.md#error-codes)).
 
 The check has holes:
@@ -207,7 +207,7 @@ The check has holes:
   adopts it, and it is no longer below the app. The test "a process that left the tree" shows this.
 - **Every other process of your user gets through.** A shell you open, another program, a user
   service, or anything that a tool asks one of these to run.
-- **Anything that runs as you can read what you can read,** issance's own state folder included.
+- **Anything that runs as you can read what you can read,** issance own state folder included.
 
 So the check stops the simple case only. The real defence is a sandbox for the agent's tools: run them
 as another user, in a mount or network namespace that cannot reach the socket, or behind a seccomp
@@ -370,4 +370,4 @@ the socket rules, the hello, the request ids, the cleaning and the caps, the
 descendant check, a whole ticket, and restarts with real kills. The protocol tests run twice, over the
 socket and straight against the core. It needs no key and makes no network
 call. From the root of issance, `bun test bridge/mux/durable/example.test.ts` starts the desk, and
-`bun test bridge/mux/durable/example-hello.test.ts` starts `hello.ts`; both are driven by issance's own adapter.
+`bun test bridge/mux/durable/example-hello.test.ts` starts `hello.ts`; both are driven by issance own adapter.

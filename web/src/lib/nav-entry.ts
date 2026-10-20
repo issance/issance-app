@@ -1,4 +1,4 @@
-// How issance's history begins and how it is entered from outside (ADR 0067). Three pieces, each
+// How issance history begins and how it is entered from outside (ADR 0067). Three pieces, each
 // small, all about the history stack rather than about any one route:
 //
 //   1. `seedColdEntry` puts a deep link's parents BEHIND it on a cold start, so the first edge

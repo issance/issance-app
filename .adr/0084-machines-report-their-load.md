@@ -132,7 +132,7 @@ asks every member for its snapshot on every sweep, so the fact was one field awa
 
 9. **Disks too, read with `statfs` and never on the tick's time.** A sample carries an optional
    `disks: [{ mount, used, total }]` in bytes (`bridge/machine-disks.ts`). The filesystems are the
-   ones holding the home folder, the root (the system drive on Windows) and issance's state folder,
+   ones holding the home folder, the root (the system drive on Windows) and issance state folder,
    with symlinks resolved. A filesystem is left out when it is under 1 GiB, or read-only with no free
    block: a Fedora Atomic root is a 34 MiB composefs image at 100 %, and it must never show or alert
    (on Linux the `ro` flag comes from `/proc/self/mounts`; elsewhere "no free block, the root reserve

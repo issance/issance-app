@@ -249,12 +249,12 @@ function rankOf(order: ReadonlyMap<string, number>, key: string): number {
 }
 
 /**
- * One pane the multiplexer reported, as the view issance's clients read.
+ * One pane the multiplexer reported, as the view issance clients read.
  *
  * Almost a rename, and that is the point: the port already carries everything a pane IS, so this
  * only re-labels the fields the wire has always used (`workspaceId`, not `spaceId` — nothing
  * phone-visible renames) and adds the two things the multiplexer cannot know. `kind` is one
- * (issance's split of the herd into agents and bare shells); `sessionName` is the other, filled in
+ * (issance split of the herd into agents and bare shells); `sessionName` is the other, filled in
  * afterwards from the pane's own text (see {@link StateEngine.enrichSessionNames}).
  */
 function toView(pane: MuxPane, kind: "agent" | "shell"): AgentView {

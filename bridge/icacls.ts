@@ -6,7 +6,7 @@
 //
 // BY ABSOLUTE PATH. Each tool is `%SystemRoot%\System32\<tool>.exe` (`C:\Windows` when SystemRoot is
 // unset), never a bare name: Windows looks in the current folder first, so a cloned repository that
-// carries its own `icacls.exe` would otherwise run in issance's place.
+// carries its own `icacls.exe` would otherwise run in issance place.
 //
 // BOUNDED. Every call ends after {@link ACL_TIMEOUT_MS}; a call that ran out of time answers
 // `timedOut`, which the caller treats as "not checked", never as "loose".
@@ -137,7 +137,7 @@ export const bunRunner: Runner = {
 
 /**
  * Temp files in the user's own temp folder, which the profile keeps private. They hold access lists
- * of issance's folders, not secrets, and each is removed when its call returns.
+ * of issance folders, not secrets, and each is removed when its call returns.
  */
 export const realScratch: Scratch = {
   file: () => nodePath.join(tmpdir(), `issance-acl-${randomUUID()}.txt`),

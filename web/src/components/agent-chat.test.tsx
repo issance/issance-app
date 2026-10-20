@@ -2364,7 +2364,7 @@ describe("AgentChat — zen mode", () => {
     expect(header).not.toBeNull();
     expect(header?.className).toContain("[padding-top:env(safe-area-inset-top)]");
 
-    // Content stays. Zen hides issance's chrome, never the pane's output — the mirror keeps polling
+    // Content stays. Zen hides issance chrome, never the pane's output — the mirror keeps polling
     // and keeps rendering exactly as it did.
     expect(screen.getByText("Welcome back!")).toBeInTheDocument();
   });

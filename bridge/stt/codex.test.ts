@@ -100,7 +100,7 @@ function held<T>() {
 }
 
 describe("the codex provider — the identity on the wire", () => {
-  test("honest sends issance's own User-Agent and NO originator header", async () => {
+  test("honest sends issance own User-Agent and NO originator header", async () => {
     const { fetch, calls } = recorder(() => Response.json({ text: "hello" }));
     const provider = createCodexSttProvider(HONEST, {
       broker: fakeBroker(),

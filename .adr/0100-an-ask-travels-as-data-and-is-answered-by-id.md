@@ -98,7 +98,7 @@ it needs no change. WIRE.md section 6 states the rule; a random id stays allowed
 - A hostile program can send many asks. The caps bound the noise, and the string cleaning of
   ADR 0099 bounds what each one can show. They do not make a bad ask safe to accept. A person still
   reads the card. The card's buttons take their words and weight from the option's `effect`, in
-  issance's own words, with the program's label as small text under them, and `allow-always` needs
+  issance own words, with the program's label as small text under them, and `allow-always` needs
   a second tap that names the tool.
 - The socket does not stop a process of the same user, and a tool the agent runs is such a
   process: it can open the socket and answer an ask, so a durable program SHOULD refuse callers

@@ -183,14 +183,14 @@ A refusal is one object, the same on both sides:
 ```ts
 interface VersionRefusal {
   code: "version";
-  /** issance's range, [N-1, N] (or [N, N] when it accepts no N-1). */
+  /** issance range, [N-1, N] (or [N, N] when it accepts no N-1). */
   issance: [number, number];
   /** The program's own range, [min, max]. */
   program: [number, number];
 }
 ```
 
-- **issance's side.** The adapter writes one log line for each range it refuses, not one per poll, and
+- **issance side.** The adapter writes one log line for each range it refuses, not one per poll, and
   keeps the refusal for the bridge. The pane list SHOULD show one notice row in place of the program's
   panes: `The durable agent speaks wire v<max>, this issance speaks v<N>. Update issance, or the agent's SDK.`, where `<max>` is the
   program's newest version.
@@ -1374,7 +1374,7 @@ document. The version number stays 1; the spike's shapes are not supported.
     adapter ignores both caps and `sessionId`, and an older program never sets them.
 28. **A version policy** (section 2): issance speaks N and accepts N-1 for one minor. `Problem` gains an
     optional `refusal` (a `VersionRefusal`) on 409 `incompatible`, and a refused program gets one telling
-    `hello` per epoch with issance's version, which every version 1 program already answers 409.
+    `hello` per epoch with issance version, which every version 1 program already answers 409.
     Additive, so the version stays 1.
 29. **`Ask` gains an optional `expiresAt`** (sections 4 and 7.3). Past it the ask is decided by `timeout`.
     Additive: an older adapter ignores it and keeps the ask until the program closes it.

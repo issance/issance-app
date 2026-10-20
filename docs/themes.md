@@ -127,7 +127,7 @@ the other parts. A floor is a contrast ratio, so a higher number is easier to re
 | `rule` on `background` | 1.3 |
 | `status-blocked` apart from `status-done` | a distance of 0.15 |
 
-- **Destructive text is held to what issance measures when you keep its colours.** issance's own light red on
+- **Destructive text is held to what issance measures when you keep its colours.** issance own light red on
   its page measures 4.38. A theme that keeps both colours of the pair is held to that value and never below 3.
   A theme that moves either colour is held to 4.5.
 - **A gradient or a grain is measured at its far end.** The report measures the page text, the chips,

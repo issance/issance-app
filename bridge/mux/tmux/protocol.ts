@@ -121,12 +121,12 @@ export interface TmuxPaneRecord {
  * Listed for exactly one question: WHICH SESSION IS THE OPERATOR'S SCREEN SHOWING. tmux's own
  * `session_attached` cannot answer it, because this adapter's watch attaches control clients of its
  * own and they would count as an operator. `client_control_mode` is what tells the two apart —
- * probed 2026-08-25 against the live test server, where issance's own watcher reported `1` and the
+ * probed 2026-08-25 against the live test server, where issance own watcher reported `1` and the
  * two real terminals reported `0`.
  */
 export interface TmuxClient {
   readonly sessionId: string;
-  /** A `tmux -C` client — issance's own watch is one of these, and it is nobody's screen. */
+  /** A `tmux -C` client — issance own watch is one of these, and it is nobody's screen. */
   readonly control: boolean;
   /** tmux's last-activity stamp for this client. Orders two real terminals; nothing more. */
   readonly activity: number;
@@ -436,7 +436,7 @@ const READ_ONLY_CLIENT = /^client is read-only$/m;
 /**
  * A client name no tmux client can have. tmux 3.7 resolves the "target client" of `send-keys` to the
  * most recently active client of the pane's session, and refuses when that client is read-only, which
- * issance's own watcher always is. Naming a client that does not exist makes the lookup fail quietly
+ * issance own watcher always is. Naming a client that does not exist makes the lookup fail quietly
  * (`send-keys` carries CMD_CLIENT_CANFAIL), so tmux sends the keys to the pane and asks no client.
  */
 export const NO_TARGET_CLIENT = "issance-no-client";
@@ -454,7 +454,7 @@ export function sendKeysArgs(paneId: string, keys: readonly string[], withoutCli
 /**
  * The argv for one control-mode client, attached to one session.
  *
- * Both client flags are load-bearing and neither is a convenience. `ignore-size` stops issance's
+ * Both client flags are load-bearing and neither is a convenience. `ignore-size` stops issance
  * watcher from resizing the operator's own windows — a control client is a real client, and without
  * it every window in the session would be squeezed to the watcher's default 80×24. `read-only`
  * means this connection can never type: writes go through `send-keys`, where they are audited and

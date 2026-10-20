@@ -1189,7 +1189,7 @@ describe("the Task Scheduler tier (Windows)", () => {
     test("over the community script: registers the task again and restarts its bridge alone", async () => {
       const h = windows({ files: { [RECORD]: "7100|7200" }, ps: { 7100: OLD_LAUNCHER, 7200: OLD_BRIDGE } });
       expect(await cmdRestart(h.deps)).toBe(EXIT.OK);
-      // The next logon runs issance's launcher, not a script this release deleted.
+      // The next logon runs issance launcher, not a script this release deleted.
       expect(schtasks(h)).toEqual([`schtasks /Create /TN herdr.issance /XML ${TASK_FILE} /F`]);
       expect(h.exec.killed).toEqual([7200]);
       expect(h.io.stdout.join("\n")).toContain("from the next logon");
@@ -1502,11 +1502,11 @@ describe("the Task Scheduler tier (Windows)", () => {
   });
 
   describe("status", () => {
-    test("names the task, its state, and issance's launcher as a supervised service", async () => {
+    test("names the task, its state, and issance launcher as a supervised service", async () => {
       const h = windows();
-      expect(serviceDescription(h.deps)).toBe("Task Scheduler (herdr.issance) · Running · launcher: issance's");
+      expect(serviceDescription(h.deps)).toBe("Task Scheduler (herdr.issance) · Running · launcher: issance");
       const banner = (await statusBanner(h.deps)).join("\n");
-      expect(banner).toContain("service   Task Scheduler (herdr.issance) · Running · launcher: issance's");
+      expect(banner).toContain("service   Task Scheduler (herdr.issance) · Running · launcher: issance");
       expect(banner).not.toContain("not supervised");
     });
 

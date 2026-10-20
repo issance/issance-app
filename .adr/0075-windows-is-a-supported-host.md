@@ -93,7 +93,7 @@ against a Task Scheduler tier (point 4). The older decisions stand only as histo
      maintainer's accounts.
    - Hangar older than 0.9.3. That is the tested minimum, and `issance doctor` warns below it.
      Hangar's own Windows build is an upstream dependency that the Hangar project makes, so a defect
-     in it is not issance's to fix.
+     in it is not issance to fix.
    - Hangar's action buttons. `herdr-plugin.toml` stays `linux` and `macos` because its actions
      run `bash`.
    - Installing through `hangar plugin install` and starting from a Hangar action. On Windows the
@@ -117,7 +117,7 @@ against a Task Scheduler tier (point 4). The older decisions stand only as histo
    and sets the access list through `icacls` by absolute path. `issance doctor` reports
    `secrets-private` in three states: private, loose, not checked. The repair is narrow: only the
    bridge process repairs, and only a folder issance created now, a default folder under the profile,
-   or a folder that is empty or holds only issance's names. Any other folder is checked and
+   or a folder that is empty or holds only issance names. Any other folder is checked and
    warned about, with the `icacls` line that fixes it. The old list is saved first, and the bridge prints
    the `icacls /restore` line. `ISSANCE_NO_ACL_REPAIR=1` turns every change off. A network share or a
    FAT volume is "not checked", because a list that does not exist cannot be read.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// harness-drift — compares each ledger agent's INSTALLED CLI version against the version issance's
+// harness-drift — compares each ledger agent's INSTALLED CLI version against the version issance
 // readers were last verified on (`web/src/lib/harness/verified-versions.json`, M37 spec 01).
 //
 // 2026-09-26: Claude Code 2.1.283 and Codex 0.156.1 both broke dialog reading the same day they

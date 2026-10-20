@@ -97,7 +97,7 @@ export function resolveTmuxBinary(
  * Which tmux SERVER to talk to, as tmux itself addresses one.
  *
  * tmux has no notion of connecting to a host — a server is a unix socket under the user's runtime
- * dir, named (`-L name`) or given by path (`-S path`). issance's configured endpoint is one string
+ * dir, named (`-L name`) or given by path (`-S path`). issance configured endpoint is one string
  * and the fork is the only ambiguity: a value carrying a `/` is a path, anything else is a name, and
  * an empty value means tmux's own default server. That rule is the documented default and it is
  * mechanical, so an operator can predict it without reading this file.

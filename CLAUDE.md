@@ -149,7 +149,7 @@ is nothing to record. Touch one of them *and* the code under it and the ordinary
 source file is what the line is about. This is enforced two ways, but **you are the first line — do
 it as part of the change, not after**:
 
-**A docs change reaches issance.com only with a release.** issance's `release.yml` tells the website
+**A docs change reaches issance.com only with a release.** issance `release.yml` tells the website
 on every tag, and the website re-quotes `docs/*.md` at the newest published release — so a doc-only
 fix pushed to `main` and not released sits unpublished, and the website's daily cron will not pick it
 up either. To publish sooner, run the website's sync by hand against a ref:
@@ -212,7 +212,7 @@ link; then the by-hand verify recipe, the one block that sits in a `<details>`.
 The compare link's other end is a **real tag, asked of git** (`git describe --tags` on the tagged
 commit's parent), never derived from a CHANGELOG heading: betas 33 to 41 have headings and no tags,
 so a derived link would 404. No previous tag means no compare line. GitHub's generated notes are no
-longer appended either: that list only knew merged pull requests, and most of issance's history
+longer appended either: that list only knew merged pull requests, and most of issance history
 lands as direct commits or cherry-picks that keep the author, so it read as if almost nothing had
 shipped. Nobody writes release notes by hand, and a bullet the script cannot read stops the release
 rather than publishing an empty page. `scripts/release-notes.test.ts` pins the body's shape and
@@ -339,7 +339,7 @@ page to be skimmed.
   both typechecks); a committed `.envrc` carries `use flake` for direnv users, and nobody is
   obliged to allow it. **Do not install a build tool by hand** to get past a version problem — move
   the pin, or say why you did not. Hangar is deliberately not pinned: it is the product's peer, not
-  one of issance's build tools.
+  one of issance build tools.
 - **`nix develop` is the reference, not a requirement.** A developer with no Nix works exactly as
   today — `bun run build`, `bun run lint`, `bun test`, unchanged. No script, hook or `bun run`
   target needs Nix to be installed.
@@ -745,7 +745,7 @@ nothing ([ADR 0103](./.adr/0103-the-wire-has-two-transports-a-private-socket-or-
 hold a provider credential at 0600, open an operator-configured outbound path carrying microphone
 audio, on `codex` spawn a `codex app-server` child, and on `local-cli` spawn the operator's named
 command as the bridge user, once per dictation, argv only and never a shell (ADR 0029, addendum
-2026-10-03). The `whistle` provider spawns issance's own binary instead, `_whistle-transcribe` with a
+2026-10-03). The `whistle` provider spawns issance own binary instead, `_whistle-transcribe` with a
 fixed argv, under the same bounds, and its audio stays on the host. Every one of these costs is
 declined by doing nothing, the local-engine configuration keeps the egress on loopback, and the wire
 identity is probed honest-first and recorded
@@ -787,7 +787,7 @@ the pre-commit hook; a pure refactor takes the `SKIP_CREW_WIRE_CHECK=1` hatch
 
 **Code reaches a peer over the operator's own SSH, never over the crew link** — `crew add` installs
 it and `crew update` levels it, both pushing the lead's own commit as a `git bundle` from a checkout
-lead, while a lead with no commit sends issance's own installer over the same ssh and the member
+lead, while a lead with no commit sends issance own installer over the same ssh and the member
 installs the lead's release tag; the link
 carries runtime data and never becomes a distribution channel
 ([ADR 0016](./.adr/0016-updates-ride-the-operators-ssh.md), addendum 2026-09-04: a peer may also

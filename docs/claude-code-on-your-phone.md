@@ -195,7 +195,7 @@ issance push-keys     # writes the VAPID keys to your .env
 issance restart
 ```
 
-Turn notifications on in issance's Settings on the phone. **Needs input** is enabled by default. On
+Turn notifications on in issance Settings on the phone. **Needs input** is enabled by default. On
 an iPhone, install issance to your home screen first. Safari restricts Web Push to home-screen web
 apps. See [Web Push](voice-and-push.md#web-push-optional).
 

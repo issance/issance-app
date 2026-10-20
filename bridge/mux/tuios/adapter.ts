@@ -12,7 +12,7 @@
 //   tuios workspace  →  issance TAB     (`<session id>:<workspace number>`)
 //   tuios window     →  issance PANE    (the window's `window_id`, carried through unchanged)
 //
-// tuios's three levels are issance's three levels, as on tmux. The ids are the part worth stating:
+// tuios's three levels are issance three levels, as on tmux. The ids are the part worth stating:
 //
 //  • A window id is a UUID that survives a rename, a move between workspaces AND a daemon restart
 //    (probed: `tuios kill-server`, `tuios start-server`, every window came back under its old id).
@@ -193,7 +193,7 @@ function refusalFor<T>(err: T): MuxRefusalOutcome {
 /**
  * The issance harness name for each tuios harness id, where issance has that harness.
  *
- * tuios names harnesses after their manifests (`claude-code`); issance's screen readers and journal
+ * tuios names harnesses after their manifests (`claude-code`); issance screen readers and journal
  * readers key on the short name (`claude`). The contract requires a issance harness name or `shell`
  * (../agents.ts), so a harness missing here reads as a shell rather than passing its tuios id on.
  */

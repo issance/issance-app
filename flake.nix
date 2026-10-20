@@ -1,5 +1,5 @@
 {
-  description = "issance's build environment: the tools a release is built and checked with.";
+  description = "issance build environment: the tools a release is built and checked with.";
 
   # Pinned by revision, not by branch. `flake.lock` records the same revision with its hash, and
   # that lock moves ONLY in a `chore(release): x.y.z` commit — see CLAUDE.md → Versioning. A lock
@@ -90,7 +90,7 @@
           #   zellij  — the other one
           #
           # Hangar is deliberately NOT pinned. It is not in nixpkgs, it is the product's peer rather
-          # than one of issance's build tools, and pinning it would turn this flake into a
+          # than one of issance build tools, and pinning it would turn this flake into a
           # distribution channel for something this repository does not build.
           packages = [
             (pinBun pkgs)

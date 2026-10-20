@@ -137,7 +137,7 @@ from fontTools.ttLib import TTFont
 from fontTools.varLib.instancer import instantiateVariableFont
 
 work = os.environ["WORK"]
-# The line the width ratio is measured over: a real slab of issance's own chrome, NOT the alphabet.
+# The line the width ratio is measured over: a real slab of issance own chrome, NOT the alphabet.
 # An unweighted A-Za-z0-9 sample was tried first and was wrong by 5% on Space Grotesk — it counts
 # every letter once, so the wide capitals it never prints outvote the lowercase it prints constantly.
 # The ratio this produces agrees with what Chrome measures on the same line to within 0.5%.

@@ -147,7 +147,7 @@ stick to it.** (Over plain HTTP the SW can't register — always fresh, but no P
 
 
 **I saved a machine in Hangar and the phone does not show it.** Expected. Hangar's saved machines are
-its own client's list, and a crew is issance's own; neither list feeds the other. To reach that
+its own client's list, and a crew is issance own; neither list feeds the other. To reach that
 machine from the phone, enrol it: `issance crew add <ssh-host>` on the lead, then `issance restart` on
 the lead and `issance crew status` to check the link. Adding or removing a machine in Hangar changes
 nothing in the crew ([Hangar machines and the crew](crew.md#herdr-machines-and-the-crew)).
@@ -180,7 +180,7 @@ both with no other symptom. `issance doctor` names the pane under `agent-session
    started from a shell that another agent opened. Oh My Pi's hook stays silent when `OMPCODE=1` is
    inherited from the parent agent. Start it from a fresh terminal.
 
-On tmux, zellij and tern only Claude Code reports a session, through issance's beacon hooks. Run
+On tmux, zellij and tern only Claude Code reports a session, through issance beacon hooks. Run
 `issance hooks install claude` ([issance writes hooks into Claude's own
 settings](multiplexers.md#issance-writes-hooks-into-claudes-own-settings)). The other agents have no
 Chat or History there.

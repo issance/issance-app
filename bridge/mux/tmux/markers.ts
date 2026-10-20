@@ -20,7 +20,7 @@
 //
 // ── WHERE THE SOCKET PATH COMES FROM ──────────────────────────────────────────────────────────────
 //
-// tmux is asked, rather than the value being re-derived from the configured endpoint. issance's
+// tmux is asked, rather than the value being re-derived from the configured endpoint. issance
 // endpoint is a socket NAME, a socket PATH or empty (exec.ts `tmuxServerArgs`), and turning a name
 // into the path tmux actually opened means reimplementing tmux's own rule for the socket directory
 // (`$TMUX_TMPDIR`, `/tmp/tmux-<uid>`, the default name) — a re-derivation that would be wrong on

@@ -167,7 +167,7 @@ export interface DoctorDeps {
    * The owner-only check's seams (`bridge/owner-only.ts`): a `stat`, and on Windows the `icacls` and
    * `whoami` reads. `doctor` calls `isOwnerOnly` and `currentUserSid` only, which read; the repair
    * functions are never called from here. A read writes `icacls /save`'s answer to a file in the
-   * user's temp folder and removes it at once: that file is the tool's output, not issance's state.
+   * user's temp folder and removes it at once: that file is the tool's output, not issance state.
    */
   readonly ownerOnly: OwnerOnlyDeps;
   /**
@@ -355,7 +355,7 @@ export async function cmdDoctor(deps: DoctorDeps, args: readonly string[]): Prom
 // ── The finding set is scoped by the CHOSEN multiplexer ──────────────────────
 // issance mirrors ONE multiplexer per install, and Hangar is one adapter of the three rather than the
 // product. On a tmux or zellij install Hangar drives nothing: no socket is dialled, and the hooks
-// that name an agent are issance's own (`beacon-hooks-claude`), not `hangar integration`'s. So the
+// that name an agent are issance own (`beacon-hooks-claude`), not `hangar integration`'s. So the
 // checks below are DROPPED there rather than reported `ok` — a hollow pass is a line an operator
 // learns to skim past, and a red one is worse: it fails `issance doctor` on a perfectly healthy host.
 //
@@ -365,7 +365,7 @@ export async function cmdDoctor(deps: DoctorDeps, args: readonly string[]): Prom
 //
 // Membership is decided by what a check ASKS, never by how it is spelled: `hangar-socket` probes the
 // socket only Hangar serves, `hangar-version` runs `hangar --version`, and `hook-python3` is here
-// because the interpreter it hunts for is the one HERDR's agent hooks shell out to — issance's own
+// because the interpreter it hunts for is the one HERDR's agent hooks shell out to — issance own
 // emitter needs none, so an absent `python3` costs a tmux host nothing and must not fail it.
 const HERDR_ONLY_CHECKS = new Set(["herdr-socket", "herdr-version", "hook-python3"]);
 /** `integration-<agent>`: every one of them is a line of `hangar integration status` (cli/history.ts). */
@@ -444,7 +444,7 @@ function line(f: Finding): string {
 // ── Local checks ─────────────────────────────────────────────────────────────
 
 /**
- * The very first line: this issance's own version and platform. Not a check — there is nothing to
+ * The very first line: this issance own version and platform. Not a check — there is nothing to
  * pass or fail — but an operator pasting a `doctor --json` block into a GitHub issue should never
  * have to be asked "which version was this" as a follow-up question.
  */
@@ -768,7 +768,7 @@ function updateSource(deps: DoctorDeps, install: InstallKind): Finding {
       : warn(
           "update-source",
           `github.com/${repo} (ISSANCE_UPDATE_REPO) — updates come from a fork`,
-          "unset ISSANCE_UPDATE_REPO to take issance's own releases",
+          "unset ISSANCE_UPDATE_REPO to take issance own releases",
         );
   }
   const origin = originOf(deps.exec, deps.ctx.root);
@@ -778,7 +778,7 @@ function updateSource(deps: DoctorDeps, install: InstallKind): Finding {
       : warn(
           "update-source",
           `github.com/${repo} (ISSANCE_UPDATE_REPO) — updates come from a fork`,
-          "unset ISSANCE_UPDATE_REPO to take issance's own releases",
+          "unset ISSANCE_UPDATE_REPO to take issance own releases",
         );
   }
   if (origin.kind === "unresolvable") {
@@ -1691,7 +1691,7 @@ export function windowsLongPaths(deps: Pick<DoctorDeps, "ctx" | "exec">): Findin
  *     `warn`, "cannot confirm", never silent and never ok;
  *   - private: ok.
  *
- * `doctor` changes nothing (the contract at the top of this file). The bridge repairs issance's own
+ * `doctor` changes nothing (the contract at the top of this file). The bridge repairs issance own
  * folders at start, so "restart issance" is the first fix there; the `icacls` line is the same repair
  * by hand, and the only fix for a folder issance does not own.
  */

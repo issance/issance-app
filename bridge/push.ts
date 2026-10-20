@@ -219,7 +219,7 @@ export interface PushMessage {
    * The stable code `title` was rendered from, and the values it was filled with (`push-titles.ts`).
    * The service worker shows its own translation of the code when it has one and `title` otherwise,
    * so an older cached SW — which ignores both — keeps showing exactly what it did. A title the
-   * operator typed (`issance push-test "…"`) is not issance's to translate and carries no code.
+   * operator typed (`issance push-test "…"`) is not issance to translate and carries no code.
    */
   titleCode?: PushTitleCode;
   titleDetail?: PushTitleDetail;

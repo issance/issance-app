@@ -33,7 +33,7 @@ import { WALKY_ACK_HEADER, WALKY_OUTCOMES_ROUTE } from "../walky/crew.ts";
 //
 // It is the mirror image of `bridge/crew/router.ts` and the sibling of `bridge/mux/herdr/client.ts`.
 // That module is the only one that knows Hangar method names (ARCHITECTURE.md §5); this
-// one knows **issance's HTTP routes and no Hangar method at all** — that is the mux-driver seam
+// one knows **issance HTTP routes and no Hangar method at all** — that is the mux-driver seam
 // (ADR 0011, CREW_PROTOCOL.md §2 rule 1), and it is mechanically checked by spec M4/03's grep for a
 // dotted method literal in this file.
 //
@@ -1220,7 +1220,7 @@ function asRecord(value: JsonValue | undefined): JsonObject | null {
 }
 
 /**
- * The reason string for a transport throw, with no secret and no stack in it — and in issance's
+ * The reason string for a transport throw, with no secret and no stack in it — and in issance
  * voice rather than the runtime's.
  *
  * **Why the translation lives here.** Bun's connection error is written for a browser console:

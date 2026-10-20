@@ -42,7 +42,7 @@ Hangar is a terminal multiplexer, a program that keeps your agents running in pa
 Hangar is the only supported multiplexer.
 
 issance reads agents such as Claude Code, Codex, OpenCode, pi and omp. The agent itself must run on
-Windows. Which ones do is the agent's matter, not issance's.
+Windows. Which ones do is the agent's matter, not issance.
 
 ## Before you start
 
@@ -219,7 +219,7 @@ real phone or agent was used. If a step fails, report it ([where](#when-somethin
 2. In the Tailscale [admin console](https://login.tailscale.com/admin/dns), open **DNS**, turn on
    MagicDNS, then select **Enable HTTPS**.
 
-3. In a new terminal on the PC, publish issance's local port, 8787 by default, on your tailnet:
+3. In a new terminal on the PC, publish issance local port, 8787 by default, on your tailnet:
 
    ```powershell
    tailscale serve --bg --set-path=/ 8787
@@ -276,7 +276,7 @@ replaces whatever this PC already serves at `/` on your tailnet.
 > (WireGuard), and the HTTP hop stays inside the tailnet. Never use `tailscale funnel`. Over HTTP
 > the home screen install, Web Push and the microphone stay off.
 >
-> On Linux and macOS, issance's own HTTP mode publishes on the bridge port instead
+> On Linux and macOS, issance own HTTP mode publishes on the bridge port instead
 > ([`ISSANCE_SERVE_MODE`](configure.md#the-environment-still-wins)). issance does not run Serve on
 > Windows, so that variable changes no publishing here.
 
@@ -400,7 +400,7 @@ $k.SetValue('Path', (($k.GetValue('Path', '', 'DoNotExpandEnvironmentNames') -sp
 $k.Close()
 ```
 
-Copy the lines from issance's own output when you can. issance does not remove a `tailscale serve`
+Copy the lines from issance own output when you can. issance does not remove a `tailscale serve`
 mapping that you made by hand ([Reaching it from your phone](#reaching-it-from-your-phone)).
 
 ## When something breaks
@@ -502,7 +502,7 @@ A folder on a network share or a FAT or exFAT volume is "not checked", because t
 to read. Keep the state and config folders on an NTFS drive in this PC.
 
 The bridge repairs a loose folder at start, but only a folder issance created now, a default
-folder in your user profile, or a folder that is empty or holds only issance's own files. Any other
+folder in your user profile, or a folder that is empty or holds only issance own files. Any other
 folder is checked and warned about, with the `icacls` command that fixes it. `issance doctor` and
 other commands change nothing.
 
@@ -667,7 +667,7 @@ Plain list, so nothing here reads as a promise:
 - The Task Scheduler fix on Windows Home. The route was checked with a standard user whose name held
   a space and a non-ASCII letter.
 - A FAT volume with real hardware. The "not checked" answer is covered by unit tests.
-- A second issance's task being refused, covered by unit tests only.
+- A second issance task being refused, covered by unit tests only.
 - Whether Explorer sees the new PATH without a sign-out, and a PATH edit by a standard user.
 - The `local-cli` voice provider with a real engine. Its cleanup was tested with a test command:
   issance ends the command's process tree, but a process started by a helper that has already exited

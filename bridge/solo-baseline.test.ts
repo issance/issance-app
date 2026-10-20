@@ -45,7 +45,7 @@ import type {
 // SOLO ZERO-TAX BASELINE — you are not allowed to tax a solo user.
 //
 // Crew federation (M3/M4) is being built on top of this code. The contract in CREW_PROTOCOL.md §11
-// says that with ZERO peers enrolled, issance's observable behaviour stays byte-for-byte what it is
+// says that with ZERO peers enrolled, issance observable behaviour stays byte-for-byte what it is
 // TODAY: no added snapshot field, no shifted ETag, no new route, no new state file, no new env key,
 // no changed notification tag or audit line.
 //

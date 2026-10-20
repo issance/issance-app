@@ -113,7 +113,7 @@ the act is never sent a third time.
 
 ## Transports
 
-A durable agent uses one of two transports: a private socket on issance's machine, or TLS with a token.
+A durable agent uses one of two transports: a private socket on issance machine, or TLS with a token.
 
 The bytes are the same on both: the routes, the bodies, the version header, the ETag and the error
 codes. Only who may reach the durable agent differs.

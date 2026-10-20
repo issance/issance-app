@@ -12,7 +12,7 @@ import {
 
 // These rules are the difference between an installed PWA that can reach its front door and one that
 // is bricked behind a refused session, and the failure is silent in both directions: too narrow and
-// the sign-in page is invisible, too wide and issance's own deep links stop resolving offline. The
+// the sign-in page is invisible, too wide and issance own deep links stop resolving offline. The
 // regexes are what the service worker actually installs, so pin the contract here.
 describe("service-worker navigation passthrough", () => {
   it("never answers the API from the precache", () => {
@@ -22,7 +22,7 @@ describe("service-worker navigation passthrough", () => {
 
   // The Files reads (ADR 0083) and the Machines routes (ADR 0084) are API calls like their neighbours:
   // the worker answers none of them from the precache, with or without a query, and the app pages that
-  // show them are issance's own routes, answered offline from the shell.
+  // show them are issance own routes, answered offline from the shell.
   it("never answers the Files and Machines routes from the precache", () => {
     for (const path of [
       "/api/pane/w1%3Ap1/files",
@@ -82,7 +82,7 @@ describe("service-worker navigation passthrough", () => {
     expect(isNetworkOnlyNavigation("/auth?rd=%2Fpane%2Fw1%3Fh%3Dbox2")).toBe(true);
     expect(isNetworkOnlyNavigation("/auth?rd=%2Fpane%2Fw1%3Ap1%3Fh%3Dbox2%26s%3Ddemo")).toBe(true);
     expect(isNetworkOnlyNavigation("/api/snapshot?host=box2")).toBe(true);
-    // …and a peer's own deep link is still issance's to answer offline.
+    // …and a peer's own deep link is still issance to answer offline.
     expect(isNetworkOnlyNavigation("/pane/w1%3Ap1?h=box2")).toBe(false);
     expect(isNetworkOnlyNavigation("/?h=box2&s=demo")).toBe(false);
   });
@@ -124,7 +124,7 @@ describe("service-worker navigation passthrough", () => {
     }
   });
 
-  // A route merely STARTING with the reserved word is issance's, not the proxy's: `/authors` must not
+  // A route merely STARTING with the reserved word is issance, not the proxy's: `/authors` must not
   // be handed to the network just because it shares five letters with `/auth`.
   it("does not leak a route that only shares the prefix", () => {
     expect(isNetworkOnlyNavigation("/authors")).toBe(false);
@@ -154,7 +154,7 @@ describe("service-worker navigation passthrough", () => {
     for (const path of ["/standby", "/standby/", "/standby/health", "/standby/takeover", "/standby?x=1"]) {
       expect(isNetworkOnlyNavigation(path)).toBe(true);
     }
-    // A route that merely shares the prefix is issance's, exactly as `/authors` is.
+    // A route that merely shares the prefix is issance, exactly as `/authors` is.
     expect(isNetworkOnlyNavigation("/standbyish")).toBe(false);
   });
 });

@@ -12,7 +12,7 @@ export type TemplateDetail = Readonly<Record<string, string | number>>;
  * Fill `{name}` slots from `detail`, in ONE pass.
  *
  * One pass is the load-bearing part: several error templates are `{reason}` filled with a
- * multiplexer's own words, and a push title carries an agent's name — neither is issance's to trust.
+ * multiplexer's own words, and a push title carries an agent's name — neither is issance to trust.
  * A second pass over the result would let a value that happens to contain `{maxBytes}` reach into
  * the catalogue's other values.
  *

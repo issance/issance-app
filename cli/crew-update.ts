@@ -61,7 +61,7 @@ export { answersThisBuild };
 // ── IT RIDES THE OPERATOR'S SSH, NEVER THE CREW WIRE (ADR 0016) ──────────────
 // The code goes the same way `crew add` sent it, and by the same two routes (`routeOf`, #248): a
 // lead that runs from a git checkout sends its own commit as a `git bundle`, and a lead installed by
-// install.sh or by a package has no commit, so it sends issance's own installer and the member
+// install.sh or by a package has no commit, so it sends issance own installer and the member
 // downloads the release the lead runs. Both ride an
 // ssh connection the operator authenticates. Nothing about an update crosses `/crew/v1/*` — the crew
 // link carries runtime data and admits nobody, and a lead that could push code down it would be a
@@ -1025,7 +1025,7 @@ async function workAll(
   // Bundled ONCE for the whole run: the commit is one artifact, and re-running `git bundle` per
   // member would be N copies of the same bytes with N chances for HEAD to have moved underneath.
   // Never bundled at all on the release route: there is no commit to bundle, and what travels
-  // instead is issance's own installer, which is a constant in this binary (#248).
+  // instead is issance own installer, which is a constant in this binary (#248).
   let bundle: string | null = null;
   for (const [index, planned] of ready.entries()) {
     const id = planned.target.member.memberId;
@@ -1165,7 +1165,7 @@ async function workOne(
  * shape comes back from both, so the caller's success and failure handling is one piece of code.
  *
  * The bundle route sends this lead's commit and the member builds it. The release route sends
- * issance's own installer, out of this binary, and the member downloads the release the lead runs
+ * issance own installer, out of this binary, and the member downloads the release the lead runs
  * and verifies its sha256 against the release manifest (#248). Neither leg pipes anything into a
  * shell, and neither fetches a script.
  */

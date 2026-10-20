@@ -22,7 +22,7 @@ function general(over: Partial<GeneralAction> = {}): GeneralAction {
 const names = () => screen.getAllByRole("button").map((b) => b.getAttribute("aria-label"));
 
 describe("ActionsRow", () => {
-  it("puts issance's own actions first and the harness's own after them", () => {
+  it("puts issance own actions first and the harness's own after them", () => {
     render(
       <ActionsRow
         general={[general(), general({ id: "type", icon: Terminal, label: "Type into terminal" })]}
@@ -124,7 +124,7 @@ describe("ActionsRow", () => {
     expect(belt.className).not.toMatch(/(?:^|\s)(?:border-y|border-t|mt-)/);
     expect(belt.className).toMatch(/(?:^|\s)bg-foreground\/6(?=\s|$)/);
     expect(belt.className).not.toMatch(/rounded/);
-    // issance's own controls stand on that ground with no box of their own.
+    // issance own controls stand on that ground with no box of their own.
     const controls = document.querySelector<HTMLElement>('[data-slot="composer-controls"]')!;
     expect(controls.className).not.toMatch(/rounded|border|bg-/);
   });

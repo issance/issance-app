@@ -20,7 +20,7 @@ import { isRequestId } from "./worktree-receipts.ts";
 //
 // ── A BAD FILE READS AS EMPTY, AND IS NOT WRITTEN OVER ──────────────────────────────────────────
 // Not JSON, not an object, or a version this build does not know: the list is empty, and a write is
-// REFUSED until the operator moves the file away. A newer issance's file must survive a downgrade, and
+// REFUSED until the operator moves the file away. A newer issance file must survive a downgrade, and
 // a torn file is the operator's to look at, not the bridge's to replace with "nothing".
 //
 // ── THE FILE ────────────────────────────────────────────────────────────────────────────────────

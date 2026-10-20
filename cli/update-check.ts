@@ -96,7 +96,7 @@ export interface PreflightCheck {
   readonly reason: string;
   readonly remedy?: string;
   /**
-   * True when {@link PreflightCheck.remedy} names issance's OWN self-update command.
+   * True when {@link PreflightCheck.remedy} names issance OWN self-update command.
    *
    * Set where the remedy is produced, and read in exactly one place: a packaged install must not be
    * told to run the command that refuses on it, so that remedy is swapped for the package manager's
@@ -194,7 +194,7 @@ const DISK_AMBER_KB = 1024 * 1024;
 const MIN_BUN = "1.4.0";
 
 /**
- * Rewrite a remedy that names issance's own self-update command, and ONLY such a remedy.
+ * Rewrite a remedy that names issance own self-update command, and ONLY such a remedy.
  *
  * `upstreamCheck` is also where "check this machine's network", "wait an hour, then re-run this
  * check" and "reinstall from docs/install.md" come from. Those are red verdicts, so clobbering them

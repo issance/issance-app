@@ -132,7 +132,7 @@ const STEPS: readonly SendStep[] = ["s0", "clear", "probe", "write", "s1", "comm
 /**
  * The session page's list of recent sends, row by row. A row that is not whole is left out. The wire
  * carries no text and no screen row, and this reads nothing of either: outcome, reason, time, the
- * keys by name and the measured gaps, and on a refusal issance's own line and four Surface words.
+ * keys by name and the measured gaps, and on a refusal issance own line and four Surface words.
  */
 export function readSendReceipts(body: JsonValue | undefined): SendReceiptsAnswer {
   const list = asJsonObject(body)?.receipts;

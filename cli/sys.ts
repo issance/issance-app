@@ -508,7 +508,7 @@ export function withPathPrefix(
 }
 
 /**
- * The git variables that RELOCATE a repository, and which no child of issance's may inherit.
+ * The git variables that RELOCATE a repository, and which no child of issance may inherit.
  *
  * Each of these tells git where the repository, its index or its object store actually is, and git
  * obeys them from any working directory — they defeat discovery outright rather than adjust it. So

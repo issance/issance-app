@@ -154,7 +154,7 @@ describe("the stt gate — which provider the settings name", () => {
     expect(provider.close).toBeUndefined();
   });
 
-  test("whistle settings build issance's own provider, which says it takes 16 kHz WAV for 4 minutes", async () => {
+  test("whistle settings build issance own provider, which says it takes 16 kHz WAV for 4 minutes", async () => {
     const stateDir = mkdtempSync(join(tmpdir(), "issance-stt-gate-whistle-"));
     const provider = createSttProvider({ provider: "whistle" }, { stateDir });
     expect(provider.id).toBe("whistle");

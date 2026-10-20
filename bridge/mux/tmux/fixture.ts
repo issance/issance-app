@@ -94,7 +94,7 @@ interface FakeClient {
   session: string;
   readonly control: boolean;
   readonly activity: number;
-  /** tmux 3.7 refuses `send-keys` that lands on a read-only client. issance's own watcher is one. */
+  /** tmux 3.7 refuses `send-keys` that lands on a read-only client. issance own watcher is one. */
   readonly readOnly: boolean;
   /** `client_tty`. tmux's only handle on a client, and what `switch-client -c` addresses. */
   readonly tty: string;

@@ -1,7 +1,7 @@
 # Durable agents (experimental)
 
 > **Experimental.** The wire, the SDK and this page may change, or the feature may be removed, in a
-> later minor release. Today only issance's own examples speak the wire. [The exit](#the-exit) says
+> later minor release. Today only issance own examples speak the wire. [The exit](#the-exit) says
 > what decides whether it stays. If you attach no durable agent, issance looks and works as before.
 
 If you built a durable agent with Pi Durable or any program that serves the wire, issance can show it
@@ -344,7 +344,7 @@ do (`asks`, `starters`, `send`, `steer`, `abort`, `rename`, `close`, `actions`, 
 `reopen`), and the phone draws a control only for what it said. A durable agent has no screen, so it has
 no Terminal view and no typed keys.
 
-On a send to a durable agent, the label queued is issance's own reading of the turn. issance does not show
+On a send to a durable agent, the label queued is issance own reading of the turn. issance does not show
 what waits in Pi's inbox. A task that sleeps until a deadline shows as idle or working, never as
 waiting. [Sessions](sessions.md#what-the-phone-shows) has more.
 

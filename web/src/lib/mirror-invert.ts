@@ -13,7 +13,7 @@
 //   light answer — body rgb(26,26,26)    16.91:1 raw on #fffbf8 /  1.16:1 inverted
 //   dark answer  — body rgb(238,238,238)  1.13:1 raw            / 17.32:1 inverted
 //
-// The same agent wants opposite answers, and Hangar's theme is independent of issance's, so a dark
+// The same agent wants opposite answers, and Hangar's theme is independent of issance, so a dark
 // Hangar pane sits in a light issance routinely. An agent-keyed bit cannot express that; the pane is
 // the smallest thing that knows which way its own colours point. codex is reported to show the same
 // symptom, and gets the same lever without anyone having to measure codex's palette first.

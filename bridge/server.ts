@@ -577,7 +577,7 @@ const MACHINE_ROUTE = /^\/api\/machines\/([^/]+)\/(history|alerts)$/;
 export const SEEN_HEADER = "x-issance-seen";
 
 /**
- * Whether this request proves it came from issance's own page, and may therefore stamp the pane as
+ * Whether this request proves it came from issance own page, and may therefore stamp the pane as
  * seen (bridge/activity.ts).
  *
  * This exists because marking-seen made a **read-level GET mutate server state**, which it never did
@@ -784,7 +784,7 @@ interface MuxPublication {
  * decoration. An SVG is a document, not a picture: served same-origin it could in principle carry
  * script, so `Content-Security-Policy: sandbox` drops the whole response into an opaque origin with
  * scripting off. `nosniff` (already on every response) then keeps a browser from re-deciding what
- * these bytes are. issance's own three logos contain no script — bridge/mux/logo.test.ts pins that
+ * these bytes are. issance own three logos contain no script — bridge/mux/logo.test.ts pins that
  * for each of them — but the bytes come from an ADAPTER, and the next adapter's author is not
  * necessarily in this repo.
  *
@@ -2792,7 +2792,7 @@ export function startServer(opts: {
       // ── Misc API ─────────────────────────────────────────────────────────
       // The rule catalog behind the cache chips, and the overrides this host applies. Gated exactly as
       // `/api/config` is — read-level, and through `guard` so ISSANCE_PUBLIC_HOSTS covers it — because
-      // it is the same kind of payload: issance's own facts plus operator-authored text.
+      // it is the same kind of payload: issance own facts plus operator-authored text.
       if (pathname === "/api/cache-rules" && req.method === "GET") {
         const denied = guard(req, cfg, "read", pairingGate);
         if (denied) return denied;
@@ -2805,7 +2805,7 @@ export function startServer(opts: {
       if (pathname === "/api/config") {
         // Read-level, like the other non-terminal endpoints. Nothing issance puts here is a
         // credential — the VAPID public key is handed to every browser by design — but the payload
-        // is no longer entirely issance's: operatorCommands is operator-authored text, and any read
+        // is no longer entirely issance: operatorCommands is operator-authored text, and any read
         // client sees it verbatim (`.env.example` says so where it is set).
         // It was also the one route that skipped checkAccess entirely, so ISSANCE_PUBLIC_HOSTS
         // didn't cover it and a rebound DNS name could still read the build id. The client only ever

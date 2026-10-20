@@ -52,7 +52,7 @@ issance cannot attach it as it is. issance polls a hosted durable agent every 2 
 poll wakes a hibernating Durable Object, so a hosted object stays awake while issance watches. The wire has no
 WebSocket, so the hibernation and WebSocket features of Durable Objects do not help here.
 
-On a send, the label queued is issance's own reading of the turn, and Pi's inbox is not shown. A task that sleeps until
+On a send, the label queued is issance own reading of the turn, and Pi's inbox is not shown. A task that sleeps until
 a deadline shows as idle or working, never as waiting.
 
 ## The entries
@@ -75,7 +75,7 @@ the agent's tools in a sandbox that cannot reach the socket, or run the durable 
 
 ## Versions
 
-The package has its own version, apart from issance's. `SDK_VERSION` is that version, and `WIRE_VERSION` is the
+The package has its own version, apart from issance. `SDK_VERSION` is that version, and `WIRE_VERSION` is the
 durable wire version it speaks, which is 1. The contract is
 [WIRE.md](https://github.com/issance/issance-app/blob/main/bridge/mux/durable/WIRE.md).
 

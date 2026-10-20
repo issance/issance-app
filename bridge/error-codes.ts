@@ -1,6 +1,6 @@
 // ── THE ERROR CODE CATALOGUE — one file, one place the wire's refusals are named ────────────────
 //
-// issance's web app speaks the operator's language (web/src/lib/i18n/). The bridge does not: an
+// issance web app speaks the operator's language (web/src/lib/i18n/). The bridge does not: an
 // `{ ok: false, error: "…" }` body is English prose written on the host, and it lands on the phone
 // screen verbatim. This file is how that stops being the end of the story.
 //
@@ -246,7 +246,7 @@ export const ERROR_CODES = {
   "stt.codex_other_login": "Codex on this issance is not signed in with ChatGPT; run `codex login` there and pick ChatGPT",
   /** The sign-in could not be checked: a timeout, or an answer issance does not understand (409). */
   "stt.codex_unknown": "issance could not check the Codex sign-in on this issance",
-  /** The honest-first identity probe failed (502). `detail.reason` is issance's own sentence. Nothing was written. */
+  /** The honest-first identity probe failed (502). `detail.reason` is issance own sentence. Nothing was written. */
   "stt.codex_probe_failed": "the Codex endpoint did not accept the probe: {reason}",
 
   // ── Device pairing: POST /api/pair, POST /api/devices/revoke ───────────────────────

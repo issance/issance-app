@@ -157,7 +157,7 @@ describe("rootAvailability — the publish-side gate", () => {
   });
 
   test("adoptable when the root already points at us — the upgrade path, not laxness", () => {
-    // Every install predating ownership tracking has issance's own mount and NO record; refusing
+    // Every install predating ownership tracking has issance own mount and NO record; refusing
     // here would brick start/restart/update on exactly the deployments that already work.
     expect(verdict(`{${tcp(8787, "HTTP")},${web("host:8787", "/", OURS)}}`)).toBe("adoptable");
     expect(
@@ -441,7 +441,7 @@ describe("serve — ISSANCE_SERVE_PORT (one tailnet name, a listener port per de
     });
     expect(cmdUnserve(h.deps)).toBe(EXIT.OK);
     expect(h.exec.calls).toContain("tailscale serve --https=8443 --set-path=/ off");
-    expect(h.io.stdout.join("\n")).toContain("removed issance's managed https:8443 mapping");
+    expect(h.io.stdout.join("\n")).toContain("removed issance managed https:8443 mapping");
     expect(h.files.exists(HANDLER_FILE)).toBe(false);
   });
 });
@@ -558,7 +558,7 @@ describe("unserve — teardown", () => {
     expect(cmdUnserve(h.deps)).toBe(EXIT.OK);
     expect(h.exec.calls).toContain("tailscale serve --https=443 --set-path=/ off");
     expect(h.files.exists(HANDLER_FILE)).toBe(false);
-    expect(h.io.stdout.join("\n")).toContain("removed issance's managed https:443 mapping");
+    expect(h.io.stdout.join("\n")).toContain("removed issance managed https:443 mapping");
   });
 
   test("an absent root clears the stale record", () => {

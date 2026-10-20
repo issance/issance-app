@@ -66,7 +66,7 @@ export type Availability = "free" | "adoptable" | "occupied" | "protocol-mismatc
  * first (the pre-shim `issance-ctl.sh`).
  *
  * "Don't own" is decided by where the mount points, not by our ownership file: every install
- * predating ownership tracking has issance's own root mount and NO record of it, so a pure file
+ * predating ownership tracking has issance own root mount and NO record of it, so a pure file
  * check would refuse to republish on exactly the deployments that already work — bricking
  * start/restart/update on upgrade. A root already proxying to our own `http://127.0.0.1:$PORT` is
  * therefore `adoptable`, and we record it afterwards.
@@ -372,5 +372,5 @@ function ensureRootAvailable(
   return true;
 }
 
-/** The inverse of {@link cmdServe}: remove issance's own mapping and nothing else. */
+/** The inverse of {@link cmdServe}: remove issance own mapping and nothing else. */
 export const cmdUnserve = (deps: ServeDeps): number => stopTailscaleServe(deps);

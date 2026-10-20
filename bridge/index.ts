@@ -285,7 +285,7 @@ const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 //
 // Windows only (M43 spec 04): the config folder is made private FIRST, so the files read next are
 // already behind its list. The bridge is the one process that may change an access list, and only
-// in issance's own folders (`bridge/acl-policy.ts`); `ISSANCE_NO_ACL_REPAIR=1` leaves every list as it
+// in issance own folders (`bridge/acl-policy.ts`); `ISSANCE_NO_ACL_REPAIR=1` leaves every list as it
 // is and still warns.
 const aclRepair = HOST.platform === "win32" && aclRepairAllowed(process.env);
 const securePrivateRoot = (dir: string, id: PrivateRoot["id"], createdNow: boolean): void => {
@@ -370,7 +370,7 @@ await mkdir(cfg.stateDir, { recursive: true, mode: 0o700 });
 // On Windows the mode above does nothing: NTFS keeps an access list, not mode bits (M43 spec 04). So
 // the state folder gets a private list here, once per start, and every file a store writes into it
 // later inherits it from its birth. A folder that is already private costs one `icacls` read per
-// secret file; a loose one is repaired when it is issance's own, and the line says so only after a
+// secret file; a loose one is repaired when it is issance own, and the line says so only after a
 // second read confirms it. The old lists of anything changed are saved into the state folder.
 if (HOST.platform === "win32") {
   securePrivateRoot(cfg.stateDir, "state", !stateDirExisted);
@@ -894,7 +894,7 @@ const currentVersion = (
 const updateStore = new UpdateStateStore(cfg);
 await updateStore.load();
 
-// The repo the release check + release links point at. Defaults to issance's own; overridable for a
+// The repo the release check + release links point at. Defaults to issance own; overridable for a
 // fork (or a synthetic test target) via ISSANCE_UPDATE_REPO.
 const updateRepo = process.env.ISSANCE_UPDATE_REPO?.trim() || "issance/issance-app";
 // The release reads, with the rehearsal mirror (a loopback-only test seam) decided in one place.
@@ -973,7 +973,7 @@ const updateMonitor = new UpdateMonitor({
   installKind,
   instance: collieInstance,
   // Named only where it is true: a packaged install under a prefix we recognise. Every other kind
-  // takes issance's own updater, and printing a package manager's command there would be a command
+  // takes issance own updater, and printing a package manager's command there would be a command
   // that does not apply. Resolved here, at boot, for the reason `installKind` is.
   packageCommand: installKind === "packaged" ? packageCommand(rootDir) : null,
   bootVersion,

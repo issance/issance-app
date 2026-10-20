@@ -38,7 +38,7 @@ The crew's own name is display data the lead shows. `issance crew rename <name>`
 it; it writes only that machine's trust store and sends nothing to a member.
 
 A machine saved in Hangar is not a crew member. Hangar's saved machines are ssh targets in the
-operator's own Hangar window. A crew is issance on every machine, reached over issance's own link. The
+operator's own Hangar window. A crew is issance on every machine, reached over issance own link. The
 operator sets ssh up once, and both tools use it.
 
 ## Durable agents (experimental)

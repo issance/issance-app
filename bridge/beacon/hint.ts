@@ -55,7 +55,7 @@ import type {
  * the multiplexer, because either name would be a guess arriving on the phone as a fact.
  */
 export const AGENT_HINT =
-  "This pane may be running an agent. Install issance's hooks on the host to identify it.";
+  "This pane may be running an agent. Install issance hooks on the host to identify it.";
 
 /** What the port calls a pane holding no agent — `bridge/state-engine.ts`'s `SHELL`, one word. */
 const SHELL = "shell";

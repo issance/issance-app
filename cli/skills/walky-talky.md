@@ -1,6 +1,6 @@
 ---
 name: issance-walky-talky
-description: Send a short message to another agent session, or read one sent to you, with issance's walky talky. Use it when you need to tell, ask or answer another agent, when a prompt starts with "[walky-talky wt_", or when the operator mentions walky talky.
+description: Send a short message to another agent session, or read one sent to you, with issance walky talky. Use it when you need to tell, ask or answer another agent, when a prompt starts with "[walky-talky wt_", or when the operator mentions walky talky.
 ---
 
 # Walky talky

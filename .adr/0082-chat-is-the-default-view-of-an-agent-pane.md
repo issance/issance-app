@@ -16,7 +16,7 @@
 flips in 2.0. The gate existed for two known holes on the day it shipped: Codex tool calls were not
 drawn, and Hermes can lose a turn. The first closed inside 1.15.0 itself, when the journal reader
 learned Codex's custom tool call. The second is still open and is a property of Hermes's own log, not
-of issance's reader ([ADR 0073](./0073-a-live-session-is-a-bounded-window-on-the-existing-poll.md),
+of issance reader ([ADR 0073](./0073-a-live-session-is-a-bounded-window-on-the-existing-poll.md),
 Consequences).
 
 On 2026-10-05 Altan decided to flip the default in 1.17.0 instead of waiting for 2.0. A session does

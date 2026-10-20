@@ -545,7 +545,7 @@ describe("accept-drift: the release page", () => {
 		expect(driftLines(["claude 2.1.301", "codex 0.163.0"])).toEqual([
 			"**Not verified**",
 			"",
-			"issance's readers were not verified on claude 2.1.301, codex 0.163.0: each is newer than its verified version.",
+			"issance readers were not verified on claude 2.1.301, codex 0.163.0: each is newer than its verified version.",
 		]);
 		expect(driftLines([])).toEqual([]);
 	});
@@ -554,7 +554,7 @@ describe("accept-drift: the release page", () => {
 		const plain = renderBody(FULL, "2.1.0", REPO, "v2.1.0", "v2.0.0");
 		const flagged = renderBody(FULL, "2.1.0", REPO, "v2.1.0", "v2.0.0", ["claude 2.1.301"]);
 		expect(plain).not.toContain("Not verified");
-		const sentence = "issance's readers were not verified on claude 2.1.301: each is newer than its verified version.";
+		const sentence = "issance readers were not verified on claude 2.1.301: each is newer than its verified version.";
 		expect(flagged).toContain(`**Not verified**\n\n${sentence}\n\n`);
 		expect(flagged).not.toContain(`- ${sentence}`);
 		expect(flagged.indexOf("Not verified")).toBeLessThan(flagged.indexOf("Full detail with commits"));

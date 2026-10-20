@@ -521,7 +521,7 @@ export function SettingsSection() {
         <Card
           state="voice-provider-codex-fallback"
           label="12: Host speech, ChatGPT on, fallback identity"
-          reach="as 11, when the endpoint refused issance's own name and accepted only the Codex CLI's headers."
+          reach="as 11, when the endpoint refused issance own name and accepted only the Codex CLI's headers."
           note="The fallback is said in plain words. Off ends it."
         >
           <Stage height={1000}>

@@ -45,7 +45,7 @@ itself — which is the first decision.
 The obvious road is to shell out to the tool that already does this well and inherit its
 multiplexing, its prompts and its error handling for free. It is refused: `pack add` would then only
 work where Hangar is installed **on the lead**, in a version whose `--remote` flags have not moved, and
-issance's remote story would be a private, closed-source surface it cannot test, pin or read. issance is
+issance remote story would be a private, closed-source surface it cannot test, pin or read. issance is
 a Hangar plugin *today* and its graduation into a standalone multiplexer is anticipated (discussion
 #67); a transport dependency is the one kind of coupling that would have to be unwound at exactly the
 moment there is no Hangar to unwind it from. `ssh` is a stable, universal, testable interface, and the
@@ -75,7 +75,7 @@ probed in leg 1 and each absence produces one install hint, the same posture han
 ### (c) Source, not a prebuilt binary
 
 `scp`-ing the lead's `bin/issance` looks like it removes the Bun dependency. It replaces it with a
-worse one: the operator must now match architecture and libc across two machines, and issance's answer
+worse one: the operator must now match architecture and libc across two machines, and issance answer
 to a mismatch would be a binary that does not run. issance is source-distributed by design — the M6
 shim (`scripts/issance-ctl.sh`) exists precisely to build a native binary from a checkout in a minimal
 environment with no login shell and no `PATH`, which is byte-for-byte the environment
@@ -152,7 +152,7 @@ a rebuilt-but-not-restarted issance is the thing that makes hand-rolled enrollme
 - **Pull from GitHub / a release tarball on the far machine.** Decision (b). Needs remote egress and
   hands back the version-matching problem the push does not have.
 - **`scp` the built binary.** Decision (c). Trades a build dependency for an architecture-matching
-  dependency, and issance's whole distribution model already builds natively.
+  dependency, and issance whole distribution model already builds natively.
 - **A `pack add` route in the protocol** — have the lead ask a running peer to enroll itself.
   Rejected as circular: the peer has no issance yet, which is the entire problem. Any such route would
   be a second admission path into the pack.
@@ -167,7 +167,7 @@ a rebuilt-but-not-restarted issance is the thing that makes hand-rolled enrollme
 
 - **issance graduating from Hangar and growing its own remote protocol.** If a standalone issance ever
   speaks to remote machines as a first-class capability, `pack add` should ride *that*, and decision
-  (a)'s reasoning inverts: the thing it refuses to depend on would be issance's own.
+  (a)'s reasoning inverts: the thing it refuses to depend on would be issance own.
 - **A host class with no `git`** — an appliance, a minimal container image, an airgapped box that
   cannot even receive a bundle through this path. That is when a signed artifact push (still a push,
   still exact-version) earns its keep and decision (b) narrows rather than reverses.

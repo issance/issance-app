@@ -12,7 +12,7 @@ import type { HarnessInfo, Launcher, LauncherItem, RecentRun, ServerSummary, Wor
 
 /** Where the two "how to add one" links under the Agent and Command selects open: one docs section. */
 export const NEW_PAGE_DOCS = {
-  /** issance's agent list is built in; the operator's way to add another is a `launchers.toml` row. */
+  /** issance agent list is built in; the operator's way to add another is a `launchers.toml` row. */
   agent: "https://issance.com/docs/app/configure#your-own-launchers",
   command: "https://issance.com/docs/app/configure#your-own-launchers",
 } as const;

@@ -420,7 +420,7 @@ describe("a peer's pane that carries asks", () => {
     clock.fireAll();
     const msg = push.sent.find((m) => m.type !== "clear");
     expect(msg?.title).toBe("durable: Ticket 400 needs a yes");
-    // The program's words are not issance's to translate, so the title carries no code.
+    // The program's words are not issance to translate, so the title carries no code.
     expect(msg?.titleCode).toBeUndefined();
     expect(msg?.body).toBe("laptop · write_note wants to add one line to notes.txt");
     // The ask's own title and tool line still never cross.

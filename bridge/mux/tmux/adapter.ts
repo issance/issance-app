@@ -14,7 +14,7 @@
 // It is the natural one and it is also the only one that survives identity rule 2. The tempting
 // alternative — one space per tmux SERVER, tabs from sessions — collapses two levels into one and
 // leaves nothing to map windows onto; the other — ignore sessions and treat every window as a space
-// — throws away the grouping the operator actually organises by. tmux's three levels are issance's
+// — throws away the grouping the operator actually organises by. tmux's three levels are issance
 // three levels, and each id is carried through UNCHANGED: `$N`, `@N`, `%N` are tmux's own,
 // server-lifetime unique, never recycled, and stable across a rename (a session_id survives what a
 // session_name does not). `%` is legal in a issance id for precisely this reason (../identity.ts).
@@ -118,7 +118,7 @@ export const TMUX_BINARY_OPTION = "tmuxBin";
 /** Per-call budget when the target names none. tmux answers a listing in milliseconds. */
 export const DEFAULT_TMUX_TIMEOUT_MS = 5000;
 
-/** The named paste buffer literal text travels through. issance's own, deleted after every paste. */
+/** The named paste buffer literal text travels through. issance own, deleted after every paste. */
 const TYPE_BUFFER = "issance-type";
 
 /**
@@ -206,7 +206,7 @@ const TMUX_CAPABILITIES = declareCapabilities({
       "`capture-pane -S` reaches behind the viewport as far as the pane's history-limit allows; a pane on the alternate screen has no history to reach, exactly as on Hangar.",
     createSpace: "A new space is a new tmux session on the same server. It is created detached, so nothing the operator is looking at moves.",
     sendKeys:
-      "tmux sends every key in issance's alphabet. It has no Super/Command key, so a `meta` chord is refused — tmux's `M-` is Alt, which issance already spells `alt`. Ctrl+Enter is refused too: tmux delivers it as a plain Enter.",
+      "tmux sends every key in issance alphabet. It has no Super/Command key, so a `meta` chord is refused — tmux's `M-` is Alt, which issance already spells `alt`. Ctrl+Enter is refused too: tmux delivers it as a plain Enter.",
     pushTopologyEvents:
       "Control mode pushes window and session changes. A bounded 5-second listing backs it up, which is also what keeps the promise on a tmux with no control mode.",
     pushPaneEvents:
@@ -446,7 +446,7 @@ export class TmuxMux implements MuxAdapter {
     const result = await this.attemptRun(sendKeysArgs(paneId, translated, false));
     if (result.ok) return muxAck();
     if (result.reason !== "refused" || !saysReadOnlyClient(result.detail)) return result;
-    // tmux 3.7 picked a read-only client (issance's own watcher) as the target client and sent
+    // tmux 3.7 picked a read-only client (issance own watcher) as the target client and sent
     // nothing, so asking again with no client named cannot double-send.
     const retry = await this.attemptRun(sendKeysArgs(paneId, translated, true));
     return retry.ok ? muxAck() : retry;
@@ -578,9 +578,9 @@ export class TmuxMux implements MuxAdapter {
 
   /** The contract's watch over control mode plus a bounded listing. All of it lives in watch.ts. */
   /**
-   * Declined, and the reason is tmux's rather than issance's.
+   * Declined, and the reason is tmux's rather than issance.
    *
-   * The mapping puts a tmux SESSION at issance's space level (the header), so every session of the
+   * The mapping puts a tmux SESSION at issance space level (the header), so every session of the
    * server this adapter addresses is already in one snapshot. What is left over is another tmux
    * SERVER, and tmux 3.6b has no verb that enumerates them: `tmux list-servers` answers "unknown
    * command", and `list-sessions` needs a server to ask in the first place. The only enumeration
@@ -861,7 +861,7 @@ function toSnapshot(listing: TmuxListing, ownLabels: ReadonlyMap<string, string>
 }
 
 /**
- * The session a real terminal is attached to, or null when only issance's own watch is.
+ * The session a real terminal is attached to, or null when only issance own watch is.
  *
  * `client_session` prints a session NAME rather than a `$N` id (probed 2026-08-25), so the match is
  * against either — a name today, an id if tmux ever changes its mind, and no re-derivation either

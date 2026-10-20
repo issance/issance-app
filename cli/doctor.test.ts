@@ -72,7 +72,7 @@ const SOCKET = "/home/pat/.config/hangar/herdr.sock";
 const HOSTPORT = "laptop.tail.ts.net:443";
 const PROXY = "http://127.0.0.1:8787";
 
-/** A `tailscale serve status --json` in which issance's own root mount is live. */
+/** A `tailscale serve status --json` in which issance own root mount is live. */
 const SERVE_OK = JSON.stringify({
   TCP: { "443": { HTTPS: true } },
   Web: { [HOSTPORT]: { Handlers: { "/": { Proxy: PROXY } } } },
@@ -1610,7 +1610,7 @@ describe("mux", () => {
 // ── The finding set is scoped by the CHOSEN multiplexer ──────────────────────
 // issance mirrors ONE multiplexer per install. On tmux or zellij, Hangar's socket, its build and its
 // per-agent `integration` hooks drive nothing here — the bridge never dials that socket, and the
-// hook that names an agent is issance's own. Those checks are ABSENT rather than a hollow `ok`, and
+// hook that names an agent is issance own. Those checks are ABSENT rather than a hollow `ok`, and
 // a healthy host exits 0: `issance doctor` failing on a working tmux install is the bug these pin.
 
 /** The checks that only mean something under Hangar — none of them may appear on another mux. */

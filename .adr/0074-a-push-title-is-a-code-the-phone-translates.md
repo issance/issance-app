@@ -53,7 +53,7 @@ falls back to the English. The bridge never learns a language.
    yet, or storage that refuses: the worker shows `title`, exactly as before. An older worker ignores
    both new fields and shows `title` too.
 4. **Only the title.** A body is the pane's place, the names in a digest, or a release's own notes.
-   Those are the operator's words and issance's history, not issance's UI, and they travel as they did.
+   Those are the operator's words and issance history, not issance UI, and they travel as they did.
 
 ## Consequences
 
@@ -73,7 +73,7 @@ falls back to the English. The bridge never learns a language.
 
 ### What would justify revisiting
 
-- **A push body that is issance's own prose, worth translating.** The cache warning's closing
+- **A push body that is issance own prose, worth translating.** The cache warning's closing
   sentence is the only one today. A second would argue for a `bodyCode` beside `titleCode`, on the
   same terms.
 - **Rendering that needs the value's locale at fill time** (a date, a grouped number). The worker

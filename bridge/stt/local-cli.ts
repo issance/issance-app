@@ -59,7 +59,7 @@ import { MAX_PROVIDER_RESPONSE_BYTES, readCapped } from "./transcript.ts";
 //   • a cap of its own on children in flight — {@link LOCAL_CLI_MAX_IN_FLIGHT}, refused before any
 //     temp file or spawn — and a slot is only given back once the child has exited.
 //   • a command that is a regular, executable file — checked by `status()` and by `issance stt`.
-//   • stderr is never read and never forwarded. The phone gets issance's own sentence and an exit
+//   • stderr is never read and never forwarded. The phone gets issance own sentence and an exit
 //     status; a command line or an engine's error output may name a path, a model or a token.
 //   • no `ISSANCE_*` variable is passed down. The bridge's environment carries the push keys and
 //     the STT credential of other providers, none of which a transcription command needs.
@@ -99,7 +99,7 @@ const swept = new Set<string>();
 /** An extension issance is willing to put in a path: short, lower-case, alphanumeric. */
 const SAFE_EXTENSION = /^[a-z0-9]{1,5}$/;
 
-/** The words for the local-cli command, in issance's own sentences. Never the command line itself. */
+/** The words for the local-cli command, in issance own sentences. Never the command line itself. */
 const LOCAL_CLI_NOUN = "the local transcription command";
 
 /**
@@ -187,14 +187,14 @@ export interface ChildRunnerOptions {
   env: Record<string, string>;
   /** The platform facts the spawn branches on. The machine's own unless a test pins one. */
   host?: Host;
-  /** How issance's sentences name the child: "the local transcription command", "the Whistle engine". */
+  /** How issance sentences name the child: "the local transcription command", "the Whistle engine". */
   noun: string;
 }
 
 /**
  * One transcription in a short-lived child, under every bound the header lists: the in-flight cap,
  * the private temp dir, the deadline with the group (tree) kill, the stdout cap, stderr unread, and
- * issance's own sentences on failure. The `local-cli` provider and the `whistle` provider both run
+ * issance own sentences on failure. The `local-cli` provider and the `whistle` provider both run
  * through it, so the two can never be bounded differently.
  *
  * `argv` is given the recording's path and returns the full argv; `recording` is the file's name

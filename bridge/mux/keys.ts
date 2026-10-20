@@ -1,4 +1,4 @@
-// THE NEUTRAL KEY SPELLING — issance's own, owned by the contract, translated by every adapter.
+// THE NEUTRAL KEY SPELLING — issance own, owned by the contract, translated by every adapter.
 //
 // Three multiplexers, three grammars, and no two agree:
 //

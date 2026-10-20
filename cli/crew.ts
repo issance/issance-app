@@ -746,7 +746,7 @@ function joinLabel(deps: CrewDeps, flag: string | undefined): string | undefined
 /** One enrollment POST. `res` absent means nothing answered; see {@link looksLikePlaintextListener}. */
 interface EnrollAttempt {
   readonly res?: Response;
-  /** issance's words for why nothing answered — never the runtime's, once it reaches an operator. */
+  /** issance words for why nothing answered — never the runtime's, once it reaches an operator. */
   readonly reason: string;
   /** Did it fail the way a TLS client fails against a listener that speaks plain HTTP? */
   readonly plaintext: boolean;
@@ -1959,7 +1959,7 @@ export function crewAddressRefusal(address: string): string | null {
  * refuses them, which is the whole of F11.
  *
  * Address-shaped remedies only. The lead is one machine behind one front door, so the two ways this
- * row goes quiet are "the door is down" and "the door moved" — and only the second is issance's to
+ * row goes quiet are "the door is down" and "the door moved" — and only the second is issance to
  * repair. The pin is never mentioned: it is unchanged by either, and `reconnect` does not touch it.
  */
 function unreachableLeadLines(m: Pick<TrustedMember, "role" | "address">): TonedLine[] {

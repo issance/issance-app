@@ -821,9 +821,9 @@ describe("issance crew add", () => {
     expect(h.calls.map((c) => c.leg)).toEqual(["probe", "install", "configure", "membership", "enroll"]);
     expect(h.bundles).toBe(0);
     const install = h.calls.find((c) => c.leg === "install")!;
-    // The payload IS issance's own installer, out of this binary — never fetched on the far machine.
+    // The payload IS issance own installer, out of this binary — never fetched on the far machine.
     expect(install.stdin!.startsWith("#!/bin/sh\n")).toBe(true);
-    expect(install.stdin).toContain("issance's installer");
+    expect(install.stdin).toContain("issance installer");
     expect(install.stdin).toBe(INSTALLER_SH);
     expect(install.script).toContain(`ISSANCE_TAG='v${VERSION}'`);
     expect(install.script).toContain("ISSANCE_DIR=\"$DIR\"");

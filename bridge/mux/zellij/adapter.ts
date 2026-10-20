@@ -212,7 +212,7 @@ const ZELLIJ_CAPABILITIES = declareCapabilities({
     createSpace:
       "One issance on zellij drives exactly one zellij session, because every zellij verb is scoped to one. A session created from the phone would not appear in this issance at all, so the button is not offered.",
     sendKeys:
-      "zellij sends every key in issance's alphabet and refuses a name it does not know rather than typing it as text. It drops a Super/Command modifier silently instead of encoding it, so a `meta` chord is refused rather than delivered as the bare key. Ctrl+Enter is refused too: zellij delivers it as a plain Enter.",
+      "zellij sends every key in issance alphabet and refuses a name it does not know rather than typing it as text. It drops a Super/Command modifier silently instead of encoding it, so a `meta` chord is refused rather than delivered as the bare key. Ctrl+Enter is refused too: zellij delivers it as a plain Enter.",
     pushTopologyEvents:
       "Nothing in zellij's command line announces a pane or tab appearing, closing or being renamed — the plugin API is where such an event lives, and that is not a command line. A bounded census, 3 s after any change and relaxing to 12 s while nothing moves, is what keeps the promise instead.",
     pushPaneEvents:

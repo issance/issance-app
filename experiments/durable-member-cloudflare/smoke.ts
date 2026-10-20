@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const PORT = 8801; // never 8787: wrangler's default, and issance's own port on the author's host
+const PORT = 8801; // never 8787: wrangler's default, and issance own port on the author's host
 const DEADLINE_MS = 60_000;
 
 const dir = mkdtempSync(join(tmpdir(), "issance-cf-smoke-"));

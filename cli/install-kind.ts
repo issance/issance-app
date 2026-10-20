@@ -58,7 +58,7 @@ export function isManagedCheckout(exec: Exec, root: string): boolean {
  * happens inside git with both sides already symlink-resolved — which keeps a checkout reached
  * through a symlinked root (the dev lane's shape) a checkout.
  *
- * This question is only answerable because no child of issance's inherits a variable that relocates
+ * This question is only answerable because no child of issance inherits a variable that relocates
  * a repository — `withoutGitRelocators` in `cli/sys.ts`, ADR 0049. An exported `GIT_DIR` otherwise
  * answers every git question here about somebody else's repository, from any directory, and `-C`
  * does not override it.
@@ -348,7 +348,7 @@ export function detectInstall(deps: {
 
 export const DEFAULT_UPDATE_REPO = "issance/issance-app";
 
-/** The `owner/repo` releases come from — `ISSANCE_UPDATE_REPO`, or issance's own repo. */
+/** The `owner/repo` releases come from — `ISSANCE_UPDATE_REPO`, or issance own repo. */
 export function updateRepoOf(env: { readonly ISSANCE_UPDATE_REPO?: string | undefined }): string {
   return env.ISSANCE_UPDATE_REPO?.trim() || DEFAULT_UPDATE_REPO;
 }

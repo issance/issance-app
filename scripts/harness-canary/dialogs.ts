@@ -4,7 +4,7 @@
 // something that needs permission, and Hangar's own agent state says when the dialog is up
 // (`blocked`). From there the same split as scenarios.ts holds. WHETHER the dialog came is judged
 // without issance (Hangar's state, a screen that held still); WHAT the phone makes of it is judged with
-// issance's readers only: the card kind, the option labels, the free-text lock. A model that answers
+// issance readers only: the card kind, the option labels, the free-text lock. A model that answers
 // in words instead of calling the tool reads as `not-reached`, never as a pass or a fail.
 //
 // Keys are pressed only where the recipe was measured live on 2026-09-26: a permission dialog's "No"

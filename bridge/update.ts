@@ -578,7 +578,7 @@ export const mirrorValue = (env: Readonly<Record<string, string | undefined>>): 
 // github.com, which counts nothing, and redirects to a storage host that must never see it.
 
 /** The names read for a GitHub token, in the order they win. `GH_TOKEN` and `GITHUB_TOKEN` are the
- *  two the `gh` CLI and Actions already set; the first is issance's own, for a service's `.env`. */
+ *  two the `gh` CLI and Actions already set; the first is issance own, for a service's `.env`. */
 export const GITHUB_TOKEN_ENVS = ["ISSANCE_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] as const;
 
 /** A token and the NAME it was read from. A message names the variable and never the value. */

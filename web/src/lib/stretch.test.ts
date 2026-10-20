@@ -3,7 +3,7 @@ import { composeStretches, fullSpelling, liftStretches, parseStretches, skimSpel
 
 // Stretchtext as cc-stretch writes it: `{{short|long}}`. The parse must agree with cc-stretch's own,
 // or a key issance opens is not the key the terminal opened; the composed source must survive
-// issance's Markdown parser so each stretch comes back out as a span of its own.
+// issance Markdown parser so each stretch comes back out as a span of its own.
 
 const prose = (text: string): Segment => ({ kind: "prose", text });
 const text = (t: string): MdSpan => ({ kind: "text", text: t });

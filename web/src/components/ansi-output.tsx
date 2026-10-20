@@ -348,7 +348,7 @@ export const AnsiOutput = memo(function AnsiOutput({
   onImageClusterCount,
 }: AnsiOutputProps) {
   // The mirror is agent output and is not translated — but the two strings the image cluster
-  // renders are issance's own words, so this subscribes for the same reason every t() caller does.
+  // renders are issance own words, so this subscribes for the same reason every t() caller does.
   useLocale();
   // The pane's walky talky list. A header row earns its style only when the log holds the row's id; a
   // pane with no messages pays nothing (renderLine reads the text of no row at all).

@@ -40,7 +40,7 @@ export interface CodexAppServerProcess {
   onStdout(listener: (chunk: Uint8Array) => void): void;
   /** Register the stderr reader. It exists to DRAIN the pipe — see the note at the call site. */
   onStderr(listener: (chunk: Uint8Array) => void): void;
-  /** Called once when the child dies, however it died. `reason` is issance's own sentence. */
+  /** Called once when the child dies, however it died. `reason` is issance own sentence. */
   onExit(listener: (reason: string) => void): void;
   /** Terminate it. Must tolerate being called on a child that is already gone. */
   kill(): void;

@@ -1107,7 +1107,7 @@ describe("a forwarded write's own budget (§10.1)", () => {
 const WRONG_ANSWERER =
   "something other than the pinned member answered at this address (wrong port, another service, or a changed certificate)";
 
-describe("operatorReason — one runtime failure, said once, in issance's words", () => {
+describe("operatorReason — one runtime failure, said once, in issance words", () => {
   const BUN_CONNECT = "Unable to connect. Is the computer able to access the url?";
 
   test("a certificate that is not the pinned one says so, by message or by code", () => {

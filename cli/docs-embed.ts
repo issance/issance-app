@@ -180,12 +180,12 @@ export const DOC_PAGES: readonly DocPage[] = [
   },
   {
     name: "deployment",
-    purpose: "Front doors other than the default, and several Collies on one host",
+    purpose: "Front doors other than the default, and several issance on one host",
     text: deployment,
   },
   {
     name: "terminology",
-    purpose: "issance's words in plain words, beside the names other tools use",
+    purpose: "issance words in plain words, beside the names other tools use",
     text: terminology,
   },
   {

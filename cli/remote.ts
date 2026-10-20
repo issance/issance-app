@@ -598,7 +598,7 @@ export async function runInstall(
 }
 
 /**
- * Lay the release the LEAD runs down on the member, with issance's own installer.
+ * Lay the release the LEAD runs down on the member, with issance own installer.
  *
  * THE SECOND ROUTE INTO A MEMBER, and the one a lead with no commit takes (#248). ADR 0015 (b)
  * refused a release fetch for the bundle route on two counts, and both are answered here rather than
@@ -1221,7 +1221,7 @@ interface AddOptions {
 /**
  * What issance the MEMBER already has, from the two shapes leg 1 reports.
  *
- * `other` is a real answer and not a fallback: a directory that carries issance's Hangar manifest but
+ * `other` is a real answer and not a fallback: a directory that carries issance Hangar manifest but
  * is neither a git checkout nor an install.sh layout is one this verb has no safe way to advance,
  * and it is told so rather than written over.
  */
@@ -1442,7 +1442,7 @@ async function bundleLeg(
 }
 
 /**
- * Leg 2 on the RELEASE route — the release THIS LEAD RUNS, laid down by issance's own installer (#248).
+ * Leg 2 on the RELEASE route — the release THIS LEAD RUNS, laid down by issance own installer (#248).
  *
  * The member decides what happens, from what leg 1 saw there. A machine with no issance gets one; a
  * machine with an install.sh layout is asked before it is moved; a machine running a git checkout is

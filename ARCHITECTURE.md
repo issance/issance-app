@@ -78,7 +78,7 @@ exactly, and pays no tax for the feature ([`CREW_PROTOCOL.md` §11](./CREW_PROTO
 - **The lead consumes a peer's *issance* HTTP API.** It never dials a peer's multiplexer across a
   machine boundary, and no Hangar (or tmux, or zellij) verb ever crosses the link — that is the
   mux-driver seam ([ADR 0011](./.adr/0011-the-pack-protocol-is-the-mux-driver-seam.md)). What crosses
-  is issance's own domain model: snapshots, pane grids, replies, history, uploads. What never crosses:
+  is issance own domain model: snapshots, pane grids, replies, history, uploads. What never crosses:
   software. `issance crew add` / `crew update` push a git bundle over the **operator's own ssh**
   ([ADR 0016](./.adr/0016-updates-ride-the-operators-ssh.md)), so the link is never a distribution
   channel. A peer may also level itself to the release its lead is running, taking that public tag
@@ -164,15 +164,15 @@ Product details that shaped the loop:
 - **Dictation needs zero special build; the in-app mic is opt-in.** The reply box is a plain text
   field, so the phone keyboard's own mic works in it with nothing built, and Send stays an explicit
   button — dictated text is reviewable before it goes. Beyond that, `issance stt setup` switches on
-  issance's own record button through a provider seam (`bridge/stt/`, CLI `cli/stt.ts`,
+  issance own record button through a provider seam (`bridge/stt/`, CLI `cli/stt.ts`,
   [docs/voice-and-push.md → Voice input](./docs/voice-and-push.md#voice-input-optional)). The seam is **absent until that verb
   runs**: no key, no outbound path, no child process, no button. Turning it on is what buys the
   credential in the state dir and the outbound path carrying microphone audio — a local engine keeps
   that egress on loopback, and hands-free sends go through the same guarded reply path a typed reply
   takes ([ADR 0029](./.adr/0029-speech-to-text-is-a-provider-seam-issance-owns.md)).
-  A fourth provider, `whistle`, is issance's own code: a vendored WebAssembly engine and a 16.9 MB model
+  A fourth provider, `whistle`, is issance own code: a vendored WebAssembly engine and a 16.9 MB model
   that the host fetches once on a tap or `issance stt whistle`. It runs in two places, chosen per
-  device. The **Host** engine runs it in a short-lived child of issance's binary and takes a 16 kHz WAV
+  device. The **Host** engine runs it in a short-lived child of issance binary and takes a 16 kHz WAV
   upload. The **This phone** engine runs it in a worker with its own CSP, with no upload at all
   ([ADR 0096](./.adr/0096-speech-can-stay-on-the-phone.md)).
 - **Quick replies are heuristics, not guarantees.** Different agents expect different input (a Y/n
@@ -249,7 +249,7 @@ graph TD
 ```
 
 - **`bridge/mux/` is a port with three drivers, and nothing above it knows which one is loaded.** The
-  port is issance's own contract (`types.ts`), not Hangar's shape renamed
+  port is issance own contract (`types.ts`), not Hangar's shape renamed
   ([ADR 0022](./.adr/0022-the-mux-seam-is-a-port-issance-owns.md)); the drivers are `hangar/`, `tmux/`
   and `zellij/`, and `registry.ts` is the one place `ISSANCE_MUX` becomes an adapter. A driver is the
   only code that knows its multiplexer's verbs (`pane.read`, `capture-pane -p -e`,

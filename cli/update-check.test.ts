@@ -1083,7 +1083,7 @@ describe("the dispatcher", () => {
   });
 });
 
-// ── An install whose updates are not issance's to make ────────────────────────
+// ── An install whose updates are not issance to make ────────────────────────
 // The shape that started this: `hangar plugin install` leaves a git checkout, so `buildsFromSource`
 // said yes, so the phone asked for Bun on a host whose service could not see it. A packaged install
 // is the honest end of that thread — nothing here compiles, and nothing here is even writable.

@@ -99,7 +99,7 @@ Further hazards, all observed:
 - In a wizard, the preview step's digit does **not** instant-select (unlike the no-preview wizard
   step where a digit answers and advances) — it only moves the pointer; `Enter` answers+advances.
 
-## issance's choreography recipes (what `preview-action.ts` sends)
+## issance choreography recipes (what `preview-action.ts` sends)
 
 Select an option (race-guarded at step 1, verified at step 3):
 

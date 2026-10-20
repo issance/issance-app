@@ -452,7 +452,7 @@ function verifyBlock(repo: string, tag: string, version: string): string[] {
 export function driftLines(entries: readonly string[]): string[] {
 	const named = entries.map((entry) => entry.trim()).filter((entry) => entry.length > 0);
 	if (named.length === 0) return [];
-	return ["**Not verified**", "", `issance's readers were not verified on ${named.join(", ")}: each is newer than its verified version.`];
+	return ["**Not verified**", "", `issance readers were not verified on ${named.join(", ")}: each is newer than its verified version.`];
 }
 
 /**

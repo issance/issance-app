@@ -1,5 +1,5 @@
 #!/bin/sh
-# issance's installer — download the release for this platform, verify its sha256, lay it down, put
+# issance installer — download the release for this platform, verify its sha256, lay it down, put
 # `issance` on PATH.
 #
 # This file is curl-piped into a shell AND read by people who will not run what they have not read,

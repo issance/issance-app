@@ -110,7 +110,7 @@ export function claudeRuleFor(tier: string | undefined): CacheRule | undefined {
 //
 // Copied from AltanS/herdr-cache-alert `src/harness/claude-resets.ts` (commit 17fb2af), every quote
 // and its `retrievedAt`, and the quotes re-read against the live page on 2026-09-19. The labels are
-// issance's own, because the pane sheet slots them into a sentence. The counts in each `note` come from
+// issance own, because the pane sheet slots them into a sentence. The counts in each `note` come from
 // that commit: 160 Claude Code transcripts, main chain only, each case a turn less than 50 minutes after
 // the one before, so an expired one-hour TTL cannot explain the miss.
 //

@@ -1,4 +1,4 @@
-// A small test client for the wire. It dials the socket the way issance's `durable` adapter does (or, for a dial
+// A small test client for the wire. It dials the socket the way issance `durable` adapter does (or, for a dial
 // with a `handler`, calls the core's `handle` in process, with no socket), with
 // none of the adapter's checks, so a test can send what the adapter never would (a bad id, an old
 // version, a reused request id). The real adapter drives this example in issance's own test,

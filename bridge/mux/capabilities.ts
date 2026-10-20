@@ -19,7 +19,7 @@
 import { formatMuxKey, parseMuxKey } from "./keys.ts";
 
 /**
- * Every capability an adapter may declare, in issance's words.
+ * Every capability an adapter may declare, in issance words.
  *
  * The order is the order the matrix in MUX_CONTRACT.md reads: what you can learn about a pane,
  * what you can do to a pane, what you can do to the structure around it, and how you learn that

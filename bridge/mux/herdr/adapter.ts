@@ -18,7 +18,7 @@
 // (ADR 0011, ADR 0022) — so nothing here grows a host, and neither does dial.ts.
 //
 // CAPABILITIES ARE DECLARED FROM THE METHODS BELOW, one for one. Hangar implements every one of the
-// contract's fourteen, which is unsurprising — issance's routes were written against Hangar — and is
+// contract's fourteen, which is unsurprising — issance routes were written against Hangar — and is
 // exactly why the declaration must be read off the implementation rather than assumed: the value of
 // the list is that the NEXT adapter's is shorter.
 
@@ -119,7 +119,7 @@ const HERDR_CAPABILITIES = declareCapabilities({
     gridScrollback:
       "Hangar reports a pane's scrollback depth, so how far back a read can reach is known rather than guessed (MuxPane.readableLines) — its own `truncated` flag is always false and must not be gated on.",
   },
-  // Hangar's workspaces are issance's spaces, and there are as many as the operator created.
+  // Hangar's workspaces are issance spaces, and there are as many as the operator created.
   spaces: "many",
 });
 

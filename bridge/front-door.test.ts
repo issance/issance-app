@@ -171,7 +171,7 @@ describe("releaseManagedFrontDoor — only the recorded mapping", () => {
       "tailscale serve --http=8788 --set-path=/ off",
     ]);
     expect(h.record()).toBeNull();
-    expect(h.out.join("\n")).toContain("removed issance's managed http:8788 mapping");
+    expect(h.out.join("\n")).toContain("removed issance managed http:8788 mapping");
   });
 
   test("a root replaced out from under us is REFUSED, and the record is kept", () => {

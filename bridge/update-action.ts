@@ -985,7 +985,7 @@ export interface RollbackState {
  *  1. **No confirm, no rollback**, and **no request id, no rollback**: the id is the receipt.
  *  2. **The same id again** answers its receipt, before any refusal a finished run would now make.
  *  3. **A run is going** (an update, a rollback, or this lead's crew run): the double-tap refusal.
- *  4. **A packaged install** keeps no previous build of issance's own; its package manager does.
+ *  4. **A packaged install** keeps no previous build of issance own; its package manager does.
  *  5. **The preflight could not run**: "we could not check" is not "there is a build to go back to".
  *  6. **No previous build** in the report.
  *  7. **A stale sheet**: the version it named is not the one on disk now.

@@ -26,9 +26,9 @@ setup can store a credential, name a command the bridge will spawn, or open a pa
 audio off the host, and a page loaded over the front door should not decide any of those. For the
 codex provider it added two things that make borrowing the operator's ChatGPT sign-in acceptable at
 all: a consent step that names the risk in words, and an identity probe that asks the endpoint under
-issance's own name first and records the fallback, if it is needed, in `stt.json`.
+issance own name first and records the fallback, if it is needed, in `stt.json`.
 
-ADR 0096 made the first exception. Whistle holds no credential, runs issance's own binary with
+ADR 0096 made the first exception. Whistle holds no credential, runs issance own binary with
 arguments issance wrote, and keeps the audio on the host, so a write device may set it up from
 Settings. That left a page that could turn Whistle on and say nothing about any other provider: an
 operator with Codex on the host saw no trace of it in the app, and one who wanted to move between

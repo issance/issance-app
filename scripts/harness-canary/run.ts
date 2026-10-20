@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 // `bun run canary`: drive claude, codex, opencode and pi in a Hangar session of the canary's own and
-// judge what the phone would read and whether a send lands, with issance's own code, off the screen
+// judge what the phone would read and whether a send lands, with issance own code, off the screen
 // AND off the session each agent wrote. Specs M37/02 and M41/05; the how and the traps are in
 // ./README.md.
 

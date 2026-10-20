@@ -22,12 +22,12 @@ import { t as translate } from "@/lib/i18n";
 import type { OperatorCommand } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-// ONE ROW OF ACTIONS, DIRECTLY ABOVE THE INPUT. issance's own controls first — Keys, Type, Quick,
+// ONE ROW OF ACTIONS, DIRECTLY ABOVE THE INPUT. issance own controls first — Keys, Type, Quick,
 // Agent, the display gear — then the running harness's own commands in a section of their own. It
 // scrolls sideways; nothing wraps and nothing is dropped.
 //
 // IT IS A BELT: ONE FULL-BLEED BAND, NOT TWO FLOATING CAPSULES. The row is a continuous strip that
-// runs edge to edge, closed above and below by a hairline, with a quiet ground of its own. issance's
+// runs edge to edge, closed above and below by a hairline, with a quiet ground of its own. issance
 // controls stand DIRECTLY on that ground with no outline at all; the harness's commands stand in a
 // SECTION of the same band — a square-cornered rectangle spanning the belt's full inner height,
 // tinted with the harness's brand. One belt, two parts, and the tint boundary is what separates
@@ -356,7 +356,7 @@ function useSwitchBlockWidth(active: boolean): SwitchBlockWidth {
 }
 
 /**
- * One of issance's own actions. The composer owns every one of these — what it does, whether it is
+ * One of issance own actions. The composer owns every one of these — what it does, whether it is
  * on, whether it is refused — and this file owns only how it is drawn.
  */
 export interface GeneralAction {
@@ -384,7 +384,7 @@ export interface GeneralAction {
 }
 
 export interface ActionsRowProps {
-  /** issance's own actions, in the order the thumb should meet them. */
+  /** issance own actions, in the order the thumb should meet them. */
   general: readonly GeneralAction[];
   /** The focused pane's agent — picks the harness section and its brand colour. */
   agent: string | undefined | null;
@@ -459,7 +459,7 @@ export interface ActionsRowProps {
    * THE COMPOSER'S CLEAR SLOT (M40 spec 04, issue #291; Altan, 2026-09-26/27). An icon-only X on
    * the pinned block, directly LEFT of the Changes pill, left of the Switch mark when there is no
    * Changes pill, alone when neither shows. The scrolling pills are for acts inside the terminal;
-   * the pinned block holds issance's own controls, and emptying the phone's own draft is one of them.
+   * the pinned block holds issance own controls, and emptying the phone's own draft is one of them.
    *
    * The composer passes it only while its box holds text or chips (`mode: "clear"`), and for the
    * Undo window after a tap (`mode: "undo"`). Absent otherwise, so the belt at rest is unchanged.
@@ -652,7 +652,7 @@ export function ActionsRow({ general, agent, mine, onRun, disabled, durable, han
                 data-slot="composer-controls"
                 role="group"
                 aria-labelledby="composer-controls-label"
-                // NO BOX OF ITS OWN. issance's controls stand directly on the belt's ground: no
+                // NO BOX OF ITS OWN. issance controls stand directly on the belt's ground: no
                 // outline, no ground, no padding — a group in the accessibility tree and a flex run
                 // in the paint. The harness section is the only thing on this belt that is drawn.
                 className={cn("flex shrink-0 items-center gap-1.5", left && "[direction:rtl]")}

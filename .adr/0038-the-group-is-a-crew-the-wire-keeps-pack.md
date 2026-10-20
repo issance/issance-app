@@ -16,10 +16,10 @@ is not this group)
 
 **hangar 0.9.0 ships a feature called machines, and it is not this.** Its machine linking lives in
 the hangar TUI client, keeps ssh endpoint profiles on that client's disk, and never reaches the public
-socket. ADR 0036 read that source first-hand and drew the line: the map of machines is issance's, an
+socket. ADR 0036 read that source first-hand and drew the line: the map of machines is issance, an
 adapter reports one machine, and `hangar machine list --json` is a list of ssh targets rather than a
 group of collies. So an operator now meets two words for two different things on one machine, and
-issance's word has to carry its own weight without a paragraph of setup.
+issance word has to carry its own weight without a paragraph of setup.
 
 **"Pack" no longer carries it.** Three problems, in order of weight.
 

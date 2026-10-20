@@ -10,7 +10,7 @@
 //   (b) it is a default location under the user profile (the plugin folders Hangar hands out, and the
 //       `~/.local/state/issance*`, `~/.config/issance*` and `~/.issance` fallbacks), or
 //   (c) it exists and is empty, or holds only entries issance writes ({@link isCollieEntry}): files
-//       with issance's names, and issance's own folders holding only their own kind of file.
+//       with issance names, and issance own folders holding only their own kind of file.
 //
 // Any other folder (a `ISSANCE_STATE_DIR` someone pointed at `D:\Projects`, `Documents`, a synced or
 // shared folder) is CHECKED ONLY: one warning with the exact `icacls` line, and no change.
@@ -131,7 +131,7 @@ const KNOWN_NAME_PATTERNS: readonly RegExp[] = [
 const OWN_SUFFIX = /^(?:\.\d+|\.tmp|\.\d+\.tmp|\.\d+\.\d+\.tmp|\.issance-tmp|\.push-keys\.tmp)$/;
 
 /**
- * issance's own FOLDERS in the state and the config folder, and the one kind of file each holds:
+ * issance own FOLDERS in the state and the config folder, and the one kind of file each holds:
  * beacons as `.json`, phone uploads as `<pane>-<time>-<8 hex>.<ext>` (`bridge/server.ts`), fonts as
  * bare `.woff2` names (`operator-fonts.ts`), saved access lists, and the Whistle model's folder
  * (`bridge/stt/whistle-model.ts`: the model, its manifest, the download's lock, and a download's part
@@ -148,7 +148,7 @@ const KNOWN_FOLDERS: ReadonlyMap<string, RegExp> = new Map([
 
 /**
  * Whether `name`, a FILE, is one issance writes: a known name or shape, alone or followed by one of
- * issance's own suffixes ({@link OWN_SUFFIX}).
+ * issance own suffixes ({@link OWN_SUFFIX}).
  */
 export function isCollieName(name: string): boolean {
   const known = (stem: string): boolean => KNOWN_NAMES.has(stem) || KNOWN_NAME_PATTERNS.some((s) => s.test(stem));
@@ -170,7 +170,7 @@ const STATE_SECRET_NAMES: ReadonlySet<string> = new Set(
 
 /**
  * Whether a file NAME is one of a issance state folder's secrets, wherever it sits: a state secret,
- * alone or followed by one of issance's own suffixes (`crew-trust.json.tmp`). Case-folded on every
+ * alone or followed by one of issance own suffixes (`crew-trust.json.tmp`). Case-folded on every
  * host. The Files view refuses and hides these by basename (ADR 0083), because a root that holds a
  * SIBLING instance's state folder is not one of this bridge's private folders.
  */
@@ -191,13 +191,13 @@ export type EntryKind =
   | { readonly kind: "folder"; readonly names: readonly string[] | null };
 
 /**
- * Whether an entry is issance's, for rule (c). The rule, one level deep:
- *   * a FILE is issance's when {@link isCollieName} says so;
- *   * a FOLDER is issance's when it is one of {@link KNOWN_FOLDERS} and is empty or holds only FILES
- *     of that folder's own kind (no subfolder, no link): `fonts` holding a `.woff2` is issance's,
+ * Whether an entry is issance, for rule (c). The rule, one level deep:
+ *   * a FILE is issance when {@link isCollieName} says so;
+ *   * a FOLDER is issance when it is one of {@link KNOWN_FOLDERS} and is empty or holds only FILES
+ *     of that folder's own kind (no subfolder, no link): `fonts` holding a `.woff2` is issance,
  *     `fonts` holding the operator's photos is not;
- *   * a LINK (a symbolic link or a junction) is never issance's: issance never makes one there;
- *   * an entry that cannot be read is not issance's.
+ *   * a LINK (a symbolic link or a junction) is never issance: issance never makes one there;
+ *   * an entry that cannot be read is not issance.
  * `look` reports a path relative to the folder being judged, as a list of names.
  */
 export function isCollieEntry(name: string, look: (rel: readonly string[]) => EntryKind | null): boolean {
@@ -325,6 +325,6 @@ export function repairScope(
   if (foreign.length === 0) return { allowed: true };
   return {
     allowed: false,
-    why: `it also holds files that are not issance's (${foreign.slice(0, 3).join(", ")}${foreign.length > 3 ? " and more" : ""})`,
+    why: `it also holds files that are not issance (${foreign.slice(0, 3).join(", ")}${foreign.length > 3 ? " and more" : ""})`,
   };
 }

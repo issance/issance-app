@@ -7,7 +7,7 @@ import { createWhistleModelStore, whistleEngineInPlace } from "./whistle-model.t
 
 // ── THE WHISTLE PROVIDER (ADR 0096 Decision 4) ───────────────────────────────────────────────
 //
-// The host engine, and the one provider that is issance's own code. One child per dictation:
+// The host engine, and the one provider that is issance own code. One child per dictation:
 //
 //     <issance> _whistle-transcribe <tempdir>/recording.wav
 //
@@ -63,7 +63,7 @@ export interface WhistleProviderDeps {
   stateDir: string;
   /** The checkout root the engine is read from. {@link pluginRoot} unless a test names one. */
   root?: string;
-  /** The argv prefix that runs this issance's CLI. {@link collieSelfCommand} unless a test fakes the child. */
+  /** The argv prefix that runs this issance CLI. {@link collieSelfCommand} unless a test fakes the child. */
   self?: readonly string[];
   /** The bridge's environment, before `ISSANCE_*` is dropped. */
   env?: Record<string, string | undefined>;
@@ -106,7 +106,7 @@ export function createWhistleSttProvider(deps: WhistleProviderDeps): SttProvider
     },
 
     transcribe(input: SttAudio, signal?: AbortSignal): Promise<SttResult> {
-      // The route has already checked the WAV header (bridge/stt/http.ts); the name is issance's own.
+      // The route has already checked the WAV header (bridge/stt/http.ts); the name is issance own.
       const timeoutMs = deps.timeoutMs ?? whistleTimeoutFor(input.audio);
       return run((path) => [...self, WHISTLE_VERB, path], "recording.wav", input, signal, timeoutMs);
     },

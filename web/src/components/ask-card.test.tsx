@@ -47,7 +47,7 @@ function stubAnswer(reply: () => Response): Sent[] {
   return seen;
 }
 
-/** A button by issance's own wording (the effect), whatever second line the program's label adds. */
+/** A button by issance own wording (the effect), whatever second line the program's label adds. */
 function wording(main: string): RegExp {
   return new RegExp(`^${main}`, "u");
 }
@@ -70,7 +70,7 @@ describe("the card as data", () => {
     }
   });
 
-  it("each button leads with issance's wording for the effect and shows the program's label as the second line", () => {
+  it("each button leads with issance wording for the effect and shows the program's label as the second line", () => {
     draw();
     const allow = screen.getByRole("button", { name: wording("Allow") });
     expect(allow.querySelectorAll("span.block")[0]).toHaveTextContent(/^Allow$/u);

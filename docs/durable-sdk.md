@@ -65,7 +65,7 @@ With no `socket` option, the path comes from `ISSANCE_DURABLE_SOCKET`, the varia
 | --- | --- | --- |
 | `socket` | The socket path: absolute, at most 103 bytes. Its folder is made with mode `0700`, or must already be yours with mode `0700` | The `ISSANCE_DURABLE_SOCKET` variable. Neither set: the start fails |
 | `hostName` | The durable agent's own name in its hello, cut to 64 bytes. Required | None |
-| `tailLimit` | How many raw events each pane keeps for issance's reads | 500, at most 1000 |
+| `tailLimit` | How many raw events each pane keeps for issance reads | 500, at most 1000 |
 | `caps` | What the durable agent says it can do ([Caps](#caps)) | Everything the SDK can do |
 | `callerCheck` | `descendant` or `off`. Read on Bun only | `descendant` |
 | `hooks` | One named place for each act the phone sends ([Hooks and history](#hooks-and-history)) | None |
@@ -264,7 +264,7 @@ Once a provider is set, each pane's `sessionId` is its pane id, and the history 
 conversation under it. Pass `sessionId` to `tab.pane()` to name another id, or `null` when it cannot
 stay the same across a restart.
 
-`tailLimit` is not history. It is the raw tail each pane keeps for issance's event reads, 500 events by
+`tailLimit` is not history. It is the raw tail each pane keeps for issance event reads, 500 events by
 default. A reader that fell behind it gets the pane's whole current view instead, at most the newest
 2000 items.
 
@@ -348,7 +348,7 @@ puts every part together.
 
 ## Versions
 
-The package has its own version, apart from issance's, and names the wire version it speaks.
+The package has its own version, apart from issance, and names the wire version it speaks.
 
 | | today | what it means |
 | --- | --- | --- |
@@ -359,7 +359,7 @@ issance speaks one wire version and accepts the one before it for one minor rele
 ships. When a issance speaks none of your versions, the core writes one line through `warn`, once per
 version, for example
 `issance: issance speaks wire v2, this durable agent speaks v1. Update the agent's SDK, or issance.` The phone says the mismatch
-on the durable agent's home, in issance's own words. Update the older side.
+on the durable agent's home, in issance own words. Update the older side.
 
 The package is published under the npm dist-tag experimental, never latest. If the durable wire goes
 at [the exit](durable-agents.md#the-exit), the package is deprecated

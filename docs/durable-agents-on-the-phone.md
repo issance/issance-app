@@ -74,7 +74,7 @@ expiry the buttons stay, and the durable agent answers a late tap itself.
 
 | kind | what the card shows | limits |
 | --- | --- | --- |
-| `permission` | One button per option, in issance's words: Allow, Always allow, Deny or Cancel. The durable agent's own label is the quiet second line | Up to 6 options |
+| `permission` | One button per option, in issance words: Allow, Always allow, Deny or Cancel. The durable agent's own label is the quiet second line | Up to 6 options |
 | `choice` | One row per option. One tap sends the pick. With `multiple`, the rows toggle under "Pick any number" and Send sends the set | Up to 8 options |
 | `text` | One line to type in, a count such as "12 of 500", and Send | 500 characters, or the durable agent's limit up to 2000 |
 | `form` | Its fields stacked under one Send: a text line, a choice as a list to pick from, or a toggle. A required field says Required | Up to 6 fields |
@@ -103,7 +103,7 @@ Every tap carries one request id, and only a tap sends an answer.
 | The question changed under you | "This ask changed. Read it again, then tap an answer." | Read the new form and tap again |
 | The answer may not have arrived | "Not sure the answer arrived. Try again sends it once more." | Tap Try again. It sends the same request id, so the durable agent is told once |
 | A retry found the question closed or changed | "May already be applied. Check the chat." | Check the chat |
-| issance refused the answer | issance's reason, else "The answer was refused." | Read the reason |
+| issance refused the answer | issance reason, else "The answer was refused." | Read the reason |
 | The durable agent's machine runs an older issance | "This machine runs an older issance and cannot take answers here. Update it, or answer in the durable agent." | Update that machine |
 
 ## Receipts

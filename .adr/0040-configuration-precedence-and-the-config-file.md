@@ -64,7 +64,7 @@ anywhere under `bridge/` or `cli/` needs a row there or a named exemption in the
 
 **A key is derived from its environment name, mechanically.** `key === env.replace(/^ISSANCE_/, "")
 .toLowerCase()`, inside a `[section]`. `HERDR_SOCKET_PATH` is the one row that declares its key,
-because its name is not issance's.
+because its name is not issance.
 
 **A config file never refuses to start the bridge, and never widens the bind.** A parse failure, an
 unknown key or a wrong type is a problem printed by `issance config check` and reported by

@@ -94,7 +94,7 @@ interface RichHarness {
  * type.
  */
 const serveChatter = (port: number): readonly string[] => [
-  `tailscale serve: removed issance's managed http:${port} mapping`,
+  `tailscale serve: removed issance managed http:${port} mapping`,
   `tailscale serve (http) → tailnet :${port} -> 127.0.0.1:${port}`,
 ];
 

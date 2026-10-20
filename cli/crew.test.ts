@@ -1250,7 +1250,7 @@ describe("looksLikePlaintextListener", () => {
 
 // ── the runtime's voice never reaches an operator (F18) ──────────────────────
 
-describe("an unreachable member is described in issance's words, not Bun's", () => {
+describe("an unreachable member is described in issance words, not Bun's", () => {
   // The exact string Bun throws, which reached `crew status`'s link line, the 503 body a phone
   // reads and `issance leave`'s warning — all three read the same `reason` field.
   const BUN_CONNECT = new Error("Unable to connect. Is the computer able to access the url?");

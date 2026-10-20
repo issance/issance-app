@@ -90,7 +90,7 @@ same hold-the-last-good-rows failure posture. Named for a theme rather than for 
 block can join it later without becoming a fifth operator file.
 
 **This is the opposite posture to ADR 0018, and 0018 is untouched.** A `commands.toml` row
-*shadows* a shipped command: the operator's `/deploy` and issance's catalog compete for the same
+*shadows* a shipped command: the operator's `/deploy` and issance catalog compete for the same
 tap on the same pane, so a merge would leave the operator unable to say "not that one", and 0018
 resolves that by letting a declaration replace the list whole. **A font cannot fire an action.**
 There is nothing for it to shadow, nothing it could make unsayable, and no guarantee issance is

@@ -44,7 +44,7 @@ const PLACEHOLDER = /\[Pastedtext#\d+(?:\+(\d+)lines)?\]/g;
 const IMAGE_TOKEN = /\[Image#\d+\]/g;
 
 /**
- * The shape of the path issance's upload route hands back (`bridge/server.ts`): an absolute
+ * The shape of the path issance upload route hands back (`bridge/server.ts`): an absolute
  * `<stateDir>/uploads/<pane>-<base36 time>-<8 hex>.<ext>`, with a POSIX or a Windows root. The
  * composer swaps a chip's marker for that path where the marker stood (`composeLine`), so it is the
  * only image path issance ever sends. A name merely ending `.png` in a sentence is not this shape.
@@ -73,7 +73,7 @@ const PIECE_CUT = new RegExp(`\\r?\\n| (?=${UPLOAD_ROOT})`);
  *   `P <text>`, `P P <text>` → no image, or one: the piece `P <text>` is not a path
  *   `<text> P word`, `<300 chars> P <rest>` → no image
  *
- * Only issance's own upload paths count. Claude also takes other image files it finds on disk, and
+ * Only issance own upload paths count. Claude also takes other image files it finds on disk, and
  * a token for one of those makes the send unprovable, which stalls it rather than guessing.
  */
 export function liftedPaste(sent: string): { images: number; text: string } {

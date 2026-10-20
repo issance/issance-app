@@ -372,7 +372,7 @@ async function switchProvider(deps: SttHostRouteDeps, choice: SttHostChoice, cha
     try {
       ({ document, identity } = await probeCodexSetup(signIn.codexBin, deps.probe));
     } catch (err) {
-      // issance's own sentence (codex-auth.ts and codex.ts write them), never the endpoint's body.
+      // issance own sentence (codex-auth.ts and codex.ts write them), never the endpoint's body.
       return refuse(502, "stt.codex_probe_failed", choice, { reason: err instanceof Error ? err.message : String(err) });
     }
     // The CLI's acceptance test, applied here too: the document must resolve on its own.

@@ -1,7 +1,7 @@
 // The program: the same support desk as examples/durable-member/app.ts, in one Durable Object hosted by Cloudflare's
 // PiHarness (package `agents`, `agents/harness/pi`, beta). PiHarness keeps Pi Durable's conversations in the
 // object's SQLite under the prefix `pi_`, opens Pi on every start, and wakes the object by alarm while a session
-// has work, so a run that was evicted goes on without waiting for a read. The SDK core serves issance's wire
+// has work, so a run that was evicted goes on without waiting for a read. The SDK core serves issance wire
 // (core.handle), and the request ids go to a `collie_receipts` table, so a retry after a restart still runs once.
 // The newest 1000 per pane are kept (receipts.ts).
 //

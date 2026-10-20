@@ -153,7 +153,7 @@ test("a worker served with the speech policy compiles wasm and has no network", 
     compile: "ok",
     // `default-src 'none'` closes `connect-src`: the glue could not fetch, XHR or open a socket.
     fetch: "TypeError",
-    // `script-src 'self'` still lets it load issance's own glue.
+    // `script-src 'self'` still lets it load issance own glue.
     importScripts: "ok",
   });
 });

@@ -67,7 +67,7 @@ export const MAX_CHOICE_OPTIONS = 8;
 /** The most fields a form ask draws. */
 export const MAX_FORM_FIELDS = 6;
 
-/** issance's own wording for an option's effect. The program's label never replaces it. */
+/** issance own wording for an option's effect. The program's label never replaces it. */
 export function effectKey(effect: Effect): MessageKey {
   switch (effect) {
     case "allow":

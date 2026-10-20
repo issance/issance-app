@@ -996,7 +996,7 @@ export class DurableMux implements MuxAdapter {
 
   /**
    * A program this issance does not speak (WIRE.md section 2): keep the refusal for the pane list, write one line to the
-   * log, and tell the program once. The telling call is a `hello` that carries this issance's own version, which the
+   * log, and tell the program once. The telling call is a `hello` that carries this issance own version, which the
    * program answers with its 409, so it can name the mismatch in its own log. The line goes out once per refused range,
    * and the telling call once per start of the program, so a program that stays old costs one extra request per start,
    * never one per poll.
@@ -1015,7 +1015,7 @@ export class DurableMux implements MuxAdapter {
     try {
       await this.transport.get({ path: "/hello", version: SPEAKS.max, ifNoneMatch: null, timeoutMs: this.budget.readTimeoutMs, maxBytes: REPLY_CAPS.hello });
     } catch {
-      // Telling the program is a courtesy. issance's own refusal stands whatever the program does with it.
+      // Telling the program is a courtesy. issance own refusal stands whatever the program does with it.
     }
   }
 

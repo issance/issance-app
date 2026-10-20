@@ -222,7 +222,7 @@ export function prepareHarness(id: HarnessId, machine: Machine = "lead"): Prepar
       );
       // The model catalog, so a start does not wait on a catalog download. No secret in it.
       if (existsSync(join(realAgent, "models-store.json"))) copyFileSync(join(realAgent, "models-store.json"), join(d.agent, "models-store.json"));
-      // Two of pi's stock example extensions, the screens issance's pi reader lifts (ASK_NOTES.md):
+      // Two of pi's stock example extensions, the screens issance pi reader lifts (ASK_NOTES.md):
       // `question` (a pick-one question tool) and `permission-gate` (asks before `rm -rf`, `sudo`).
       const examples = join(BIN.pi, "..", "..", "lib", "node_modules", "@earendil-works", "pi-coding-agent", "examples", "extensions");
       const extensions = ["question.ts", "permission-gate.ts"].map((file) => join(examples, file)).filter((path) => existsSync(path));

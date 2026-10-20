@@ -60,7 +60,7 @@ const MANIFEST_TEMP_NAME = /^whistle\.json\.\d+\.\d+\.tmp$/;
 
 /**
  * The fixed names this module writes into the folder, for the Windows access-list rule that judges
- * the folder "issance's own" (bridge/acl-policy.ts `KNOWN_FOLDERS`, which keeps a pattern of its own;
+ * the folder "issance own" (bridge/acl-policy.ts `KNOWN_FOLDERS`, which keeps a pattern of its own;
  * a test holds the two together, with {@link whistlePartName} and the manifest's temporary,
  * `whistle.json.<pid>.<seq>.tmp`).
  */
@@ -83,7 +83,7 @@ export interface WhistlePaths {
 export function whistlePaths(stateDir: string): WhistlePaths {
   // Spelled out rather than through a constant, so the state-dir guard (solo-baseline.test.ts) reads it.
   // A folder of its own, one level under the state dir: the Windows access-list rule judges a folder
-  // "issance's own" one level deep, and a `stt/` holding a subfolder would fail it.
+  // "issance own" one level deep, and a `stt/` holding a subfolder would fail it.
   const dir = join(stateDir, "whistle");
   return {
     dir,
@@ -145,7 +145,7 @@ export type WhistleLookup = (hostname: string) => Promise<readonly string[]>;
 
 export interface WhistleModelDeps {
   stateDir: string;
-  /** issance's version, for the `User-Agent`. */
+  /** issance version, for the `User-Agent`. */
   version: string;
   fetch?: WhistleFetch;
   /** How a hop's host name is resolved before it is asked. `node:dns` unless a test names its own. */
@@ -214,7 +214,7 @@ export type WhistleDescription =
   /** A file is there and cannot be read, or is a symlink or not a file. */
   | { kind: "unreadable"; reason: string };
 
-/** A refusal whose message is issance's own sentence and safe to report: no path, no upstream body. */
+/** A refusal whose message is issance own sentence and safe to report: no path, no upstream body. */
 class WhistleRefusal extends Error {}
 
 /** Another process holds the lock. Not a failure of this one, and nothing of theirs is touched. */

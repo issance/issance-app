@@ -95,7 +95,7 @@ export type SttFailureKind = "timeout" | "oversized" | "refused" | "unavailable"
 /**
  * A deliberately body-free provider failure.
  *
- * The message is issance's own sentence, chosen from the kind — an upstream error body may name an
+ * The message is issance own sentence, chosen from the kind — an upstream error body may name an
  * account, a model or an endpoint, so it is never reflected to a browser and never audited. The
  * `kind` is the only thing the route reads.
  */

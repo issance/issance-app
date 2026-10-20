@@ -106,7 +106,7 @@ string).
 - **`SnapshotResponse.bridge` keeps a name the docs no longer use.** Accepted. It is arguably already
   misnamed — it reports the *mux link*, not the process — which makes it a candidate for a
   meaning-driven rename later, on the add-then-remove rule above. Vocabulary alone never justifies it.
-- **"Lead" collides with nothing in issance's namespace** — `session`, `space`, `tab`, `pane`, `agent`
+- **"Lead" collides with nothing in issance namespace** — `session`, `space`, `tab`, `pane`, `agent`
   and `herd` are all taken and all untouched. In prose it is always *"the lead"*, never a bare verb.
 - **The doc sweep is a list, not an excavation.** README, ARCHITECTURE, CLAUDE.md, HERDR_API.md,
   HARNESS_CONTRIBUTING.md, the plugin action titles, and the in-app strings. Anything not on that list
