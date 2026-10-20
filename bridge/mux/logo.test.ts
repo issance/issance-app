@@ -20,7 +20,7 @@ import { MUX_ADAPTERS } from "./registry.ts";
 // export a module makes, and a scan would pass happily on the day someone adds a fourth adapter and
 // forgets its logo — which the config test in bridge/server.test.ts catches instead.
 const LOGOS: readonly [name: string, svg: string][] = [
-  ["herdr", HERDR_LOGO_SVG],
+  ["hangar", HERDR_LOGO_SVG],
   ["tern", TERN_LOGO_SVG],
   ["tmux", TMUX_LOGO_SVG],
   ["zellij", ZELLIJ_LOGO_SVG],
